@@ -43,6 +43,7 @@ import {
   moveAggregateSite,
   normalizeGatewayAggregateAliases,
   normalizeGatewayAggregateSiteIds,
+  resolveGatewayAggregateEffectiveAliases,
   restoreDirectUnavailableHintKey,
   subscribeGatewayProviderProfiles,
   subscribeGatewayAggregateConfig,
@@ -95,6 +96,7 @@ interface SortableSiteRowProps {
   onToggleSite: (siteId: string, checked: boolean) => void;
   onMoveSite: (siteId: string, direction: 'up' | 'down') => void;
   alias: string;
+  separator: string;
   onAliasChange: (siteId: string, alias: string) => void;
   onAliasCommit: () => void;
 }
@@ -112,6 +114,7 @@ const SortableSiteRow: React.FC<SortableSiteRowProps> = ({
   onToggleSite,
   onMoveSite,
   alias,
+  separator,
   onAliasChange,
   onAliasCommit,
 }) => {
@@ -157,7 +160,7 @@ const SortableSiteRow: React.FC<SortableSiteRowProps> = ({
         maxLength={32}
         placeholder={t('gateway.aggregate.aliasPlaceholder')}
         aria-label={`${candidate.name}: ${t('gateway.aggregate.alias')}`}
-        aria-invalid={alias.length > 0 && !validateGatewayAggregateAlias(alias)}
+        aria-invalid={alias.length > 0 && !validateGatewayAggregateAlias(alias, separator)}
         onChange={(event) => onAliasChange(candidate.id, event.currentTarget.value)}
         onBlur={onAliasCommit}
       />
@@ -273,7 +276,12 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     return Object.keys(aliases).filter((siteId) => !addressable.has(siteId));
   }, [aliases, candidateSiteIds]);
   const hasStaleConfig = staleSiteIds.length > 0 || staleAliasSiteIds.length > 0;
-  const normalizedAliases = normalizeGatewayAggregateAliases(aliases, siteIds, candidateSiteIds);
+  const normalizedAliases = normalizeGatewayAggregateAliases(
+    aliases,
+    siteIds,
+    candidateSiteIds,
+    separatorError === null ? separator : DEFAULT_AGGREGATE_SEPARATOR,
+  );
   const canEngage =
     running &&
     normalizedSiteIds.length > 0 &&
@@ -516,7 +524,12 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       await handleToggle(false);
       return;
     }
-    const nextAliases = normalizeGatewayAggregateAliases(aliases, nextSiteIds, candidateSiteIds);
+    const nextAliases = normalizeGatewayAggregateAliases(
+      aliases,
+      nextSiteIds,
+      candidateSiteIds,
+      separatorError === null ? separator : DEFAULT_AGGREGATE_SEPARATOR,
+    );
     if (separatorError === null && nextAliases) {
       void runEngage(nextSiteIds, separator, nextAliases, naming);
     }
@@ -560,7 +573,12 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     if (!engaged || siteIds.length === 0) {
       return;
     }
-    const nextAliases = normalizeGatewayAggregateAliases(aliases, siteIds, candidateSiteIds);
+    const nextAliases = normalizeGatewayAggregateAliases(
+      aliases,
+      siteIds,
+      candidateSiteIds,
+      separatorError === null ? separator : DEFAULT_AGGREGATE_SEPARATOR,
+    );
     if (!nextAliases) {
       setNotice({ kind: 'error', text: t('gateway.aggregate.aliasInvalid') });
       return;
@@ -584,11 +602,24 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     .map((siteId) => candidates.find((candidate) => candidate.id === siteId))
     .filter((candidate): candidate is GatewayAggregateSiteCandidate => Boolean(candidate));
   const unselectedCandidates = candidates.filter((candidate) => !siteIds.includes(candidate.id));
+  // Mirrors the backend `resolve_effective_site_aliases`: a site without an
+  // explicit alias is addressed by its normalised display name, so the preview
+  // shows `思源888 pro.<model>` rather than the opaque provider id.
+  const effectiveAliases = React.useMemo(
+    () =>
+      resolveGatewayAggregateEffectiveAliases(
+        aliases,
+        selectedCandidates.map((candidate) => ({ id: candidate.id, name: candidate.name })),
+        candidateSiteIds,
+        separatorError === null ? separator : DEFAULT_AGGREGATE_SEPARATOR,
+      ),
+    [aliases, candidateSiteIds, selectedCandidates, separator, separatorError],
+  );
   const separatorExample = buildGatewayAggregateSitePreviewSlug(
     candidates[0]?.id || 'site-id',
     separatorError === null ? separator : DEFAULT_AGGREGATE_SEPARATOR,
     naming,
-    aliases,
+    effectiveAliases,
   );
   const buildSiteRoutePreview = React.useCallback(
     (siteId: string) =>
@@ -596,9 +627,9 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
         siteId,
         separatorError === null ? separator : DEFAULT_AGGREGATE_SEPARATOR,
         naming,
-        aliases,
+        effectiveAliases,
       ),
-    [aliases, naming, separator, separatorError],
+    [effectiveAliases, naming, separator, separatorError],
   );
   const invalidSiteIds = siteIds.filter((siteId) => !isAggregateSiteId(siteId));
 
@@ -758,6 +789,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
                          onToggleSite={handleToggleSite}
                          onMoveSite={handleMoveSite}
                          alias={aliases[candidate.id] ?? ''}
+                         separator={separatorError === null ? separator : DEFAULT_AGGREGATE_SEPARATOR}
                          onAliasChange={(siteId, alias) => {
                            const nextAliases = { ...aliases, [siteId]: alias };
                            if (!alias.trim()) delete nextAliases[siteId];
