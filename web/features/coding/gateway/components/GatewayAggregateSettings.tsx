@@ -212,6 +212,10 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   const [separator, setSeparator] = React.useState<string>(DEFAULT_AGGREGATE_SEPARATOR);
   const [aliases, setAliases] = React.useState<Record<string, string>>({});
   const [naming, setNaming] = React.useState<GatewayAggregateNamingMode>('site_model');
+  // Optional Codex `[agents]` defaults. Blank means "don't manage this key", so
+  // an untouched form never writes to the user's `[agents]` section.
+  const [subagentModel, setSubagentModel] = React.useState('');
+  const [subagentReasoningEffort, setSubagentReasoningEffort] = React.useState('');
   const [cliStatuses, setCliStatuses] = React.useState<GatewayCliTakeoverStatus[]>([]);
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<{ kind: 'error' | 'success'; text: string } | null>(
@@ -385,6 +389,8 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
         : DEFAULT_AGGREGATE_SEPARATOR,
     );
     setNaming(saved?.naming ?? 'site_model');
+    setSubagentModel(saved?.subagent?.model ?? '');
+    setSubagentReasoningEffort(saved?.subagent?.reasoning_effort ?? '');
     if (!saved) {
       setAliases({});
       setSiteIds([]);
@@ -461,11 +467,13 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
             nextSeparator,
             nextAliases,
             nextNaming,
+            subagentModel,
+            subagentReasoningEffort,
           ),
         t('gateway.aggregate.notice.enabled'),
         'enableFailed',
       ),
-    [cliKey, runGatewayOperation, t],
+    [cliKey, runGatewayOperation, subagentModel, subagentReasoningEffort, t],
   );
   const handleToggle = async (checked: boolean) => {
     setNotice(null);
@@ -704,6 +712,57 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
        <p className={styles.helper}>{t('gateway.aggregate.modeHint')}</p>
       {restoreDirectBlocked ? <p className={styles.helper}>{restoreDirectBlockedHint}</p> : null}
       {!running ? <p className={styles.helper}>{t('gateway.aggregate.takeoverHint')}</p> : null}
+
+      <div className={styles.fieldRow}>
+        <div className={styles.fieldMeta}>
+          <span className={styles.fieldLabel}>{t('gateway.aggregate.subagentModel')}</span>
+          <span className={styles.fieldHelp}>{t('gateway.aggregate.subagentModelHint')}</span>
+        </div>
+        <div className={styles.fieldControl}>
+          <input
+            className={styles.separatorInput}
+            value={subagentModel}
+            disabled={busy}
+            placeholder={t('gateway.aggregate.subagentModelPlaceholder')}
+            aria-label={t('gateway.aggregate.subagentModel')}
+            onChange={(event) => setSubagentModel(event.currentTarget.value)}
+            onBlur={() => {
+              if (engaged && normalizedAliases && siteIds.length > 0 && separatorError === null) {
+                void runEngage(siteIds, separator, normalizedAliases, naming);
+              }
+            }}
+          />
+        </div>
+      </div>
+
+      <div className={styles.fieldRow}>
+        <div className={styles.fieldMeta}>
+          <span className={styles.fieldLabel}>{t('gateway.aggregate.subagentEffort')}</span>
+          <span className={styles.fieldHelp}>{t('gateway.aggregate.subagentEffortHint')}</span>
+        </div>
+        <div className={styles.fieldControl}>
+          <select
+            className={styles.select}
+            value={subagentReasoningEffort}
+            disabled={busy}
+            aria-label={t('gateway.aggregate.subagentEffort')}
+            onChange={(event) => {
+              const nextEffort = event.currentTarget.value;
+              setSubagentReasoningEffort(nextEffort);
+              if (engaged && normalizedAliases && siteIds.length > 0 && separatorError === null) {
+                void runEngage(siteIds, separator, normalizedAliases, naming);
+              }
+            }}
+          >
+            <option value="">{t('gateway.aggregate.subagentEffortUnset')}</option>
+            {['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map((effort) => (
+              <option key={effort} value={effort}>
+                {effort}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
 
       <div className={styles.fieldRow}>
         <div className={styles.fieldMeta}>
