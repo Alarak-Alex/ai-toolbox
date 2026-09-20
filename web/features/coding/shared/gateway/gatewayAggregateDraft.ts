@@ -1,5 +1,6 @@
 import type { GatewayAggregateConfig, GatewayAggregateNamingMode } from '@/services';
 import {
+  normalizeSubagentExposedModels,
   normalizeGatewayAggregateSiteIds,
   validateGatewayAggregateSeparator,
 } from './gatewayAggregateConfig';
@@ -32,6 +33,12 @@ export interface GatewayAggregateFormSeed {
   separator: string;
   aliases: Record<string, string>;
   naming: GatewayAggregateNamingMode;
+  /**
+   * Bare model names the takeover keeps publishing as programmable hidden
+   * aliases. An empty list is the backend's "publish every bare model" default,
+   * never "publish none".
+   */
+  subagentExposedModels: string[];
   /**
    * True when the stored draft named sites that are no longer selectable
    * (deleted, disabled or official). The caller surfaces it so a silently
@@ -102,6 +109,9 @@ export const resolveAggregateFormSeed = (params: {
       separator: resolveDraftSeparator(activeConfig.separator),
       aliases: aliasesForSelectedSites(activeConfig.aliases, siteIds),
       naming: activeConfig.naming ?? 'site_model',
+      subagentExposedModels: normalizeSubagentExposedModels(
+        activeConfig.subagent_exposed_models,
+      ),
       droppedDraftSites: false,
     };
   }
@@ -119,6 +129,9 @@ export const resolveAggregateFormSeed = (params: {
     separator: resolveDraftSeparator(draftConfig?.separator),
     aliases: aliasesForSelectedSites(draftConfig?.aliases, siteIds),
     naming: draftConfig?.naming ?? 'site_model',
+    subagentExposedModels: normalizeSubagentExposedModels(
+      draftConfig?.subagent_exposed_models,
+    ),
     // A draft whose sites all disappeared is replaced by the default selection;
     // the caller tells the user instead of silently swapping their selection.
     droppedDraftSites: reconciled.droppedStaleSites,

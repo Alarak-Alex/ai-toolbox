@@ -1158,6 +1158,7 @@ const CodexPage: React.FC = () => {
         naming,
         subagentModel,
         subagentReasoningEffort,
+        subagentExposedModels,
       }) =>
         engageProxyGatewayAggregate(
           'codex',
@@ -1167,6 +1168,7 @@ const CodexPage: React.FC = () => {
           naming,
           subagentModel,
           subagentReasoningEffort,
+          subagentExposedModels,
         ),
       onGatewayStatusChange: applyGatewayCliStatus,
     });
@@ -1974,6 +1976,7 @@ const CodexPage: React.FC = () => {
           naming,
           subagentModel,
           subagentReasoningEffort,
+          subagentExposedModels,
         }) =>
           engageProxyGatewayAggregate(
             'codex',
@@ -1983,6 +1986,7 @@ const CodexPage: React.FC = () => {
             naming,
             subagentModel,
             subagentReasoningEffort,
+            subagentExposedModels,
           ),
         onGatewayStatusChange: applyGatewayCliStatus,
         saveProvider: async () => {
