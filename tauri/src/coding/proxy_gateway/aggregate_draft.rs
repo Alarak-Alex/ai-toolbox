@@ -34,6 +34,9 @@ struct AggregateDraftRecord {
     separator: String,
     aliases: BTreeMap<String, String>,
     naming: AggregateNamingMode,
+    /// Whether a request may move to another selected site on failure. Absent
+    /// in older draft files, which therefore default to `false`.
+    cross_site_failover: bool,
     /// Bare model names the catalog keeps publishing as hidden aliases. Empty
     /// keeps the backend default of publishing every bare model.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -51,6 +54,7 @@ impl From<AggregateDraftRecord> for GatewayAggregateConfig {
                 separator.to_string()
             },
             aliases: record.aliases,
+            cross_site_failover: record.cross_site_failover,
             naming: record.naming,
             subagent_exposed_models: record.subagent_exposed_models,
             subagent: None,
@@ -65,6 +69,7 @@ impl From<&GatewayAggregateConfig> for AggregateDraftRecord {
             separator: config.separator.clone(),
             aliases: config.aliases.clone(),
             naming: config.naming,
+            cross_site_failover: config.cross_site_failover,
             subagent_exposed_models: config.subagent_exposed_models.clone(),
         }
     }
@@ -134,6 +139,9 @@ mod tests {
             separator: separator.to_string(),
             aliases: BTreeMap::from([("site-a".to_string(), "a".to_string())]),
             naming: AggregateNamingMode::ModelAtSite,
+            // Deliberately non-default so the round trip proves the new field
+            // is persisted instead of silently collapsing to its default.
+            cross_site_failover: true,
             // Deliberately non-default: a round trip that collapsed this to the
             // empty "publish everything" set would go unnoticed otherwise.
             subagent_exposed_models: BTreeSet::from(["gpt-5.6-luna".to_string()]),

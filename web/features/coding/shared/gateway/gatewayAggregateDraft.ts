@@ -34,6 +34,13 @@ export interface GatewayAggregateFormSeed {
   aliases: Record<string, string>;
   naming: GatewayAggregateNamingMode;
   /**
+   * Whether the takeover may move a request to another selected site when the
+   * addressed site fails. A stored value that is absent or `false` means the
+   * backend default: the request stays on one site, so a failure never spends
+   * another site's balance.
+   */
+  crossSiteFailover: boolean;
+  /**
    * Bare model names the takeover keeps publishing as programmable hidden
    * aliases. An empty list is the backend's "publish every bare model" default,
    * never "publish none".
@@ -109,6 +116,7 @@ export const resolveAggregateFormSeed = (params: {
       separator: resolveDraftSeparator(activeConfig.separator),
       aliases: aliasesForSelectedSites(activeConfig.aliases, siteIds),
       naming: activeConfig.naming ?? 'site_model',
+      crossSiteFailover: activeConfig.cross_site_failover === true,
       subagentExposedModels: normalizeSubagentExposedModels(
         activeConfig.subagent_exposed_models,
       ),
@@ -129,6 +137,7 @@ export const resolveAggregateFormSeed = (params: {
     separator: resolveDraftSeparator(draftConfig?.separator),
     aliases: aliasesForSelectedSites(draftConfig?.aliases, siteIds),
     naming: draftConfig?.naming ?? 'site_model',
+    crossSiteFailover: draftConfig?.cross_site_failover === true,
     subagentExposedModels: normalizeSubagentExposedModels(
       draftConfig?.subagent_exposed_models,
     ),

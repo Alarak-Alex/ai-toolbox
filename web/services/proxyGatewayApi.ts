@@ -33,6 +33,14 @@ export interface GatewayAggregateConfig {
   /** Template used to name each selected `(site, model)` pair. */
   naming?: GatewayAggregateNamingMode;
   /**
+   * Whether a request may fail over to another selected site when the site its
+   * slug names fails.
+   *
+   * Absent means the backend default, which refuses cross-site failover: the
+   * request fails instead of spending another site's balance.
+   */
+  cross_site_failover?: boolean;
+  /**
    * Bare upstream model names the generated Codex catalog keeps publishing as
    * hidden aliases.
    *
@@ -621,6 +629,7 @@ export const engageProxyGatewayAggregate = async (
   naming: GatewayAggregateNamingMode = 'site_model',
   subagentModel?: string,
   subagentReasoningEffort?: string,
+  crossSiteFailover?: boolean,
   subagentExposedModels?: string[],
 ): Promise<GatewayCliTakeoverStatus> => {
   return invoke<GatewayCliTakeoverStatus>('proxy_gateway_engage_aggregate', {
@@ -631,6 +640,7 @@ export const engageProxyGatewayAggregate = async (
     naming,
     subagentModel,
     subagentReasoningEffort,
+    crossSiteFailover: crossSiteFailover ?? false,
     // Always a concrete set: an empty array is the backend's "publish every
     // bare model" default and is exactly what "expose all" sends.
     subagentExposedModels: subagentExposedModels ?? [],
@@ -670,6 +680,7 @@ export const saveProxyGatewayAggregateDraft = async (
   separator: string,
   aliases?: Record<string, string>,
   naming: GatewayAggregateNamingMode = 'site_model',
+  crossSiteFailover?: boolean,
   subagentExposedModels?: string[],
 ): Promise<GatewayAggregateConfig> => {
   return invoke<GatewayAggregateConfig>('proxy_gateway_save_aggregate_draft', {
@@ -678,6 +689,7 @@ export const saveProxyGatewayAggregateDraft = async (
     separator,
     aliases: aliases ?? {},
     naming,
+    crossSiteFailover: crossSiteFailover ?? false,
     subagentExposedModels: subagentExposedModels ?? [],
   });
 };

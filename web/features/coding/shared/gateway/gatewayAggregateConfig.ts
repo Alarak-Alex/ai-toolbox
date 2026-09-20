@@ -293,6 +293,9 @@ export const toGatewayAggregateReengageConfig = (
   // silently unset the user's subagent default.
   const subagentModel = aggregate.subagent?.model?.trim();
   const subagentReasoningEffort = aggregate.subagent?.reasoning_effort?.trim();
+  // The failover policy is always replayed: a dropped `false` would silently
+  // re-enable cross-site spending on the next provider save.
+  const crossSiteFailover = aggregate.cross_site_failover === true;
   // A narrowed exposure set must be replayed verbatim: `[]` means "publish
   // every bare model", so dropping it here would silently widen the catalog on
   // the next provider save — the user would think they had restricted it.
@@ -309,6 +312,7 @@ export const toGatewayAggregateReengageConfig = (
     // object's own keys.
     ...(subagentModel ? { subagentModel } : {}),
     ...(subagentReasoningEffort ? { subagentReasoningEffort } : {}),
+    crossSiteFailover,
     ...(subagentExposedModels.length > 0 ? { subagentExposedModels } : {}),
   };
 };

@@ -64,6 +64,9 @@ fn draft(
             .map(|(site_id, alias)| ((*site_id).to_string(), (*alias).to_string()))
             .collect::<BTreeMap<_, _>>(),
         naming: AggregateNamingMode::ModelAtSite,
+        // Deliberately non-default so the round trip proves the new field is
+        // persisted instead of silently collapsing back to `false`.
+        cross_site_failover: true,
         // Deliberately non-default so the round trip proves the field is
         // persisted instead of silently collapsing to "expose everything".
         subagent_exposed_models: BTreeSet::from(["gpt-5.6-luna".to_string()]),
@@ -95,6 +98,7 @@ async fn draft_round_trips_and_rejects_an_empty_selection() {
             separator: "|".to_string(),
             aliases: BTreeMap::from([("site-a".to_string(), "a".to_string())]),
             naming: AggregateNamingMode::ModelAtSite,
+            cross_site_failover: true,
             subagent_exposed_models: BTreeSet::from(["gpt-5.6-luna".to_string()]),
             subagent: None,
         }

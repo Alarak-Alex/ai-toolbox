@@ -97,6 +97,11 @@ pub struct AggregateManifestConfig {
     /// How `(site, model)` pairs are named in the generated Codex catalog.
     #[serde(default)]
     pub naming: AggregateNamingMode,
+    /// Whether aggregate routing may move a request to another selected site
+    /// when the addressed site fails. Absent (manifests written before this
+    /// field) means `false`: the request stays on the single named site.
+    #[serde(default)]
+    pub cross_site_failover: bool,
     /// Bare upstream model names the generated catalog still publishes as
     /// hidden aliases. Absent or empty keeps the historical default of
     /// publishing every bare name the selected sites declare.
@@ -134,6 +139,7 @@ impl Default for AggregateManifestConfig {
             separator: default_aggregate_separator(),
             aliases: BTreeMap::new(),
             naming: AggregateNamingMode::default(),
+            cross_site_failover: false,
             subagent_exposed_models: BTreeSet::new(),
             slug_table: Vec::new(),
             subagent: AggregateSubagentDefaults::default(),
@@ -226,6 +232,7 @@ impl CliProxyManifest {
         separator: String,
         aliases: BTreeMap<String, String>,
         naming: AggregateNamingMode,
+        cross_site_failover: bool,
         slug_table: Vec<AggregateSlugEntry>,
     ) -> Self {
         self.mode = GatewayProxyMode::Aggregate;
@@ -234,6 +241,7 @@ impl CliProxyManifest {
             separator,
             aliases,
             naming,
+            cross_site_failover,
             // `with_aggregate` keeps the historical "publish every bare model"
             // default; callers narrow it through
             // `with_aggregate_subagent_exposed_models`.

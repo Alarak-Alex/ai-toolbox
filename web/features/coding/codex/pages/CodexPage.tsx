@@ -1158,6 +1158,7 @@ const CodexPage: React.FC = () => {
         naming,
         subagentModel,
         subagentReasoningEffort,
+        crossSiteFailover,
         subagentExposedModels,
       }) =>
         engageProxyGatewayAggregate(
@@ -1168,6 +1169,7 @@ const CodexPage: React.FC = () => {
           naming,
           subagentModel,
           subagentReasoningEffort,
+          crossSiteFailover,
           subagentExposedModels,
         ),
       onGatewayStatusChange: applyGatewayCliStatus,
@@ -1976,6 +1978,7 @@ const CodexPage: React.FC = () => {
           naming,
           subagentModel,
           subagentReasoningEffort,
+          crossSiteFailover,
           subagentExposedModels,
         }) =>
           engageProxyGatewayAggregate(
@@ -1986,6 +1989,7 @@ const CodexPage: React.FC = () => {
             naming,
             subagentModel,
             subagentReasoningEffort,
+            crossSiteFailover,
             subagentExposedModels,
           ),
         onGatewayStatusChange: applyGatewayCliStatus,

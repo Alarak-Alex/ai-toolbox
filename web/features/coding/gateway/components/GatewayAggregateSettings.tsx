@@ -184,6 +184,9 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
   // an untouched form never writes to the user's `[agents]` section.
   const [subagentModel, setSubagentModel] = React.useState('');
   const [subagentReasoningEffort, setSubagentReasoningEffort] = React.useState('');
+  // Cross-site failover is off by default: a request stays on the site its slug
+  // names, so a failure reports an error instead of spending another site.
+  const [crossSiteFailover, setCrossSiteFailover] = React.useState(false);
   /**
    * Programmable bare-name exposure. `'all'` submits an empty set, which is the
    * backend's "publish every bare model" default; `'selected'` publishes exactly
@@ -440,6 +443,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     setAliases(seed.aliases);
     setSiteIds(seed.siteIds);
     setDroppedDraftSites(seed.droppedDraftSites);
+    setCrossSiteFailover(seed.crossSiteFailover);
     // The stored value carries the mode: an empty set is the backend's default
     // "publish every bare model", so it must not be shown as "only selected".
     setSubagentExposedModels(seed.subagentExposedModels);
@@ -529,11 +533,12 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       nextNaming: GatewayAggregateNamingMode,
       /**
        * Values the caller just changed. `React.setState` has not flushed yet
-       * when an event handler engages, so anything read from state would write
-       * the previous value back.
+       * when an event handler engages, so anything derived from state would
+       * write the previous value back. Omitted fields come from the form.
        */
-      overrides?: { subagentExposedModels?: string[] },
+      overrides?: { crossSiteFailover?: boolean; subagentExposedModels?: string[] },
     ) => {
+      const nextCrossSiteFailover = overrides?.crossSiteFailover ?? crossSiteFailover;
       const nextExposedModels =
         overrides?.subagentExposedModels ??
         (subagentExposedMode === 'all' ? [] : subagentExposedModels);
@@ -565,6 +570,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
             nextNaming,
             subagentModel,
             subagentReasoningEffort,
+            nextCrossSiteFailover,
             nextExposedModels,
           );
         },
@@ -580,6 +586,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
           separator: nextSeparator,
           aliases: { ...nextAliases },
           naming: nextNaming,
+          cross_site_failover: nextCrossSiteFailover,
           subagent_exposed_models: [...nextExposedModels],
         };
       }
@@ -587,6 +594,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
     },
     [
       cliKey,
+      crossSiteFailover,
       primaryNeedsProxy.needsProxy,
       restoreDirectBlockedHint,
       runGatewayOperation,
@@ -610,8 +618,11 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       separator: string;
       aliases: Record<string, string>;
       naming: GatewayAggregateNamingMode;
+      /** Same "just changed" rule as `runEngage`. */
+      crossSiteFailover?: boolean;
       subagentExposedModels?: string[];
     }) => {
+      const nextCrossSiteFailover = next.crossSiteFailover ?? crossSiteFailover;
       const nextExposedModels =
         next.subagentExposedModels ??
         (subagentExposedMode === 'all' ? [] : subagentExposedModels);
@@ -626,6 +637,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
           next.separator,
           aliasesForSelectedSites(next.aliases, next.siteIds),
           next.naming,
+          nextCrossSiteFailover,
           nextExposedModels,
         ),
       )
@@ -644,7 +656,7 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
           }
         });
     },
-    [cliKey, subagentExposedMode, subagentExposedModels, t],
+    [cliKey, crossSiteFailover, subagentExposedMode, subagentExposedModels, t],
   );
 
   /**
@@ -767,6 +779,25 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
       return;
     }
     applySiteSelection(candidates.map((candidate) => candidate.id));
+  };
+
+  /**
+   * Flip the cross-site failure policy. Engaged: re-engage so the running
+   * takeover follows immediately. Not engaged: persist the draft, which is what
+   * makes the choice survive leaving this editor.
+   */
+  const handleToggleCrossSiteFailover = (checked: boolean) => {
+    setNotice(null);
+    setCrossSiteFailover(checked);
+    if (!engaged) {
+      persistAggregateDraft({ siteIds, separator, aliases, naming, crossSiteFailover: checked });
+      return;
+    }
+    if (siteIds.length > 0 && normalizedAliases && separatorError === null) {
+      void runEngage(siteIds, separator, normalizedAliases, naming, {
+        crossSiteFailover: checked,
+      });
+    }
   };
 
   // Render from the normalised selection so what the user sees is exactly the
@@ -1048,6 +1079,22 @@ const GatewayAggregateSettings: React.FC<GatewayAggregateSettingsProps> = ({
               </option>
             ))}
           </select>
+        </div>
+      </div>
+
+      <div className={styles.fieldRow}>
+        <div className={styles.fieldMeta}>
+          <span className={styles.fieldLabel}>{t('gateway.aggregate.crossSiteFailover')}</span>
+          <span className={styles.fieldHelp}>{t('gateway.aggregate.crossSiteFailoverHint')}</span>
+        </div>
+        <div className={styles.fieldControl}>
+          <Switch
+            size="small"
+            checked={crossSiteFailover}
+            disabled={busy}
+            aria-label={t('gateway.aggregate.crossSiteFailover')}
+            onChange={(checked) => handleToggleCrossSiteFailover(checked)}
+          />
         </div>
       </div>
 
