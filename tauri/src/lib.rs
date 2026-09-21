@@ -21,12 +21,15 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 // Module declarations
+pub mod app_paths;
 pub mod auto_launch;
+pub mod clipboard;
 pub mod coding;
 pub mod db;
 pub mod http_client;
 pub mod keep_awake;
 pub mod lightweight;
+pub mod mini_browser;
 pub mod settings;
 pub mod single_instance;
 pub mod startup_recovery;
@@ -54,7 +57,18 @@ pub(crate) fn build_main_window<R: tauri::Runtime>(
         .title("AI Toolbox")
         .inner_size(width, height)
         .min_inner_size(800.0, 600.0)
-        .visible(false);
+        .visible(false)
+        // Without this, WebKitGTK/WebView2 deny navigator.clipboard to the page and
+        // Monaco's Ctrl+V paste silently fails on Linux/Windows (issue #341). macOS
+        // always allows clipboard access.
+        .enable_clipboard_access();
+
+    // Keep the native WebView profile with custom app data too. Leaving this
+    // unset without an override preserves Tauri's original platform defaults.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if app_paths::get_override_info().is_custom {
+        builder = builder.data_directory(app_paths::resolved_data_dir().join("webview"));
+    }
 
     builder = match geometry {
         Some(g) => builder.position(g.x, g.y).maximized(g.maximized),
@@ -173,14 +187,7 @@ fn init_logging() -> Option<std::path::PathBuf> {
     }
 
     // 正式版本：日志写入文件
-    let log_dir = dirs::data_dir()
-        .map(|p| p.join("com.ai-toolbox").join("logs"))
-        .or_else(|| dirs::home_dir().map(|p| p.join(".ai-toolbox").join("logs")));
-
-    let log_dir = match log_dir {
-        Some(dir) => dir,
-        None => return None,
-    };
+    let log_dir = app_paths::resolved_data_dir().join("logs");
 
     if let Err(e) = fs::create_dir_all(&log_dir) {
         eprintln!("无法创建日志目录: {}", e);
@@ -255,9 +262,7 @@ fn setup_panic_hook() {
         error!("PANIC 发生: {} at {}", msg, location);
 
         // 尝试将错误写入单独的崩溃日志文件
-        if let Some(log_dir) = dirs::data_dir()
-            .map(|p| p.join("com.ai-toolbox").join("logs"))
-            .or_else(|| dirs::home_dir().map(|p| p.join(".ai-toolbox").join("logs")))
+        let log_dir = app_paths::resolved_data_dir().join("logs");
         {
             let crash_file = log_dir.join("CRASH.log");
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
@@ -291,6 +296,29 @@ fn is_wayland_session() -> bool {
 #[cfg(target_os = "linux")]
 fn is_appimage_runtime() -> bool {
     std::env::var_os("APPIMAGE").is_some() || std::env::var_os("APPDIR").is_some()
+}
+
+/// Detect whether the process is running inside a WSL2 distribution (WSLg).
+///
+/// WSLg exposes a Wayland compositor (Weston) and an XWayland server, but the
+/// Wayland path lacks the text-input-v3 protocol that GTK/WebKitGTK rely on for
+/// IME input, so Chinese input methods (fcitx5/ibus) cannot deliver candidates
+/// to the webview. The XWayland path (`GDK_BACKEND=x11`, workaround level 4)
+/// does support IME, and also sidesteps the Mesa/Zink GPU failures that are
+/// typical under WSLg (issue #341).
+#[cfg(target_os = "linux")]
+fn is_wsl_runtime() -> bool {
+    // WSL2 sets WSL_DISTRO_NAME / WSL_INTEROP / ROOTFS in the environment.
+    if std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some()
+        || std::env::var_os("ROOTFS").is_some()
+    {
+        return true;
+    }
+    // Fallback: /proc/version mentions Microsoft on WSL.
+    std::fs::read_to_string("/proc/version")
+        .map(|c| c.to_lowercase().contains("microsoft"))
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -442,9 +470,7 @@ const WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL: u8 = 4;
 
 #[cfg(target_os = "linux")]
 fn wayland_webview_workaround_level_path() -> Option<std::path::PathBuf> {
-    let base_dir = dirs::data_dir()
-        .map(|p| p.join("com.ai-toolbox"))
-        .or_else(|| dirs::home_dir().map(|p| p.join(".ai-toolbox")))?;
+    let base_dir = app_paths::resolved_data_dir();
     Some(
         base_dir
             .join("runtime")
@@ -777,6 +803,18 @@ fn setup_linux_wayland_webview_workaround() -> u8 {
     };
     let default_min_level = appimage_min_level.max(wayland_min_level);
 
+    // WSL2/WSLg: the Wayland compositor (Weston) lacks the text-input-v3
+    // protocol, so IME (Chinese input) cannot reach WebKitGTK, and the
+    // Mesa/Zink GPU path routinely fails (issue #341). Force level 4
+    // (GDK_BACKEND=x11 via XWayland) unless the user explicitly overrides
+    // the level — XWayland supports fcitx5/ibus and software rendering.
+    let wsl_min_level = if is_wsl_runtime() {
+        WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL
+    } else {
+        0
+    };
+    let default_min_level = default_min_level.max(wsl_min_level);
+
     let level = std::env::var("AI_TOOLBOX_WAYLAND_WEBVIEW_WORKAROUND_LEVEL")
         .ok()
         .and_then(|v| v.trim().parse::<u8>().ok())
@@ -791,7 +829,8 @@ fn setup_linux_wayland_webview_workaround() -> u8 {
 
     if default_min_level > 0 && level == default_min_level {
         info!(
-            "Detected AppImage runtime and/or Wayland session; using safer initial workaround level {} (DMABUF renderer disabled)",
+            "Detected AppImage runtime and/or Wayland session{}; using safer initial workaround level {} (DMABUF renderer disabled)",
+            if wsl_min_level > 0 { " and WSL2/WSLg runtime" } else { "" },
             default_min_level
         );
     }
@@ -828,7 +867,11 @@ fn setup_linux_wayland_webview_workaround() -> u8 {
     }
 
     if level >= 4 {
-        info!("Level 4: Falling back to X11 backend via GDK_BACKEND=x11 (requires XWayland)");
+        if wsl_min_level > 0 {
+            info!("Level 4 (WSL2/WSLg): Falling back to X11 backend via GDK_BACKEND=x11 (requires XWayland) so IME input works and GPU failures are avoided");
+        } else {
+            info!("Level 4: Falling back to X11 backend via GDK_BACKEND=x11 (requires XWayland)");
+        }
     }
 
     level
@@ -836,6 +879,13 @@ fn setup_linux_wayland_webview_workaround() -> u8 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Resolve the app data directory *before* anything else: logging, panic
+    // dumps and the Wayland workaround-level file all derive from it, and the
+    // main SQLite DB is opened from it later in setup(). Reading the bootstrap
+    // override here means a custom data path takes effect for the whole
+    // session, including diagnostics files.
+    app_paths::init_resolved_data_dir();
+
     // 初始化日志系统
     let log_file = init_logging();
     if let Some(ref path) = log_file {
@@ -949,21 +999,14 @@ pub fn run() {
             }
 
             // Create main window with platform-specific configuration
+            app_paths::configure_image_asset_scope(&app_handle, &app_paths::resolved_data_dir())?;
             info!("正在创建主窗口...");
             let _window = build_main_window(&app_handle, None).expect("Failed to create main window");
 
             // Create app data directory
             info!("正在获取应用数据目录...");
-            let app_data_dir = match app_handle.path().app_data_dir() {
-                Ok(dir) => {
-                    info!("应用数据目录: {:?}", dir);
-                    dir
-                }
-                Err(e) => {
-                    error!("无法获取应用数据目录: {}", e);
-                    panic!("Failed to get app data dir: {}", e);
-                }
-            };
+            let app_data_dir = app_paths::resolved_data_dir();
+            info!("应用数据目录: {:?}", app_data_dir);
 
             if !app_data_dir.exists() {
                 info!("创建应用数据目录...");
@@ -1556,7 +1599,8 @@ pub fn run() {
                     // A restore-specific recovery task starts one second later and owns the
                     // ordering of local re-apply -> Skills -> MCP -> WSL. Do not race it with the
                     // normal startup full sync while either restore flag is still present.
-                    if let Ok(app_data_dir) = app_clone.path().app_data_dir() {
+                    {
+                        let app_data_dir = app_paths::resolved_data_dir();
                         let resync_flag = app_data_dir
                             .join(settings::backup::utils::RESYNC_REQUIRED_FLAG_FILENAME);
                         let reapply_flag =
@@ -1681,10 +1725,7 @@ pub fn run() {
                     // Delay to ensure database is fully initialized
                     tokio::time::sleep(Duration::from_secs(3)).await;
 
-                    let app_data_dir = match app_clone.path().app_data_dir() {
-                        Ok(dir) => dir,
-                        Err(_) => return,
-                    };
+                    let app_data_dir = app_paths::resolved_data_dir();
                     let resync_flag =
                         app_data_dir.join(settings::backup::utils::RESYNC_REQUIRED_FLAG_FILENAME);
                     let reapply_flag =
@@ -1862,6 +1903,15 @@ pub fn run() {
                     return;
                 }
 
+                // Only the main window participates in the minimize-to-tray /
+                // lightweight-on-close behaviour. Secondary windows (the mini
+                // browser) must close normally: without this guard, closing the
+                // browser would be swallowed and the app would hide or drop
+                // into lightweight mode instead.
+                if window.label() != "main" {
+                    return;
+                }
+
                 let app_handle = window.app_handle().clone();
 
                 if app_handle.try_state::<SqliteDbState>().is_none() {
@@ -1914,6 +1964,19 @@ pub fn run() {
             open_folder,
             open_existing_folder,
             set_window_background_color,
+            // System clipboard (Monaco context menu + editor clipboard service)
+            clipboard::copy_text_to_clipboard,
+            clipboard::read_clipboard_text,
+            // Mini browser (relay dashboards / API balance)
+            mini_browser::mini_browser_open,
+            mini_browser::mini_browser_navigate,
+            mini_browser::mini_browser_current_url,
+            mini_browser::mini_browser_is_open,
+            mini_browser::mini_browser_close,
+            mini_browser::mini_browser_close_window,
+            mini_browser::mini_browser_focus_window,
+            mini_browser::mini_browser_list_windows,
+            mini_browser::mini_browser_clear_profile,
             // Update
             update::check_for_updates,
             update::install_update,
@@ -1940,6 +2003,9 @@ pub fn run() {
             settings::test_proxy_connection,
             // Proxy Gateway
             coding::proxy_gateway::proxy_gateway_get_settings,
+            coding::proxy_gateway::proxy_gateway_get_privacy_settings,
+            coding::proxy_gateway::proxy_gateway_update_privacy_settings,
+            coding::proxy_gateway::proxy_gateway_preview_privacy,
             coding::proxy_gateway::proxy_gateway_update_settings,
             coding::proxy_gateway::proxy_gateway_start,
             coding::proxy_gateway::proxy_gateway_stop,
@@ -1951,6 +2017,10 @@ pub fn run() {
             coding::proxy_gateway::proxy_gateway_cli_status,
             coding::proxy_gateway::proxy_gateway_engage_single,
             coding::proxy_gateway::proxy_gateway_engage_failover,
+            coding::proxy_gateway::proxy_gateway_engage_aggregate,
+            coding::proxy_gateway::proxy_gateway_aggregate_draft,
+            coding::proxy_gateway::proxy_gateway_save_aggregate_draft,
+            coding::proxy_gateway::proxy_gateway_subagent_catalog,
             coding::proxy_gateway::proxy_gateway_disengage_failover,
             coding::proxy_gateway::proxy_gateway_restore_cli_direct,
             coding::proxy_gateway::proxy_gateway_switch_primary_provider,
@@ -1976,6 +2046,19 @@ pub fn run() {
             settings::backup::restore_database,
             settings::backup::get_database_path,
             settings::backup::open_app_data_dir,
+            // Backup - Settings (unified save across channels + encryption)
+            settings::backup::save_backup_settings,
+            settings::backup::get_backup_repository_settings,
+            settings::backup::get_backup_encryption_status,
+            // Backup - Repository (GitHub/Gitee)
+            settings::backup::backup_to_repository,
+            settings::backup::list_repository_backups,
+            settings::backup::restore_from_repository,
+            settings::backup::delete_repository_backup,
+            settings::backup::test_backup_repository_connection,
+            // Custom data directory (issue #345)
+            app_paths::get_app_data_dir_info,
+            app_paths::set_app_data_dir_override,
             // Backup - WebDAV
             settings::backup::backup_to_webdav,
             settings::backup::list_webdav_backups,
@@ -2167,6 +2250,8 @@ pub fn run() {
             coding::cc_switch::list_cc_switch_providers,
             coding::deeplink::mark_deeplink_frontend_ready,
             coding::deeplink::import_from_deeplink_unified,
+            coding::deeplink::preview_deeplink_import,
+            coding::deeplink::get_provider_share_defaults,
             // Magic Context
             coding::magic_context::read_magic_context_config,
             coding::magic_context::save_magic_context_config,
@@ -2388,6 +2473,17 @@ pub fn run() {
             coding::oh_my_pi::save_omp_other_settings,
             coding::oh_my_pi::save_omp_models_provider,
             coding::oh_my_pi::delete_omp_runtime_provider,
+            coding::oh_my_pi::list_omp_agents,
+            coding::oh_my_pi::save_omp_agent,
+            coding::oh_my_pi::delete_omp_agent,
+            coding::oh_my_pi::list_omp_agents_configs,
+            coding::oh_my_pi::create_omp_agents_config,
+            coding::oh_my_pi::update_omp_agents_config,
+            coding::oh_my_pi::delete_omp_agents_config,
+            coding::oh_my_pi::apply_omp_agents_config,
+            coding::oh_my_pi::clear_omp_agents_applied_config,
+            coding::oh_my_pi::toggle_omp_agents_config_disabled,
+            coding::oh_my_pi::reorder_omp_agents_configs,
             coding::oh_my_pi::list_omp_extensions,
             coding::oh_my_pi::install_omp_extension,
             coding::oh_my_pi::uninstall_omp_extension,

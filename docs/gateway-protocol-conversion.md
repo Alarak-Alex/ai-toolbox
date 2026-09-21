@@ -85,6 +85,7 @@ flowchart LR
 | 前缀 | CLI | `route_name` | forwarded path 示例 |
 |---|---|---|---|
 | `/anthropic` | Claude Code | `anthropic` | `/v1/messages` |
+| `/claude-desktop` | Claude Desktop | `claude_desktop` | `/v1/messages` |
 | `/openai` | Codex / OpenAI-compatible | `openai-compatible` | `/v1/responses`、`/v1/chat/completions` |
 | `/grok` | Grok CLI | `grok` | `/v1/responses` |
 | `/kimi` | Kimi CLI | `kimi` | `/v1/chat/completions` |
@@ -94,14 +95,14 @@ flowchart LR
 
 | CLI | 条件 | source protocol |
 |---|---|---|
-| Claude | `/v1/messages` 或 `/messages` | `AnthropicMessages` |
-| Codex | `/v1/chat/completions` 或 `/chat/completions` | `OpenAiChat` |
-| Codex | `/v1/responses`、`/responses`、`/v1/responses/compact`、`/responses/compact` | `OpenAiResponses` |
-| Grok | `/v1/responses` 或 `/responses` | `OpenAiResponses` |
-| Kimi | `/v1/chat/completions` 或 `/chat/completions` | `OpenAiChat` |
+| Claude Code / Claude Desktop | `/v1/messages` 或 `/messages` | `AnthropicMessages` |
+| Codex | `/v1/chat/completions` | `OpenAiChat` |
+| Codex | `/v1/responses`、`/v1/responses/compact` | `OpenAiResponses` |
+| Grok | `/v1/responses` | `OpenAiResponses` |
+| Kimi | `/v1/chat/completions` | `OpenAiChat` |
 | Gemini | path 包含 `:generateContent` 或 `:streamGenerateContent` | `GeminiNative` |
 
-Grok 的 `/grok/v1` 只用于 `GET`/`HEAD` 根路径探测；正式请求必须使用 `/grok/v1/responses`。当前不接受 `/grok/v1/chat/completions` 或 `/grok/v1/responses/compact`。Kimi 同理：`/kimi/v1` 只用于 `GET`/`HEAD` 根路径探测，正式请求必须使用 `/kimi/v1/chat/completions`。如果 route 无法推导 source protocol，则不会创建 `ConversionRoute`，请求只能走 runtime 的普通转发/兼容路径。
+表中条件是经路由匹配后实际可达的 forwarded path。source helper 虽保留 `/responses`、`/chat/completions` 等内部别名，`/openai` 公开入口仍要求 `/v1`，不能据此声明 `/openai/responses` 可达。Grok 的 `/grok/v1` 只用于 `GET`/`HEAD` 根路径探测；正式请求必须使用 `/grok/v1/responses`。当前不接受 `/grok/v1/chat/completions` 或 `/grok/v1/responses/compact`。Kimi 同理：`/kimi/v1` 只用于 `GET`/`HEAD` 根路径探测，正式请求必须使用 `/kimi/v1/chat/completions`。如果 route 无法推导 source protocol，则不会创建 `ConversionRoute`，请求只能走 runtime 的普通转发/兼容路径；旧版 `/openai/v1/completions` 属于这种 runtime 特殊兼容，响应内容识别仍必须接受 `choices[].text`。
 
 ## 4. Provider target protocol
 
@@ -124,6 +125,8 @@ provider 读取在 `runtime/providers.rs`。`load_candidate_providers*()` 从对
 Copilot 是一个 runtime 特例：`effective_upstream_provider_for_request()` 会根据本次模型名把 Copilot provider 的 effective target protocol 动态切到 `OpenAiResponses` 或 `OpenAiChat`。这只影响本次请求，不改 provider 记录。Grok CLI 本身的入站协议固定为 OpenAI Responses；Grok provider 仍可通过 profile 选择其它上游 target，因此不能把 Grok CLI 路由和 xAI provider 方言混为一谈。
 
 ## 5. ConversionRoute 决策
+
+跨工具供应商分享由 `coding/deeplink` 适配配置字段，保持上游实际 `apiFormat`，不在分享层实现请求或 SSE 转换。导入目标的 native protocol 不匹配时，预览提示需要 Gateway；数据库记录保存对应 meta，启用后继续走本节的统一转换链路。内置 profile 只映射同一 profile/协议的目标 endpoint 引用，协议、SDK 地址和持久化边界见 [`deep-link-import.md`](deep-link-import.md)。
 
 `runtime/upstream.rs::conversion_route()` 的逻辑非常窄：
 
@@ -293,7 +296,7 @@ IR 通过 `transformer_metadata` 保留少量 provider-local roundtrip 信息，
 
 OpenAI Responses request 中不能完整结构化表达的 raw-only `input[]` item、`tools[]` item 和复杂 `tool_choice` 使用 `transformer_metadata` sidecar 保存，并且只在当前 request/response 转换链路中使用：
 
-- raw fragment 按原 index 合并回 Responses target，不能降级成空 message 或提升为跨请求 store。
+- raw tool fragment 按原 index 合并回 Responses target。raw input fragment 还要记录所在的 IR message 边界，出站时根据实际输出 item 数重算 index；assistant/commentary/reasoning 归并会减少 item 数，直接复用旧 wire index 会把 raw item 移进下一工具批次。不能把 raw item 降级成空 message 或提升为跨请求 store。
 - 只要原请求存在 raw tool fragment，就必须保存 `openai_responses_tool_signatures`；原 structured tool 集合为空时也要保存空数组 `[]`。
 - 同时写入 `openai_responses_tool_signatures_complete=true`，明确区分“原 structured 集合确实为空”和“没有完整性证据”。
 - merge 前重新计算当前 structured tool signatures，并要求数量、顺序和每项 `type:name` 完全一致。
@@ -334,6 +337,29 @@ OpenAI Responses request 中不能完整结构化表达的 raw-only `input[]` it
 Anthropic tool-result 入站如果包含标准 parser 不认识的 block，必须先保留原始数组为 JSON 文本，再让共享识别入口处理 MCP/Responses alternate 形态；不能在 inbound 阶段静默丢失。该规则只对转换路径生效，同协议直通仍由 runtime 保持原始 wire body。
 
 Gemini Native 入站同一个 `content.parts` 可以包含多个并行 `functionResponse`。请求转换必须按每个 `functionResponse` 拆成独立 tool message，并把紧随其后的 Gemini 2.x marker/顶层媒体归到前一个工具结果；不能用单个临时变量覆盖后只保留最后一个。
+
+### 8.4 Responses 并行工具调用与 assistant turn（issue #352）
+
+Responses 的每个 `function_call` / `custom_tool_call` 是独立 input item，同一 assistant turn 还可以在调用前、中、后穿插 commentary 和 reasoning。`openai/responses/shared.rs::append_responses_input_to_messages` 必须把连续 assistant item 归入同一个 IR message，保留全部文本、reasoning、refusal 和调用；Chat 出站才能得到 `assistant(content, tool_calls=[A,B]) -> tool(A) -> tool(B)`。逐 item 输出 assistant，即使所有结果和 ID 仍在，也会使严格 Chat 上游在结果到达前看到新 assistant，报缺少工具结果。工具之后才出现文本的上游 SSE 及 `response.output_item.done` 历史同样走此规则。
+
+- 同名调用按各自原始 `call_id` 保留，不按工具名去重或重编号；批次内 index 按出现顺序递增，新批次从零开始。function/custom 混合与经过 Codex context 展平的 namespace/tool search 都消费同一入站归并。
+- reasoning 和 assistant commentary 不切断工具批次；前置、调用间和尾部 reasoning 按既有归属规则合并一次，保留 signature/context。tool output、非 assistant 消息、独立输入、raw-only item 和 compaction 结束当前 turn，不能跨这些边界把不同轮次拼在一起。raw input 的恢复位置见 §8.1。
+- 工具结果保留正文，带 ID 的结果逆序仍按 ID 配对，不合成缺失结果。Gemini 出站需要移除 ID 时先恢复调用顺序，见 §8.5。关闭 `parallel_tool_calls` 只影响后续生成，不能据此破坏历史批次。图片继续在整批 tool results 之后由 Chat writer 输出 synthetic user 媒体消息。
+- 归并属于纯 transformer 的 Responses 入站语义，供 Chat/Anthropic/Gemini 出站复用；不增加 provider 开关、数据库状态或 runtime 全局消息重排。同协议 Responses 继续原始 body 直通。
+- `CodexHistoryStore` 负责找回缺失 call item，不能替代 IR 的批次归并。JSON/SSE 已记录完整调用、或 `previous_response_id` 成功补回整批后，下一轮仍必须通过相同转换入口。
+
+精确回归在 `openai/responses/parallel_tool_tests.rs`；公开协议和真实 HTTP 回归在 `tauri/tests/coding/proxy_gateway/`，同时覆盖共享入站的 compact Chat fallback。`parallel_tools_matrix.rs` 对四协议的 12 个非 identity request 方向和 12 个 JSON response 往返方向逐项核对最终 wire；SSE 覆盖 Chat/Anthropic/Gemini -> Responses 历史回放及 Gemini -> Chat/Anthropic 工具事件生命周期。HTTP 模拟上游独立校验完整批次，覆盖完整/部分历史、previous-response/唯一 call-id 补全、JSON/SSE/强制 SSE 聚合、结果逆序、反复重放以及关闭/截断正文日志。只断言工具结果数量或 JSON shape 不足以验证该契约。
+
+### 8.5 Gemini 工具身份、结果分组与流式快照
+
+- Gemini 入站同名调用不能使用单值 `name -> id` 映射。`gemini/convert.rs::resolve_gemini_request_tool_ids` 在当前请求内维护未完成调用：原生 ID 优先；同一 content 中显式 ID 的结果先占用对应调用，剩余无 ID 结果再按函数名和调用顺序逐个消费，不能重复借用最后一个 ID。
+- 缺少调用 ID 时，JSON request/response 与 SSE 共用 `gemini/mod.rs::synthesize_gemini_tool_id` 生成带 `gemini_synth_` 前缀的 UUID。不能用 part 下标作为跨轮身份，否则多轮历史或 Codex history store 会出现同 ID 调用。原生 ID 不重写。
+- Gemini 出站将连续 IR tool messages 汇入同一 user content；每个结果连同 Gemini 2.x marker/inline image 或 Gemini 3.x nested parts 一起移动。普通 user、model 及 instructions 边界结束批次。
+- 仅本地合成 ID 不回传 Gemini；移除前按原调用顺序排列整批结果，避免同名工具逆序完成时失去关联。带原生 ID 的普通 Gemini 请求保持结果提交顺序。Vertex 的“移除全部 function ID”由 runtime 决定，必须在移除前完成等价排序并保持媒体归属；混合原生/匿名结果时先保留显式配对，再把匿名结果放回剩余调用位置，不能简单把无 ID 结果排到末尾。provider 判断不进入 transformer。
+- Gemini 的 chunk 内 `parts[0]` 不是流级工具 index。`gemini/stream.rs::merge_gemini_function_call_part` 只在同一非空原生 ID 下合并参数快照和签名；不同 ID 或无 ID 的每次出现均保留，不能按名称、参数相同或 chunk 内位置去重。`StreamKernel` 暂存工具快照，到 finish/EOF 输出每个调用一次并分配连续 index；普通文本和 reasoning 继续即时输出，不缓存整条 SSE。已进入错误终态时不得在 EOF 补发工具或成功终态。
+- 非流客户端遇到 forced SSE 时，`runtime/upstream.rs::GeminiCandidateAggregate` 复用同一纯协议 helper。该聚合路径仍由 runtime 按 MIME/客户端 streaming 意图选择，缺少合法终态的拒绝规则不变；不能只修正常 SSE 转换而漏掉聚合器按工具名覆盖的路径。
+
+相关回归：`parallel_tools_matrix.rs`、`parallel_tools_http.rs`；runtime 的 `gemini_sse_aggregate_*` 和 `outbound_adapter_*vertex*` 同时核对相同名称的不同 ID、匿名调用、同 ID 更新、signature、逆序结果及图片归属。
 
 ## 9. ConversionContext
 
@@ -407,7 +433,7 @@ source state 会维护必要的流式状态，例如：
 - OpenAI Chat leading `<think>...</think>` 跨 chunk FSM。
 - Anthropic content block/tool block 状态。
 - OpenAI Responses item/tool call 状态。
-- Gemini 累计文本和 reasoning 前缀差值。
+- Gemini 文本和 reasoning：严格增长且前缀匹配的累计快照做差分，相同连续片段仍按 delta 保留，不能吞掉重复字符或拆坏占位符。
 - finish reason 和 usage 的延迟合成。
 - source error terminal gate。
 
@@ -422,6 +448,7 @@ SSE 转换要求边读边写，不 full-buffer。结束事件要幂等处理，�
 - **Responses target writer（跨协议出站）**：`finish_reason=error` → `response.failed`；`cancelled`/`canceled` → `response.cancelled` + `status=canceled`；`length` → **`response.completed` + `status=incomplete`**（对齐 cc-switch Codex bridge，见 §18 有意差异）。不要把“length 未发 `response.incomplete` 事件名”单独判成实现疏漏。
 - 一旦识别到 JSON/SSE error、空 error event、transport `fail()`、Responses failed 或 source parser `StreamError`，`StreamKernel` 必须进入 error terminal。后续 source block 被忽略，EOF 也不能再生成正常 Chat stop、Responses completed 或 Gemini finish。
 - target writer 已输出 error envelope 后，正常完成事件不能再次出现；error 与 completed/stop/`message_stop` 必须保持互斥。
+- Gemini target 与 Anthropic/Responses 一样延后没有 usage 的 finish：先保留 reason，等后续 Chat `choices:[]` 用量事件或正常 EOF 再发唯一 `finishReason`，保留 `MAX_TOKENS` 等真实原因。等待期间遇到 error 只发错误，不先输出成功终态。回归见 `chat_stream_to_gemini_waits_for_usage_only_chunk_before_finish` 和 `chat_stream_to_gemini_without_usage_preserves_eof_reason_or_late_error`。
 
 runtime 在进入 transformer 前后还会包一些 provider/runtime stream adapter：
 
@@ -429,7 +456,7 @@ runtime 在进入 transformer 前后还会包一些 provider/runtime stream adap
 - Gemini target 的原始 SSE 会被 `record_gemini_sse_stream()` 旁路记录到 `GeminiShadowStore`。
 - Bailian/DashScope OpenAI Chat SSE 会先经过 provider-specific filter。
 - xAI/Grok OpenAI Chat SSE 会过滤没有 role/content/tool/finish/usage 的空 delta。
-- Ollama NDJSON stream 会先转成 OpenAI Chat SSE。
+- Ollama NDJSON stream 会先转成 OpenAI Chat SSE，工具参数对象转 JSON 字符串，最终用量使用 `choices:[]` usage-only 事件。仅真实 `done` 后发送成功结束；显式 error 或缺 done 的 EOF 不能补成功终态。
 - 如果响应最终转回 OpenAI Responses，`record_responses_sse_stream()` 会记录 Codex tool call 历史。
 - 最终 client-facing SSE 再进入同一 request-scoped pipeline 的 reverse `on_outbound_stream()`。
 
@@ -517,13 +544,13 @@ SQLite v17 只新增可空 `reasoning_effort`，列表和 SQLite 摘要详情回
 
 供应商 `cache_hit_rate` 在实时明细和 `usage_daily_rollups` 合并后计算：`cache_read / (fresh_input + cache_creation + cache_read)`，返回 0..1 比例；分母为零返回 `None`，零命中返回 `Some(0.0)`。前端 TPS 仅使用 output tokens；流式有首包时使用总耗时减首包等待，否则使用端到端耗时。现有 `first_token_ms` 是首个非空 chunk 写出时间，近似 TTFT，不承诺严格文字 token 计时。
 
-本地会话用量是独立的 `session_import` 采集链路，应用启动与每 60 秒同步，不依赖网关运行，也不进入 transformer 或 runtime 请求计数。Claude/Codex/Gemini/OpenCode 原生日志归一后写同一摘要表，source 为 session，缺失 HTTP 指标不推断。v18 JSONB 账本保证记录与导入状态原子提交及归档后幂等，并保存 envelope 身份；跨源匹配优先共享 envelope，明确不同的 ID 不按相同 token 合并，零用量只允许精确身份匹配。缺少共有 ID 时才使用唯一、精确非零 token 的窄时间窗匹配，最终用量更新会重验仍可读取的旧匹配。旧手动导入的多次快照保留全部来源身份，在同一事务内合并到一条记录。历史汇总保存有效延迟样本数，避免把本地未知延迟当零稀释网关平均值。采集格式、去重边界与验证维护在 [Gateway 模块约束](../tauri/src/coding/proxy_gateway/AGENTS.md)。
+本地会话用量是独立的 `session_import` 采集链路，应用启动与每 60 秒同步，不依赖网关运行，也不进入 transformer 或 runtime 请求计数。Claude/Codex/Gemini/OpenCode 及 Pi/OMP/DSH/Grok/Kimi/Hermes/OpenClaw 原生用量归一后写同一摘要表，source 为 session，缺失 HTTP 指标不推断。v18 JSONB 账本保证记录与导入状态原子提交及归档后幂等，并保存 envelope 身份；跨源匹配优先共享 envelope，明确不同的 ID 不按相同 token 合并，零用量只允许精确身份匹配。缺少共有 ID 的逐调用记录才使用唯一、精确非零 token 的实际执行区间匹配（结束时间减 duration_ms，起点前容差 10 秒，结束后落盘宽限 30 秒）；每轮重核验全部保留的 native 明细以覆盖 #340 的旧重复记录，最终用量更新会重验仍可读取的旧匹配。旧手动导入的多次快照保留全部来源身份，在同一事务内合并到一条记录。历史汇总保存有效延迟样本数，避免把本地未知延迟当零稀释网关平均值。统计工具集合与网关接管集合分开；v20 记录原生粒度、调用数及额外 Token，累计来源按变化贡献写入而不伪造逐请求。Desktop audit 的已证明重复贡献与修复快照原子回退。采集格式、去重边界与验证维护在 [Gateway 模块约束](../tauri/src/coding/proxy_gateway/AGENTS.md)。
 
 本节指标审查对照 cc-switch `6243e20a` 的 `services/session_usage*.rs`、`services/usage_stats.rs`、`database/dao/usage_rollup.rs`，以及 AxonHub `dfbe2259` 的 `internal/server/biz/usage_log.go`、`llm/pipeline/stream/usage.go` 和 `llm/transformer/openai/copilot/outbound.go`。本次仅核对相关行为，§19.4 的协议增量同步 baseline 保持原记录。
 
 延迟样本列由独立 v19 迁移补齐，兼容已经标记 v18 但只创建采集账本的开发数据库，并保留已有非空样本数。历史归档失败应记录告警并重试，不得阻止当前 proxy 摘要保存或已提交 native 用量的刷新事件。
 
-回归入口：`runtime/observability.rs::tests` 的快照方言/metrics-only 往返/60 秒边界，`runtime.rs::tests` 的真实转发、转换、Copilot 失败协议/effort 往返、进行中计数、failover 和 restart，`usage_stats.rs::tests` 的列表/详情/缓存与延迟聚合，`session_import::tests` 的原生会话导入、身份冲突、旧账本/旧快照收敛和去重，`tauri/tests/sqlite_jsonb.rs` 的 v17/v18/v19 迁移，以及前端 `gatewayFormatters.test.ts`。
+回归入口：`runtime/observability.rs::tests` 的快照方言/metrics-only 往返/60 秒边界，`runtime.rs::tests` 的真实转发、转换、Copilot 失败协议/effort 往返、进行中计数、failover 和 restart，`usage_stats.rs::tests` 的列表/详情/缓存与延迟聚合，`session_import::tests` 的原生会话导入、身份冲突、旧账本/旧快照收敛和去重，`tauri/tests/sqlite_jsonb.rs` 的 v17/v18/v19/v20 迁移，以及前端 `gatewayFormatters.test.ts`。
 
 ## 12. 上游 URL、query 与 auth
 
@@ -754,7 +781,7 @@ apply_outbound_adapter_compat_value(
 4. 读取 effective meta 中的 `codexChatReasoning`；没有配置时，才根据明确的 effective `providerType/apiFormat` 做窄范围推导。
 5. `apply_provider_body_compat_before_generic()` 先做 provider 专属 body 改写。
 6. 如果 target 是 OpenAI Chat，执行 Codex -> Chat 多供应商 reasoning/thinking 参数映射。
-7. 如果 target 是 OpenAI Chat，执行通用第三方 Chat 兼容清理，例如 `developer` 转 `system`、system 合并到首条、过滤 Responses custom tool、清理常见不支持字段。
+7. 如果 target 是 OpenAI Chat，执行通用第三方 Chat 兼容清理，例如 `developer` 转 `system`、instruction 消息按来源方向排布（Anthropic/Claude Code 来源只合并前导连续块，块之后的 system 原位降级为 `user`；其余来源与直通 body 一律合并到首条，见 §19.7 F-15）、过滤 Responses custom tool、清理常见不支持字段。
 8. 对发生协议转换的请求，清理无 tools 时的 `tool_choice` / `parallel_tool_calls` 等控制字段。
 9. `apply_provider_body_compat_after_generic()` 做必须在通用清理后执行的 provider 规则。
 10. 如果 target 是 OpenAI Chat，执行 `reasoningField` 策略和 DeepSeek 最终 reasoning 门控。
@@ -882,7 +909,7 @@ DeepSeek legacy OpenAI Completion API 更不是 transformer 路径。Codex/OpenA
 | Gemini Vertex | Gemini Vertex 不接受 Gemini function call/response id。 | `ProviderBodyCompat::GeminiVertex`。Gemini Native target 下移除 `contents[].parts[].functionCall.id` 和 `functionResponse.id`；Gemini URL/version 仍由 runtime path 拼接处理。 | 只在 target protocol 是 Gemini Native 时触发，不改变 transformer 内部 synthetic id / thoughtSignature 语义。 |
 | Codex official / Codex OAuth 对照 | 参考项目的 Codex OAuth 路径强制走 ChatGPT Codex backend `/responses`，body 需要 `store=false`、`include=["reasoning.encrypted_content"]` 等，并有 OAuth account manager。 | `ProviderBodyCompat::CodexOfficial`。OpenAI Responses target 下强制 `stream=true`、`store=false`、`parallel_tool_calls=true`，移除 `max_tokens` / `max_completion_tokens` / `metadata`，默认补 `include:["reasoning.encrypted_content"]` 和 `reasoning.summary="auto"`；headers 补 `Accept: text/event-stream`、缺省 `Originator: ai-toolbox`，并保留客户端已有 Codex passthrough headers。非流客户端遇到官方 forced SSE 时由 runtime 聚合同协议 JSON 后再按需 response conversion。 | AI Toolbox 这里是 official Codex upstream body/header 兼容，不包含参考项目的 Codex OAuth device/account 管理。`category=official` provider 仍不进入 Gateway 候选；要代理必须有可转发 bearer token。 |
 | GitHub Copilot | 参考项目将 Copilot 作为 provider adapter：token exchange、fingerprint headers、模型 id 归一化、Chat/Responses 动态路由。 | `ProviderBodyCompat::Copilot` + auth/header runtime adapter。本次请求按模型动态选择 OpenAI Chat 或 Responses target；GitHub token 可 exchange 成 Copilot bearer token并缓存；注入/覆盖 Copilot fingerprint headers、`X-Initiator`、interaction/request ids；Claude 4.x 模型 id 归一化；Chat/Responses orphan tool result 降级；Responses function_call item id 修正；Chat target 会移除 Anthropic thinking block。 | 不包含参考项目的 GitHub device-code 登录 UI、账号存储或 live model list fallback。Copilot profile 必须保存 origin base URL，不能固定 full URL 到 `/chat/completions`，否则会绕过动态 Responses endpoint。 |
-| Ollama | 参考项目和本地模型类接口不是 OpenAI Chat 协议本体，最后一跳是 Ollama `/api/chat`。 | `ProviderBodyCompat::Ollama` 或 `apiFormat=ollama/chat`。Gateway target protocol 仍视为 OpenAI Chat；发送前把 Chat body 投影成 Ollama `model/messages/options/format/stream`，图片 data URL 去前缀写 `images[]`，token/stop/format 映射到 Ollama 字段；非流 JSON response 先转回 OpenAI Chat，流式 NDJSON 先转 Chat SSE，再进入已有 response conversion。 | 不是第五种 transformer 协议，不需要扩展 5x5 矩阵。 |
+| Ollama | 参考项目和本地模型类接口不是 OpenAI Chat 协议本体，最后一跳是 Ollama `/api/chat`。 | `ProviderBodyCompat::Ollama` 或 `apiFormat=ollama/chat`。Gateway target protocol 仍视为 OpenAI Chat；发送前把 Chat body 投影成 Ollama `model/messages/tools/options/format/stream`，保留工具历史并把合法 arguments JSON 字符串解码成对象，图片 data URL 去前缀写 `images[]`；非流 JSON 与 NDJSON 响应先转回 Chat，保留工具调用、thinking、用量和真实终态，再进入已有 response conversion。 | 不是第五种 transformer 协议，不需要扩展 5x5 矩阵。 |
 | text-only 图片 / 多模态降级 | 参考项目有发送前 text-only 模型图片替换和上游错误后的反应式重试。 | runtime 发送前预测式替换由 provider meta 或 model catalog 显式能力驱动：`imageInputPolicy`、`textOnlyModels`、`imageCapableModels`、`supportsImage=false` 等；`allowTextOnlyModelHeuristic=true` 时才启用参考项目风格模型名名单（含 exact `glm-5.1`/`glm-5.2`，不含 `glm-5.2v`）。上游 400/415/422/501 时同 provider 重试一次并把图片块替换为 `[Unsupported Image]`：错误文本明确 image/media/vision unsupported，或自证性 `only support text` / `only supports text` / `text only` / `text-only`（无需提到 image，覆盖火山 GLM 5.2 的 `Model only support text input`）。 | 启发式默认关闭。不要因为模型名像 text-only 就静默剥图片，除非 profile/meta 明确允许。 |
 | Direct Anthropic native web_search | 参考项目会处理 Anthropic native/server tool 与 beta header。 | Anthropic target 下，Direct provider 保留 native `web_search` tool，并在 header 注入 `anthropic-beta: web-search-2025-03-05`；Bedrock 通过 body `anthropic_beta` 保留；Vertex/LongCat/普通非 Direct 平台会过滤 native web_search，避免上游拒绝。 | 这是 provider platform 兼容。Anthropic native block 的协议保真在 transformer 中可 roundtrip，但能否发给上游由 runtime provider platform 决定。 |
 | `defaultMaxTokens` / prompt cache / billing CCH | 参考项目也有 provider/session cache key、usage、billing 相关兼容。 | `EnsureMaxTokensMiddleware` 只在 effective provider meta 显式 `defaultMaxTokens > 0` 时补齐/截断目标协议 token 字段；OpenAI Responses target 缺 `prompt_cache_key` 时 runtime 可从稳定 session 线索 fallback；Claude Code billing header 中动态 `cch=...` 由 middleware 剥离，Anthropic target 可回填。 | 这些是 runtime policy，不是供应商协议结构转换。无显式 meta 时不得默认改变用户请求。 |
@@ -981,8 +1008,52 @@ X-Transformer-Lossy: /path: message | /path2: message
 - OpenAI legacy Completions API。
 - OpenAI Responses `/responses/compact` 普通矩阵转换；compact 只允许通过 runtime compact compat 的专项 facade 处理。
 - Embedding、image generation、video、rerank 等非聊天协议。
-- Provider 平台 transport，例如 WebSocket executor。
+- Provider transport 不进入 transformer；Codex 同协议 Responses WebSocket 由 runtime 单独处理，见 §16.1。
 - Provider 账号登录、token exchange、model list fallback。
+
+### 16.1 Codex Responses WebSocket（issue #342）
+
+WebSocket 是 runtime 的传输方式，不扩展上述转换矩阵。`runtime/websocket.rs` 只接收 Codex 路由的 `GET + Upgrade`，当前实际入口为 `/openai/v1/responses`。每条下游连接独占一条上游连接，固定 provider 和认证身份；连接建立后不切换 provider，也不重放已经发送的生成请求。其他 CLI 和 `/responses/compact` 继续 HTTP/SSE。
+
+网关设置 `codex_websocket_enabled` 默认关闭，旧配置缺少该字段也按关闭读取；开关位于“设置 → 转发与容错 → 传输方式”，沿用普通网关 settings 的 JSONB 保存和运行态更新。关闭时在加载 provider 前返回 `426`，不连接上游；上游握手返回后、下游写出 `101` 前再次检查，覆盖保存设置与握手并发的情况。
+
+开启后的升级顺序是：读取真实候选 provider → 判断 effective target protocol → 完成并校验上游握手 → 再次检查开关 → 才向 Codex 写出 `101`。实际目标不是 Responses、Copilot 这类需要按请求模型动态选协议的 provider，或上游配置明确 `supports_websockets=false` 时，在升级前返回 `426`。未配置该能力的 Responses provider 可以发起一次真实握手确认；只有上游返回有效 `101` 才启用，因此不能仅从接管后的 `wire_api="responses"` 推断支持。上游不接受升级时返回 `426`；鉴权、限流和其他真实错误保留错误语义，具体状态规则见兼容文档 §7.1。
+
+Codex 接管写入的 `supports_websockets=true` 描述本机网关能力，并纳入接管受管字段；恢复直连恢复原值或移除新建字段。已有接管配置需重新接管一次以写入该能力，单纯重启网关只重建 runtime。真实上游能力仍从数据库 provider 的原始配置读取。Codex 在握手阶段收到 `426` 后使用原有 HTTP/SSE 请求，转换请求仍进入现有 `ConversionRoute`。已经建立的 WS 内出现 error event 不再具备握手回退语义。
+
+切换开关不改写 CLI 文件，也不重启网关。关闭后已有连接等待 pending 轮次全部结算再关闭；空闲等待期间收到新帧也要重新检查开关，不能再放行一轮。关闭空闲连接本身不产生模型失败或额外调用数。开启后已回退 HTTP 的 Codex 会话可能继续使用 HTTP，需要新建会话或重启客户端重新尝试 WS。同一 provider 的不同会话可以同时使用 WS/HTTP；排障应核对实际 path、会话标识与业务终态，不能仅凭 provider 相同推断重复记账或回退。
+
+逐轮处理遵守以下不变量：
+
+- 每个文本 `response.create` 建立独立请求记录，按 `stream_id` 隔离 FIFO 队列；通过 response ID 关联后续事件，忽略已完成 ID 的重复终态对统计的影响。`previous_response_id`、`generate:false` 和事件控制字段保留。模型映射及已证明的同协议 provider body 兼容复用 `upstream.rs`，不调用跨协议 transformer。
+- 上游事件先提取 usage，再写给客户端；只有终态成功写出后才能标记 Completed / Failed / Incomplete / Canceled。客户端写入失败时保留已收到的真实 Token，记录 Canceled；缺终态的上游 EOF 为 Incomplete。`101`、收到 usage、日志快照中存在终态都不能替代终态送达。
+- 成功轮次在终态送达后立即写 SQLite compact summary + JSONL，不等连接关闭。`transport=websocket` 的业务轮次没有 HTTP 状态码；握手失败保留真实状态及 fallback 原因。连接/response/stream/previous IDs 和握手尝试明细只放 JSONL，并进入明细导出。
+- 握手、Ping/Pong、连接复用和轮间空闲不计模型调用或 RPM。`generate:false` 标记 WebsocketWarmup，调用数为 0；无 usage 不产生用量，有真实 usage 则照实计 Token/费用。握手重试与每轮生成尝试分别记录，不能把连接建立前的重试伪装成每轮生成重试。
+- 统计、成功率、失败筛选、原生会话去重和日聚合均使用业务终态及调用计数；native Codex 缺 response ID 时仍可按已有唯一用量/时间窗口匹配已完成 WS 请求。预热不参与该匹配，已知不同 envelope 仍不得 heuristic merge。
+- SQLite v21 只为摘要增加 transport/request-kind 判别；旧行默认 HTTP 普通请求。正文、Headers、握手过程不写 SQLite。关闭日志正文、限制快照大小、metrics-only 或动态修改日志设置均不改变 usage/终态解析；JSONL 缺失时摘要回退不把内部状态占位 `0` 展示为 HTTP 状态。
+
+传输复用全局 `http_client` 的 direct/system/custom proxy 与 rustls 策略；HTTP/1.1 完成升级后由 `tokio-tungstenite` 处理帧。当前限制为每消息 16 MiB、最多 64 个待完成请求、待完成请求原始/出站 payload 共 64 MiB；事件快照还受既有日志设置和每份 16 MiB 上限约束。写入/flush 有 10 秒上限，20 秒发送 Ping、90 秒检测失联；逐轮首事件/空闲超时复用 Codex app 配置，排队时间不提前消耗下一轮首事件超时。连接空闲 50 分钟或存活 55 分钟后关闭并要求客户端重新连接。停止/重启信号关闭两端并结算未完成轮次。
+
+关闭连接由 runtime 完成有界 Close 握手：上下游并行收尾，各自最多 1 秒；发送或冲刷自动 Close 回复后继续读取，直到握手结束、传输错误或超时。期间到达的帧只排空，不再转发、建立新轮次或改变已结算用量。`tokio-tungstenite` 的发送 Close 不等于握手完成，收到 Close 后也必须冲刷自动回复；过早释放 TCP 在 Windows 上可能使客户端收到 `10054 ConnectionReset`。此处使用 `SinkExt::close` 兼容已经收到/发送 Close 的状态，然后驱动读侧结束，不改协议转换或 provider wire 适配。
+
+本地网络回归位于 `runtime/websocket/tests.rs`、`runtime/websocket/lifecycle_tests.rs` 和 `runtime/websocket/settings_tests.rs`，覆盖真实升级、双轮复用、多路交错/重复终态、默认关闭与保存后即时生效、关闭时在途用量保留、空闲读/握手期间关闭、转换前 426 与后续 HTTP 转换、认证/限流、握手重试预算、代理/RawURL/query/Beta header、预热、正文关闭/截断、写入失败、缺终态、超时和停止。关闭握手回归还覆盖 Close 已发出后才到达的真实 TCP 请求、等待对端确认、任一端主动关闭时冲刷回复，以及对端不回应时有界退出；就绪同步通过 Ping/Pong 和 TCP peek，不依赖固定 sleep。`settings.rs` 验证旧配置默认关闭、开关保存读回及相邻设置保留。跨层回归还包括 `session_import/websocket_tests.rs` 的双向去重、`usage_stats.rs` 的日聚合、`commands.rs` 的导出、`cli_proxy/mod.rs` 的接管/恢复及 `tauri/tests/sqlite_jsonb.rs` 的 v20→v21 升级。
+
+2026-09-13 专项参考：cc-switch `e098279934a6041ebab35664c5fbd785df055ee0` 的 `src-tauri/src/codex_config.rs` 仍明确本机代理只提供 HTTP/SSE，没有可直接搬用的 WS 路由；AxonHub `dfbe22593ea33d62d1bc04d47a8e5d6c8b25d2bf` 的 `llm/transformer/openai/responses/websocket_executor.go` 与 `internal/server/api/responses_websocket.go` 提供握手、复用、终态和预热边界参考。本项目采用对应生命周期约束，保留一对一连接，不引入其全局 session pool、HTTP facade、数据库/channel/orchestrator。另核对 Codex `89c8bcf37d64be69e4c8286f4541c1a84ed312a4` 的 `codex-rs/core/src/client.rs`，确认握手 `UPGRADE_REQUIRED` → `FallbackToHttp`。这是 issue #342 的定点审查与实现，未执行两个参考项目的完整 baseline 增量同步，§19.4 的基线保持不变。
+
+### 16.2 请求脱敏与响应还原（issue #347）
+
+数据脱敏是可关闭的 runtime 功能，默认关闭；协议矩阵和 transformer 职责保持不变。完整行为、限额、会话生命周期和 UI 入口见 [`gateway-data-redaction.md`](gateway-data-redaction.md)。
+
+- 六类已支持 CLI 共用 HTTP 出站入口，按路由处理而非 User-Agent；Claude Desktop 同样接入。Session 用量采集不代表 CLI 网络已被接管；其他工具只有实际调用有效 Gateway 模型路由才进入保护链路。
+- 请求在历史补全、协议转换和 provider 兼容之后、实际发送之前脱敏。重试/failover 复用请求开始时的策略与映射；从原请求重建正文的签名整流再次脱敏。
+- 响应在原始 provider side store 记录和协议/provider 回转之后还原。SSE/WS 共享按逻辑通道的还原器；工具参数等待完整 JSON 字符串值再解码还原，支持文件内容再次嵌套 JSON 和 Unicode 转义。普通文本保持增量输出，空 error 字段不提前冲刷尾部；保留 SSE 元信息和终态送达语义。
+- Codex 同协议 Responses WebSocket 按每个 `response.create` 处理，不因启用脱敏强制 426。保护开关关闭后，在途轮次继续还原，受保护旧轮次的重复终态仍丢弃；启用时无待处理轮次的上游正文也必须通过关联检查。现有协议不兼容的握手回退仍然有效。
+- 配置位于独立 `privacy` JSONB 记录，通过独立命令编译、持久化和发布 `Arc` 快照；不把规则加入高频 clone 的 `ProxyGatewaySettings`，也不触发 provider cache 清理。关闭时不创建映射或流还原器。
+- 映射仅在有界内存缓存与活动请求中保留；previous response 需同身份、会话、provider 和保护代次。签名绑定的敏感内容、未知占位符和限额失败不得原文放行。日志保存独立脱敏副本，不能持久化反向映射。
+- 结构遍历保留 Schema 控制字段、工具 namespace/tool_name 与媒体位置，扫描工具结果、Schema 描述/示例和 Anthropic 纯文本文档。Gemini 默认 functionCall 兼容签名复用 transformer 常量识别，不当作真实签名绑定；thought、公开 text 和 function 通道分离。
+- HTTP 隐私错误使用客户端对应 envelope，Gemini 保留数字 code/status；本地拒绝和还原失败保持 health-neutral。Legacy Completions 与 Ollama adapter 的明文/工具往返也纳入保护。
+- 回归入口：`privacy/tests.rs`、`runtime/websocket/privacy_tests.rs`、`runtime/websocket/privacy_matrix_tests.rs`。矩阵覆盖七入口 × 四协议 × 开关两态 × JSON/SSE/强制 SSE 聚合（168 组合），另有 Ollama、legacy completion、协议错误和 WS 426→HTTP 回归。新增 CLI 必须更新与 `supported_mvp()` 对齐的入口集合。
+- 2026-09-13 定点审查：AxonHub `dfbe22593ea33d62d1bc04d47a8e5d6c8b25d2bf` 的 Gemini 默认签名和 Ollama tools/tool_calls 形态、cc-switch `e098279934a6041ebab35664c5fbd785df055ee0` 的 Gemini 累计前缀兼容用于核对上述修复；对应实现为 `privacy/{payload,stream}.rs`、`runtime/upstream.rs` 与 `transformer/stream.rs`，回归为 privacy matrix 和 `kernel_tests.rs`。未吸收参考项目的 orchestrator、数据库或额外协议，未执行完整增量同步，§19.4 baseline 保持不变。
 
 ## 17. 主要文件索引
 
@@ -991,6 +1062,7 @@ X-Transformer-Lossy: /path: message | /path2: message
 | 文件 | 职责 |
 |---|---|
 | `tauri/src/coding/proxy_gateway/runtime/upstream.rs` | 上游请求主编排、conversion route、body/header/path、response 回转、provider compat、lossy policy |
+| `tauri/src/coding/proxy_gateway/runtime/websocket.rs` | Codex 同协议 WS 握手/回退、一对一 relay、逐轮生命周期与现有 observability 对接 |
 | `tauri/src/coding/proxy_gateway/runtime/routes.rs` | CLI 路由匹配、forwarded path、基础 URL 拼接 |
 | `tauri/src/coding/proxy_gateway/runtime/providers.rs` | provider 读取、target protocol、auth strategy、model mapping |
 | `tauri/src/coding/proxy_gateway/runtime/middleware.rs` | request-scoped middleware context 和 middleware 实现 |
@@ -1080,7 +1152,7 @@ AI Toolbox 与 AxonHub 相同的基础思想是：都使用统一中间模型，
 当前还有多项有意保留的差异，后续对照参考项目时不能误判成待同步缺口：
 
 - 合法 Responses cancellation 是协议终态，不触发 retry/failover 或 provider health 扣分；这与 AxonHub 的 terminal 解析一致，但不同于 cc-switch 当前把 cancellation 纳入错误检测的策略。
-- AxonHub 的 Responses WebSocket executor/session/pool 不属于当前本机 HTTP JSON/SSE Gateway 范围；在没有完整 transport、session 和恢复设计前，不引入半套 WebSocket。
+- Codex 同协议 Responses WebSocket 已按 §16.1 独立接入 runtime；AxonHub 的全局 executor/session/pool 和服务端 orchestrator 仍不属于本机网关范围。
 - Responses raw tool sidecar 的 `openai_responses_tool_signatures_complete` 和完整 signature 匹配，是 AI Toolbox 针对自身 request-scoped raw merge 的额外 fail-closed 门控。
 - runtime 同时检查最终客户端 body 与原始 `upstream_response_body`，是本项目跨协议转换、retry/failover 和可观测性链路所需的双重分类，不要求照搬 AxonHub 的内部响应对象。
 - **跨协议流式写回 OpenAI Responses 的 incomplete 终态事件名**：Chat / Anthropic / Gemini → Responses 时，`finish_reason=length`（及上游截断合成的 length）出站使用 **`event: response.completed` + `response.status=incomplete`**，而不是官方字面的独立 `event: response.incomplete`。这与 **cc-switch** Codex bridge（`streaming_codex_chat` / `streaming_codex_anthropic` 一律 `sse::response_completed`，incomplete 时补 `incomplete_details`）一致，目的是兼容大量**不会发 / 不依赖** `response.incomplete` 事件名的渠道与 Codex 客户端路径，并避免半截流被当成正常 completed。**入站**仍识别官方 `response.incomplete`；runtime 强制 SSE 聚合与有意义内容检测同时接受 `response.incomplete` 事件与 `status=incomplete`。AxonHub / 官方 streaming 文档以独立 incomplete 事件为 terminal 字面标准；本项目在该点优先 **cc-switch 渠道 bridge 语义**。可选增强是补齐 `incomplete_details`，不是默认改事件名。
@@ -1195,7 +1267,7 @@ AxonHub 主要用于查询统一 IR、公共协议转换和完整生命周期：
 - 当前实现位置为 `shared/tool_media.rs`、`openai/chat.rs`、`openai/responses/shared.rs`、`anthropic/inbound.rs` / `outbound.rs`、`gemini/convert.rs`；精确回归集中在 `transformer/tool_media_tests.rs`，覆盖并行工具结果、stringified/MCP、Anthropic 原生 block、Gemini 2/3、非法/远程 data URL、残留 base64 限幅和无媒体零差异。
 - 源码终审额外确认并修复了 Gemini Native 同一 `content.parts` 中多个并行 `functionResponse` 被覆盖的问题；现在按工具结果拆成多个统一 IR tool message，并由 `gemini_parallel_function_responses_preserve_every_tool_result` 锁定。
 - AxonHub 的统一 `llm.Request` / `llm.Response` IR、inbound -> IR -> outbound 生命周期、response/stream reverse lifecycle、Responses terminal/error 语义和 middleware 逆序原则与 AI Toolbox 当前架构一致，应继续作为主参考。
-- AxonHub 的 Responses WebSocket executor/session/pool、数据库/channel/entity、云网关账号与 orchestrator 体系不属于当前本机 HTTP JSON/SSE Gateway，不吸收半套实现。
+- 初始对齐时没有吸收 AxonHub 的 Responses WebSocket executor/session/pool；issue #342 后续专项只吸收生命周期约束并实现一对一 runtime transport，见 §16.1。数据库/channel/entity、云网关账号、全局 pool 和 orchestrator 仍不吸收。
 - AxonHub `94704784` 的 Responses `cache_write_tokens` 已吸收：IR `Usage.cache_write_tokens`、`openai_usage_to_llm` / `usage_to_responses` 双向映射、`usage_parser::openai_usage` 写入 `cache_creation_tokens`；测试 `responses_usage_roundtrip_preserves_cache_write_tokens`、`parses_responses_cache_write_tokens_as_cache_creation`。
 - AxonHub `7d095b63` 的 Responses namespace tools 展开已吸收：通用入站 `responses_tools_to_llm` 将 `type=namespace` 子 function 展成 `namespace__name`；raw fragment 带 `represented_tool_count`，出站 merge 按该计数消费结构化 tools 并恢复 namespace envelope；测试 `responses_namespace_tools_expand_into_ir_functions`。Codex→Chat 既有 `codex_tools` 路径与 xAI 同协议 flatten 保持不变。
 - AxonHub `4b8ab0d6` 空 `finish_reason` 归一化已有等价覆盖（stream 解析过滤 empty string），不重复吸收。
@@ -1212,6 +1284,27 @@ AxonHub 主要用于查询统一 IR、公共协议转换和完整生命周期：
   - **已经吸收：Anthropic Messages SSE 非对象归一**（参考 cc-switch `ff3bc242` 的 `transform_codex_anthropic` / `streaming_codex_anthropic` 防护）。AI Toolbox 在 `runtime/upstream.rs` 的 `AnthropicSseAggregate::push_block` 中给 `message_start` 加 `filter(|m| m.is_object())` 门控，`content_block_start` 对非对象 `content_block` 归一为 `{"type":"text","text":""}`，使后续 delta 文本继续承接而不是静默丢弃成 completed 空输出；此路径本来就通过 `as_object_mut()` 避免 panic（比 cc-switch 更早防住），本次补齐了"不 panic 且不吞文本"的行为。回归测试 `anthropic_sse_aggregate_recovers_non_object_content_block_as_text`、`anthropic_sse_aggregate_non_object_message_does_not_panic`，位于 `runtime/upstream.rs`。
   - **已经吸收：DeepSeek 官方 Codex catalog mirror**（参考 cc-switch `8ae1ce85`）。对 `wire_api="responses"`（native Responses）且在 `base_url` 命中 `deepseek.com` 的 Codex provider，生成的 `ai-toolbox-codex-model-catalog.json` 镜像内置的 DeepSeek 官方 models.json（`tauri/resources/codex_deepseek_catalog_template.json`，freeform `apply_patch`、GPT-5 harness base_instructions、low/high/max reasoning、1m context），避免 neutral 模板把 DeepSeek 能力声明错配（如 image modality、text_and_image web search）。`CodexCatalogModelSpec.display_name` / `context_window` 改为 `Option` 以区分"用户显式值"与"默认兜底"：官方条目保留 vendor 声明，用户显式覆盖仍优先，未知模型克隆官方旗舰条目而不冒充。非 deepseek host 或非 Responses target 仍走 neutral 模板。实现位于 `codex/commands.rs`（`codex_official_vendor_catalog_models` / `codex_vendor_catalog_model_entry` / `fill_template_fields_from_static`），回归测试 `deepseek_host_native_catalog_mirrors_official_entries`、`non_deepseek_or_non_native_provider_keeps_neutral_template`。
   - **明确不吸收**：`c49cf96a` 的 Grok Build `x-grok-conv-id` / `x-grok-session-id` 会话提取（AI Toolbox 当前不代理 Grok Build 产品）、`4bfb3fc3` 的 Claude Desktop proxy 与 session logs 去重（AI Toolbox 不代理 Claude Desktop）。`12b972a6` models.dev pricing sync、`cd17912f` Object.prototype walker、zip-slip、deeplink risk 等属前端/配置/CI 层，与本机 gateway 无关。
+
+2026-09-15 issue #352 定点修复及多协议复查，参考快照为 cc-switch `42ac174dbc42e0cf50a50e60c5f2c3dcecca4560`（`origin/main`）与 AxonHub `48b7314a1c17d9545f729b2be3d9ed7fb05d60d1`（`origin/unstable`）。本次核对四协议的并行调用、SSE 历史回放和 forced SSE 聚合，不是完整增量同步，两个正式 baseline 不推进，也不改写参考仓库工作树。
+
+- Responses 参考 cc-switch `append_responses_input_as_chat_messages` / `flush_pending_tool_calls` 及 `5e0f3442` 的相邻 commentary 合并，以及 AxonHub `convertInputToMessages` / `convertReasoningWithFollowing` 的 IR 分组。AI Toolbox 将该语义统一到 Responses 入站，补齐前置、调用间、调用后文本及 reasoning；保留非 assistant、结果、raw、compaction 边界，并重算 raw input 的恢复位置。实现与测试见 §8.4。
+- Gemini 参考 AxonHub `outbound_convert.go` 的连续 tool message 分组、`outbound_stream.go` 的流级工具 index、`aggregator.go` 的逐调用累积，以及 cc-switch `transform_gemini.rs` 的唯一合成 ID/不回传合成 ID、`streaming_gemini.rs::merge_tool_call_snapshots` 的原生 ID/签名保留。实现与测试见 §8.5。
+- 明确不照搬 AxonHub 入站“按函数名查最后一个 ID”的回填，也不采纳 cc-switch 将无 ID 的 chunk 内位置视作同一次累计调用的假设：不同 SSE 事件可以分别在 `parts[0]` 返回独立同名调用，只有原生 ID 能证明快照身份。无 ID 时保留每次调用；请求结果按待完成调用顺序配对。provider/orchestrator/global store 仍不下沉 transformer。
+- 本地 HTTP 回归使用严格 Chat 和 Gemini 模拟上游，覆盖真实网关请求准备、响应转换、历史补全、逆序结果以及正文日志关闭/截断；不把这些测试表述成真实 Kimi/GLM/Gemini/Vertex 服务联调。
+- 最终验证：`cargo test --jobs 2` 共 2357 个通过、8 个既有 ignored，包含全部集成测试与 doctest；`pnpm test` 共 584 个通过；`pnpm exec tsc --noEmit` 通过。本次累计新增 91 个回归用例，包含初次修复的 47 个和多协议复查补充的 44 个；改动 Rust 文件格式检查与 `git diff --check` 均通过。
+
+2026-09-16 issue #356 定点修复：instruction（`system`/`developer`）消息位置改为按来源方向门控。参考快照为 cc-switch `e098279934a6041ebab35664c5fbd785df055ee0`（本地 checkout 与 `origin/main` 的提交，**是 §19.4 记录 baseline `42ac174d` 的祖先**，即本次分析基于比 baseline 更早的快照）与 AxonHub `dfbe22593ea33d62d1bc04d47a8e5d6c8b25d2bf`（本地 checkout == §19.4 记录的 `origin/unstable` baseline）。两条关键参考提交（cc-switch `b724f5dd`、AxonHub `9dfd6ac0`）同时存在于本次快照与各自 baseline 之内，因此本次不推进 baseline，也不改写参考仓库工作树。
+
+- 参考快照与 remote-tracking 的增量核对（只读，不 checkout）：cc-switch `HEAD..origin/main` 24 个提交中触及 `providers/{transform,transform_codex_chat}.rs` 的为 `bd247a4a`（缺省 tool description）、`c6286e14`（grok reasoning effort）、`5e0f3442`（相邻 commentary 与待处理 tool call 合并），都不改 system/developer 位置结论；`transform_codex_chat.rs` 的 `collapse_system_messages_to_head`（3 处引用）与 `transform.rs` 的 `test_anthropic_to_openai_preserves_mid_conversation_system_in_place` 在 `origin/main` 上同样存在。AxonHub `HEAD..origin/unstable` 75 个提交未触碰 `llm/pipeline/cc/system_messages.go`，但给 `llm/transformer/openai/outbound_convert.go` 新增了 `mergeSystemMessages`（把多条 system 合并到**第一条 system 所在位置**）。该增量未推进 baseline、未吸收，只作为"Chat 出站对非 Claude Code 来源做合并"的同向佐证。
+
+- 问题：网关把入站 `system` 消息**全部**合并到首条 system，于是 Claude Code 每轮追加的逐轮变化 `role:"system"` 提醒（`<total_tokens>N tokens left</total_tokens>`）把首条越堆越长，prompt 前缀在约 15.9 KB 处断开，上游前缀缓存整段失效（命中率 7.7%，同上游同模型的 Codex 路由 98.4%）。
+- 参考结论（两个项目都是**按方向**分裂，不是按角色）：cc-switch `Anthropic -> Chat` 自 `b724f5dd revert(proxy): drop Anthropic system-message hoisting (#3775)`（2026-06-16，release notes 记录合并期命中率 99%→20%）起不再合并，回归测试 `test_anthropic_to_openai_preserves_mid_conversation_system_in_place` 直接点名 `<total_tokens>`；而 `Responses -> Chat` 在 `transform_codex_chat.rs:289` **无条件**调用 `collapse_system_messages_to_head`，注释明确"避免中间 system（如 Codex 的 `developer` 指令）"。AxonHub 从另一侧得到同一结论：Chat 出站是 1:1 `lo.Map` 不提，Anthropic/Responses 出站照旧提，另用 `llm/pipeline/cc/system_messages.go`（`9dfd6ac0`，2026-08-10）只对 Claude Code 客户端把前导块之后的 system 原位降级为 `user`。
+- 吸收：新增 `transformer/shared/system_messages.rs::InstructionPlacement`，Chat/Responses writer 与 runtime Chat compat 共用；Anthropic 来源用 `PreserveOrder`（只合并前导连续块，块之后的 instruction 保 index、role 降级为 `user`），其他来源与同协议直通 body 用 `MergeToHead`（历史"全部合并到首条"）。**不吸收** cc-switch 的"原件保留 `system` role"形态：降级为 `user` 才能继续保证上游看不到中途 system role（AxonHub 同款取舍）。Anthropic target 不改：`conversion_route()` 只在 source != target 时创建，Anthropic 来源同协议直通，该 writer 只可能收到 `MergeToHead`。
+- 回归：`shared/system_messages.rs` 单测覆盖 placement 门控、合并/保序两条路径与首条跨轮字节稳定；`kernel_tests.rs` 覆盖 Anthropic->Chat 尾随提醒保位、Responses->Chat 迟到 `developer` 仍合并、Anthropic->Responses `instructions` 只收前导块、Chat->Anthropic 全量合并；`runtime/upstream.rs` 覆盖带 Anthropic conversion route 的保序与直通/Responses route 的合并；旧的 `openai_chat_target_collapses_system_messages_to_head` 已按新规则改写。
+- 本次实测（读取 `%APPDATA%\com.ai-toolbox\proxy-gateway\request-logs` 全量 307 条含 body 的 Codex 请求）：22%（68/307）的请求在 `input` 前导块**之后**仍带 instruction 项，共 144 条**全部是 `developer`**（最大一条 24,859 字符的 Codex 身份/指令块），跨轮 hash 稳定；打断 `function_call` 批次的 instruction 项为 0。这是"不能无条件降级"的直接依据，也是 Responses 方向必须保持 `MergeToHead` 的回归基线。
+- 未纳入：Gemini target 仍把 instruction 提到 `systemInstruction`（`contents` 只有 user/model role，本次不改）。
+- 明确不吸收：不引入"保留全部 system 于原位"或"按 provider 开关切换"的第三种模式；方向门控已覆盖两个真实客户端，多一个开关只会增加状态组合。
+- 最终验证：本次改动只涉及 Rust 与文档。`cargo test --jobs 2` 在独立 `CARGO_TARGET_DIR` 下执行（默认 target 目录被正在运行的本机应用占用二进制，无法重链接）共 2378 个通过、8 个既有 ignored、0 失败，含 2163 个 lib 测试、174 个 coding 集成测试、4 个 deeplink、27 个 sqlite_jsonb 与 10 个 doctest；改动文件 `cargo fmt --check` 通过（仓库其它模块存在本次之前就有的 rustfmt 偏差，未一并处理）。`pnpm test` / `pnpm exec tsc --noEmit` 未执行：本机 pnpm 垫片指向缺失的 fnm alias，且本次未改动任何前端文件。
 
 ### 19.5 行为同步策略
 
@@ -1272,6 +1365,7 @@ AxonHub 主要用于查询统一 IR、公共协议转换和完整生命周期：
 | F-12 | 非流 Responses cancellation 与 LLM `finish_reason="cancelled"` 双向映射，反向 canonical status 为 `canceled`，不能退化为 `completed`。 |
 | F-13 | runtime 的失败与空响应分类同时检查最终 body 和原始 `upstream_response_body`；转换不能隐藏失败，也不能抹掉合法终态。 |
 | F-14（审查纪律） | 发现“违反官方字面”的实现时，必须先对照 `../cc-switch` 与 `../axonhub` 判断是否为渠道兼容有意设计；跨协议 incomplete 使用 `response.completed`+`status=incomplete` 属 cc-switch 对齐项，见 §18，不得反复当 P0 bug。 |
+| F-15 | **instruction 位置按来源方向门控**：`shared/system_messages.rs::InstructionPlacement` 决定 `system`/`developer` 是合并到目标协议唯一 instruction 位置（Chat 首条 system、Responses `instructions`、Anthropic 顶层 `system`）还是按原 index 原地保留。**Anthropic Messages 来源**（即 Claude Code）用 `PreserveOrder`：只合并前导连续块，块之后的 instruction 消息保持原 index、role 降级为 `user`——Claude Code 每轮在对话尾部追加逐轮变化的 `role:"system"` 提醒（`<total_tokens>N tokens left</total_tokens>`），提到首条会让首条每轮变长、上游前缀缓存整段失效（issue #356：命中率 7.7%，同链路 Codex 98.4%）。**其余来源和同协议直通 body** 用 `MergeToHead`，即历史"全部合并到首条"行为：Codex（Responses 来源）的身份/指令块是 `developer` 角色且跨轮稳定，合并既满足"上游只接受单首位 system"的兼容约束也不伤缓存。transformer 侧用 `placement_for_api_format`，runtime 侧用 `placement_for_protocol(conversion_route.source)`，两处必须复用同一实现；Anthropic target 只可能拿到 `MergeToHead`（Anthropic 来源同协议直通）。Gemini target 仍无条件提到 `systemInstruction`，未纳入本次范围。参考依据与回归位置见 §19.4 的 issue #356 条目。 |
 
 其它已经落位的细节点：
 

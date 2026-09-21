@@ -1,4 +1,5 @@
 import React from 'react';
+import { useProviderSharing } from '@/features/coding/shared/providerShare';
 import AllApiHubIcon from '@/components/common/AllApiHubIcon';
 import { Typography, Button, Space, Empty, message, Modal, Spin, Collapse } from 'antd';
 import {
@@ -84,7 +85,9 @@ import { hasAllApiHubExtension, refreshTrayMenu } from '@/services/appApi';
 import { TRAY_CONFIG_REFRESH_EVENT } from '@/constants/configEvents';
 import {
   GatewayFailoverButton,
+  resolveGatewayReengageMode,
   saveProviderWithGatewayReengage,
+  toGatewayAggregateReengageConfig,
 } from '@/features/coding/shared/gateway';
 import {
   CUSTOM_PROVIDER_PROFILE_ID,
@@ -345,6 +348,7 @@ function buildDesktopFavoriteProviderConfig(provider: ClaudeDesktopProvider): Op
 
 const ClaudeDesktopPage: React.FC = () => {
   const { t } = useTranslation();
+  const { shareProvider, shareModal } = useProviderSharing('claudedesktop', () => loadConfig());
   const { claudeProviderRefreshKey } = useRefreshStore();
   const { sidebarHiddenByPage, setSidebarHidden } = useSettingsStore();
   const [loading, setLoading] = React.useState(false);
@@ -698,16 +702,20 @@ const ClaudeDesktopPage: React.FC = () => {
   const handleProviderSubmit = async (values: ClaudeDesktopFormValues) => {
     try {
       let savedProvider: ClaudeDesktopProvider | null = null;
-      const gatewayModeBeforeSave = gatewayCliStatus?.mode;
+      const gatewayModeBeforeSave = resolveGatewayReengageMode(gatewayCliStatus);
+      const gatewayAggregateBeforeSave = toGatewayAggregateReengageConfig(gatewayCliStatus);
       const shouldReengageGatewayProxy =
         Boolean(editingProvider && !isCopyMode && editingProvider.isApplied) &&
-        (gatewayModeBeforeSave === 'single' || gatewayModeBeforeSave === 'failover');
+        gatewayModeBeforeSave !== null;
 
       await saveProviderWithGatewayReengage({
         gatewayMode: shouldReengageGatewayProxy ? gatewayModeBeforeSave : null,
+        aggregateConfig: shouldReengageGatewayProxy ? gatewayAggregateBeforeSave : null,
         restoreDirect: () => restoreProxyGatewayCliDirect('claude_desktop'),
         engageSingle: () => engageProxyGatewaySingle('claude_desktop', savedProvider?.id || ''),
         engageFailover: () => engageProxyGatewayFailover('claude_desktop'),
+        // No `engageAggregate`: aggregate mode is Codex-only, so this CLI can
+        // never report it and the re-engage helper would reject the replay.
         onGatewayStatusChange: setGatewayCliStatus,
         saveProvider: async () => {
           const category = values.category || editingProvider?.category || 'custom';
@@ -1145,6 +1153,7 @@ const ClaudeDesktopPage: React.FC = () => {
                                 onEdit={handleEditProvider}
                                 onDelete={handleDeleteProvider}
                                 onCopy={handleCopyProvider}
+                                onShare={shareProvider}
                                 onTest={handleTestProvider}
                                 onSelect={handleSelectProvider}
                                 onToggleDisabled={handleToggleDisabled}
@@ -1337,6 +1346,8 @@ const ClaudeDesktopPage: React.FC = () => {
           await setSidebarHidden('claudedesktop', !visible);
         }}
       />
+
+      {shareModal}
     </SectionSidebarLayout>
   );
 };

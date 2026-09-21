@@ -19,7 +19,7 @@ import {
   CloudDownloadOutlined,
 } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
-import { BarChart2 } from 'lucide-react';
+import { BarChart2, Share2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { useSortable } from '@dnd-kit/sortable';
@@ -48,6 +48,9 @@ import {
   firstGatewayApiFormat,
   getGatewayProviderApiFormatFromMeta,
   getGatewayProviderProfilesVersion,
+  isGatewayAggregateMode,
+  isGatewayFailoverMode,
+  isGatewayProxyMode,
   openAiApiFormatFromBaseUrl,
   subscribeGatewayProviderProfiles,
 } from '@/features/coding/shared/gateway';
@@ -73,6 +76,7 @@ interface GrokProviderCardProps {
   onEdit: (provider: GrokProvider) => void;
   onDelete: (provider: GrokProvider) => void;
   onCopy: (provider: GrokProvider) => void;
+  onShare?: (provider: GrokProvider) => void;
   onTest: (provider: GrokProvider) => void;
   onSelect: (provider: GrokProvider) => void;
   onToggleDisabled: (provider: GrokProvider, isDisabled: boolean) => void;
@@ -114,6 +118,7 @@ const GrokProviderCard: React.FC<GrokProviderCardProps> = ({
   onEdit,
   onDelete,
   onCopy,
+  onShare,
   onTest,
   onSelect,
   onToggleDisabled,
@@ -283,8 +288,9 @@ const GrokProviderCard: React.FC<GrokProviderCardProps> = ({
   );
   const gatewayCanApplyProxy = canApplyProviderWithGatewayProxy(gatewayStatus);
   const gatewayMode = gatewayStatus?.mode ?? null;
-  const gatewayFailoverActive = gatewayMode === 'failover';
-  const gatewayProxyActive = gatewayMode === 'single' || gatewayFailoverActive;
+  const gatewayFailoverActive = isGatewayFailoverMode(gatewayMode);
+  const gatewayAggregateActive = isGatewayAggregateMode(gatewayMode);
+  const gatewayProxyActive = isGatewayProxyMode(gatewayMode);
   const priorityEntry = gatewayFailoverActive
     ? gatewayStatus?.provider_priorities.find((entry) => entry.provider_id === provider.id)
     : undefined;
@@ -313,6 +319,9 @@ const GrokProviderCard: React.FC<GrokProviderCardProps> = ({
   const canShowRestoreDirectUnavailable = canRestoreDirect && needsGatewayProxy;
   const canSwitchGatewayProvider =
     gatewayProxyActive &&
+    // Aggregate has no single primary to switch; its site list is edited in the
+    // gateway settings aggregate block, so hide the P0-style switch action.
+    !gatewayAggregateActive &&
     !isApplied &&
     !provider.isDisabled &&
     !isOfficialProvider &&
@@ -680,6 +689,10 @@ const GrokProviderCard: React.FC<GrokProviderCardProps> = ({
       icon: <CopyOutlined />,
       onClick: () => onCopy(provider),
     },
+    ...(onShare ? [{
+      key: 'share', label: t('common.share'), icon: <Share2 size={14} />,
+      onClick: () => onShare(provider),
+    }] : []),
     // Hide delete button for __local__ provider
     ...(!isLocalProvider
       ? [

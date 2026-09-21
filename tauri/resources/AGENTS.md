@@ -10,6 +10,7 @@
 - `models.dev.json` 是 OpenCode 免费/官方模型默认数据的源码来源。`tauri/src/coding/open_code/free_models.rs` 同样通过 `include_str!` 在编译期嵌入它；运行时 app data 里的 `models.dev.json` 只是缓存，不是本仓编辑入口。
 - `model_pricing.json` 是 Gateway 官方模型定价默认数据的源码来源。`tauri/src/db/model_pricing_seed.rs` 通过 `include_str!` 编译期嵌入它，并在 SQLite migration 后用 `INSERT OR IGNORE` 增量补齐 `model_pricing` 表。
 - `gateway_provider_profiles.json` 是 Gateway 内置供应商 endpoint 默认数据的源码来源。`tauri/src/coding/proxy_gateway/provider_profiles.rs` 通过 `include_str!` 编译期嵌入它；运行时 app data 里的同名文件是远端刷新缓存，用于前端启动后动态更新供应商列表、API 格式和 Base URL。
+- `dsh_builtin_models.json` 是 dsh（DeepSeek Harness）内置渠道默认模型的源码来源。`tauri/src/coding/dsh/builtin_models.rs` 通过 `include_str!` 编译期嵌入它。它是**已安装 `@earendil-works/pi-ai` catalog 投影到 dsh `llm-pi-ai` route model profile schema** 的结果（键：`id`/`name`/`api`/`baseURL`/`contextWindow`/`maxTokens`/`reasoning`/`input`/`reasoningEfforts`/`compat`），用来在 dsh 运行时不在场时也能展示与编辑该渠道的默认模型。上游 `thinkingLevelMap` 中值为 `null` 的档位在本文件里**不写键**（缺失即表示不支持）。
 - 备份/恢复里读写的 `preset_models.json`、`models.dev.json`、`model_pricing.json`、`gateway_provider_profiles.json` 都是 app data 缓存文件；不要把这些缓存链路误认为仓库内 `tauri/resources/*.json` 会被运行时直接原地改写。
 
 ## 核心设计决策（Why）
@@ -48,7 +49,9 @@ sequenceDiagram
 - xAI 官方模型预设放在 `@ai-sdk/xai`，不要因为 Grok 也兼容 OpenAI API 就塞进 `@ai-sdk/openai-compatible`。`grok-4.5` 是用户可见 canonical ID；`grok-4.5-latest` 和 `grok-build-latest` 可用于价格匹配，但不要作为重复预设展示。Grok 4.5 reasoning 不能关闭，只提供 `low`、`medium`、`high` 三档。当前预设为兼容 OpenCode 的成对 `limit` 约束，将 `contextLimit` 和 `outputLimit` 都设为 500K；这是产品兼容取值，不要表述成 xAI 已正式公布最大输出 token。
 - 预设只要声明 `contextLimit` 或 `outputLimit`，两个字段就必须成对存在，避免 OpenCode v1 生成无法通过校验的半完整 `limit`。Step 3.7 Flash、Step 3.5 Flash 2603 和 Step 3.5 Flash 当前将 `outputLimit` 设为与 262K `contextLimit` 相同的兼容值；不要把该兼容值表述成厂商已正式公布的最大输出 token。
 - `model_pricing.json` 保存标准请求的基础单价，不能表达长上下文分段计费。GPT-5.6 输入超过 272K token 后的输入/输出倍率不应通过伪造第二套模型 ID 表达；需要精确支持时应扩展计费规则结构。OpenAI 官方单独公布的 cache write 单价仍写入 `cache_creation_cost_per_million`，实际是否产生该费用取决于 usage 是否提供 cache creation token。
-- OpenCode 的 `@ai-sdk/anthropic` 预设必须按模型代际维护 reasoning variants，不能把所有 Claude 模型套成同一结构：Sonnet/Opus 4.6 及之后使用同级的 `thinking: { type: "adaptive" }` 与 `effort`；Opus 4.7+、Sonnet 5、Fable 5 还要提供 `xhigh`，并设置 `display: "summarized"` 避免默认省略思考文本；Opus 4.5 使用 `effort` 但不启用 adaptive；Sonnet 4.5、Haiku 4.5、Opus 4.1、Sonnet 4 和 Sonnet 3.7 继续使用 `thinking: { type: "enabled", budgetTokens }`。`effort` 是 `thinking` 的同级字段，不能放进 `thinking` 对象。
+- Fable 5.1 / Mythos 5.1 的 `cache_read_cost_per_million` 官方就是 `0.25`（基础输入价的 0.025x，其余模型通常是 0.1x）；不要把它当成笔误"修正"回 `1.00`。同代模型的 `cache_creation_cost_per_million` 仍按官方 5m 档 `12.50` 填写。
+- Mythos 家族（`claude-mythos-5` / `claude-mythos-5-1`）按惯例只进 `model_pricing.json`，不进 `preset_models.json`：该家族仅对通过验证的组织开放，预设列表不展示。Fable 家族则两处都维护。
+- OpenCode 的 `@ai-sdk/anthropic` 预设必须按模型代际维护 reasoning variants，不能把所有 Claude 模型套成同一结构：Sonnet/Opus 4.6 及之后使用同级的 `thinking: { type: "adaptive" }` 与 `effort`；Opus 4.7+、Sonnet 5、Fable 5、Fable 5.1 还要提供 `xhigh`，并设置 `display: "summarized"` 避免默认省略思考文本；Opus 4.5 使用 `effort` 但不启用 adaptive；Sonnet 4.5、Haiku 4.5、Opus 4.1、Sonnet 4 和 Sonnet 3.7 继续使用 `thinking: { type: "enabled", budgetTokens }`。`effort` 是 `thinking` 的同级字段，不能放进 `thinking` 对象。
 - 更新 Claude 预设时，同时核对 models.dev 的 `reasoning_options`、context/output limit 与当前 OpenCode provider variant 生成逻辑；只看 Anthropic API 支持范围不够，因为 OpenCode 会按 provider SDK 和具体模型代际生成不同参数形状。
 - 不要在这里记录“远端缓存刷新后也许会覆盖本地顺序”之类推测；判断最终线上效果时，要先区分当前看到的是 bundled defaults 还是 app data / 远端缓存数据。
 - 新增 Gateway provider compat 后要同步更新 `gateway_provider_profiles.json`，否则用户只能走自定义渠道，runtime 也不应靠模型名 fallback 补偿这个缺口。模型名可以作为已识别 provider 内部的能力细分条件，但不能作为 provider 身份识别条件。
@@ -57,6 +60,7 @@ sequenceDiagram
 ## 跨模块依赖
 
 - `tauri/src/coding/preset_models.rs` 依赖 `preset_models.json` 作为编译期默认数据，并向前端暴露加载缓存与远端刷新命令。
+- `tauri/src/coding/codex/commands.rs` 通过 `coding::preset_models::display_name_for_model_id` 用 bundled 预设的 `id -> name` 生成 Codex model catalog 的 `display_name` 回退（显式 `displayName` → 预设名称 → 原始 id）。该查询只读编译期 bundled 文件，不读 app data 缓存，保证 catalog 生成确定且离线可用；重复 id 按 JSON 分组顺序取先出现的 name。
 - `tauri/src/coding/open_code/free_models.rs` 依赖 `models.dev.json` 作为 OpenCode 默认模型数据。
 - `tauri/src/db/model_pricing_seed.rs` 依赖 `model_pricing.json` 作为 Gateway 官方模型定价默认数据；运行时远端同步只增量插入缺失行，不覆盖用户已有价格。
 - `web/app/providers.tsx` 在启动时先加载 preset models / Gateway provider profiles 本地缓存，再异步拉远端并更新前端内存态。
@@ -71,6 +75,7 @@ sequenceDiagram
 - 改 `models.dev.json` 时，至少检查：
   - 变更是否真的是 OpenCode 默认模型数据，而不是应该改运行时缓存或远端源。
   - `tauri/src/coding/open_code/free_models.rs` 的默认读取路径和筛选语义是否仍成立。
+- 改 `dsh_builtin_models.json` 时，任何增量都必须**从已安装的 `@earendil-works/pi-ai` 包实际提取**（`dist/providers/data/<provider>.json`），不能凭记忆补字段或模型：字段拼写（`baseURL`、`thinkingFormat`、`maxTokensField`）与档位集合会随 pi-ai 升级漂移，凭印象写出的内容不会被 dsh 接受，也不会被我们的展示层发现。
 - 改 `model_pricing.json` 时，至少检查：
   - 是否仍是合法 JSON 数组。
   - 每个对象字段是否与 SQLite `model_pricing` 表一致，成本字段是否仍是非负数字字符串。
@@ -84,5 +89,6 @@ sequenceDiagram
 - 修改 GPT-5.6 预设或共享思考等级时，至少确认三个 canonical ID 的顺序与 `none/low/medium/high/xhigh/max` variants，并确认 Pi 前后端仍能保留 `max`、拒绝把 `ultra` 当成普通 thinking level。
 - 修改 Grok 4.5 预设时，至少确认它位于 `@ai-sdk/xai`，只展示 canonical ID，保留 500K context、500K compatibility output limit 与 `low/medium/high` 三档 reasoning。
 - 修改 `@ai-sdk/anthropic` Claude 预设后，至少运行 `cargo test coding::preset_models::tests`，确认 adaptive、effort-only 与固定 budget 三类模型没有互相串用参数。
+- 修改 `preset_models.json` 的 `id` / `name` 后至少跑 `cargo test --lib preset_models`：`display_name_lookup_covers_bundled_ids_and_rejects_unknown_ones` 会逐个断言每个 bundled id 仍能查到自己的 name，重复 id 或漏写 `name` 会直接暴露。
 - 修改 `model_pricing.json` 后，至少跑一次 `cargo test model_pricing_seed` 或等价测试，确认 bundled JSON 可解析且 seed 仍是 `INSERT OR IGNORE` 语义。
 - 如果本轮同时改了缓存/远端刷新链路，还要额外区分 bundled defaults、app data cache 和 remote fetch 三条路径分别验证。

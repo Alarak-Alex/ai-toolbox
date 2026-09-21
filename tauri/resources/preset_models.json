@@ -55,6 +55,25 @@
       "attachment": false
     },
     {
+      "id": "agnes-3.0-flash",
+      "name": "Agnes 3.0 Flash",
+      "contextLimit": 524288,
+      "outputLimit": 65536,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "reasoning": true,
+      "tool_call": true,
+      "temperature": true,
+      "attachment": true
+    },
+    {
       "id": "glm-5",
       "name": "GLM 5",
       "contextLimit": 204800,
@@ -548,6 +567,36 @@
       "attachment": false
     },
     {
+      "id": "deepseek-v4.1-flash",
+      "name": "DeepSeek V4.1 Flash",
+      "contextLimit": 1000000,
+      "outputLimit": 384000,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "reasoning": true,
+      "tool_call": true,
+      "temperature": true,
+      "attachment": true,
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        }
+      }
+    },
+    {
       "id": "deepseek-v4-flash",
       "name": "DeepSeek V4 Flash",
       "contextLimit": 1000000,
@@ -725,6 +774,48 @@
   ],
   "@ai-sdk/google": [
     {
+      "id": "gemini-3.8-flash",
+      "name": "Gemini 3.8 Flash",
+      "contextLimit": 1048576,
+      "outputLimit": 65536,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "pdf",
+          "video",
+          "audio"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "reasoning": true,
+      "tool_call": true,
+      "temperature": true,
+      "attachment": true,
+      "variants": {
+        "low": {
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingLevel": "low"
+          }
+        },
+        "medium": {
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingLevel": "medium"
+          }
+        },
+        "high": {
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingLevel": "high"
+          }
+        }
+      }
+    },
+    {
       "id": "gemini-3.7-flash",
       "name": "Gemini 3.7 Flash",
       "contextLimit": 1048576,
@@ -852,6 +943,54 @@
           "thinkingConfig": {
             "includeThoughts": true,
             "thinkingLevel": "medium"
+          }
+        },
+        "minimal": {
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingLevel": "minimal"
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "name": "Gemini 3.5 Flash Lite",
+      "contextLimit": 1048576,
+      "outputLimit": 65536,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "pdf",
+          "video",
+          "audio"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "reasoning": true,
+      "tool_call": true,
+      "temperature": true,
+      "attachment": true,
+      "variants": {
+        "low": {
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingLevel": "low"
+          }
+        },
+        "medium": {
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingLevel": "medium"
+          }
+        },
+        "high": {
+          "thinkingConfig": {
+            "includeThoughts": true,
+            "thinkingLevel": "high"
           }
         },
         "minimal": {
@@ -2126,6 +2265,38 @@
   ],
   "@ai-sdk/xai": [
     {
+      "id": "grok-4.6",
+      "name": "Grok 4.6",
+      "contextLimit": 500000,
+      "outputLimit": 500000,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "reasoning": true,
+      "tool_call": true,
+      "attachment": true,
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        }
+      }
+    },
+    {
       "id": "grok-4.5",
       "name": "Grok 4.5",
       "contextLimit": 500000,
@@ -2156,6 +2327,63 @@
     }
   ],
   "@ai-sdk/anthropic": [
+    {
+      "id": "claude-fable-5-1",
+      "name": "Claude Fable 5.1",
+      "contextLimit": 1000000,
+      "outputLimit": 128000,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "pdf"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "reasoning": true,
+      "tool_call": true,
+      "temperature": false,
+      "attachment": true,
+      "variants": {
+        "high": {
+          "thinking": {
+            "display": "summarized",
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "low": {
+          "thinking": {
+            "display": "summarized",
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "max": {
+          "thinking": {
+            "display": "summarized",
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "medium": {
+          "thinking": {
+            "display": "summarized",
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "xhigh": {
+          "thinking": {
+            "display": "summarized",
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        }
+      }
+    },
     {
       "id": "claude-fable-5",
       "name": "Claude Fable 5",

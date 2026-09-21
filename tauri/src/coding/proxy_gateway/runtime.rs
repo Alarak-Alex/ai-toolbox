@@ -12,6 +12,7 @@ mod routes;
 mod side_stores;
 mod thinking_budget;
 mod upstream;
+mod websocket;
 
 pub(crate) use self::connectivity_test::test_gateway_provider_model_connectivity;
 #[cfg(test)]
@@ -329,6 +330,12 @@ impl ProxyGatewayManager {
         Ok(())
     }
 
+    pub(crate) fn update_privacy_policy(&self, policy: Arc<super::privacy::CompiledPolicy>) {
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.context.privacy.publish(policy);
+        }
+    }
+
     pub fn clear_provider_cache(&self) -> Result<(), String> {
         if let Some(runtime) = self.runtime.as_ref() {
             runtime.clear_provider_cache()?;
@@ -491,6 +498,7 @@ impl ProxyGatewayRuntime {
 
     fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        self.context.websocket_shutdown.send_replace(true);
         let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100));
         if let Some(task) = self.task.take() {
             task.abort();
@@ -517,6 +525,8 @@ struct GatewayRuntimeContext {
     app_handle: Option<AppHandle>,
     provider_cache: Arc<Mutex<HashMap<GatewayCliKey, ProviderCacheEntry>>>,
     side_stores: side_stores::GatewaySideStores,
+    privacy: super::privacy::PrivacyRuntime,
+    websocket_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -574,6 +584,7 @@ impl GatewayRuntimeContext {
             Arc::new(Mutex::new(registry))
         });
         Self {
+            privacy: super::privacy::PrivacyRuntime::new(db.as_ref()),
             db,
             paths,
             settings: Arc::new(RwLock::new(settings)),
@@ -584,6 +595,7 @@ impl GatewayRuntimeContext {
             app_handle: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             side_stores: side_stores::GatewaySideStores::default(),
+            websocket_shutdown: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -831,6 +843,10 @@ async fn handle_connection(
     let started_instant = Instant::now();
     let settings = context.settings_snapshot();
 
+    if websocket::is_upgrade_request(&request) {
+        return websocket::handle_upgrade(stream, request, context).await;
+    }
+
     // Codex Desktop official-login clients may send zstd-compressed JSON bodies.
     // Decode before routing/JSON parsing so passthrough and conversion both see plain JSON.
     let mut response = match decode_inbound_request_body(&mut request) {
@@ -848,6 +864,11 @@ async fn handle_connection(
                 &message,
             );
             response.error_category = Some("invalid_request".to_string());
+            if context.privacy.enabled() {
+                response.error_category = Some("privacy_request_blocked".to_string());
+                response.note =
+                    "Privacy protection rejected an undecodable request body".to_string();
+            }
             response
         }
     };
@@ -890,7 +911,12 @@ fn amend_health_after_stream(
     context: &GatewayRuntimeContext,
     response: &self::http_io::DebugHttpResponse,
 ) {
-    if !response.is_streaming {
+    if !response.is_streaming
+        || response
+            .privacy
+            .as_ref()
+            .is_some_and(|privacy| privacy.detail().failed)
+    {
         return;
     }
     let (Some(cli_key), Some(provider_id), Some(upstream_model_id)) = (
@@ -1261,6 +1287,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}
             &super::super::types::GatewayRequestLogFilters::default(),
             0,
             10,
+            true,
         )
         .unwrap();
         assert_eq!(logs.total, 1);
@@ -1680,6 +1707,7 @@ base_url = "https://openai.example.com/v1"
         let body = br#"{"model":"debug"}"#;
         let request = debug_request("POST", "/anthropic/v1/messages", body);
         let provider = UpstreamProvider {
+            supports_websockets: None,
             cli_key: GatewayCliKey::Claude,
             id: "p1".to_string(),
             name: "Provider".to_string(),

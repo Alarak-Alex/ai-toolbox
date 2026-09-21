@@ -45,5 +45,6 @@ export function shouldReengageKimiGatewayOnSave(
   gatewayMode: string | null | undefined,
 ): boolean {
   const editingAppliedRecord = Boolean(editingProvider?.isApplied);
+  // Single/failover only: aggregate is Codex-only, so Kimi can never report it.
   return editingAppliedRecord && (gatewayMode === 'single' || gatewayMode === 'failover');
 }

@@ -12,13 +12,67 @@ import {
   formatTps,
   formatUsd,
   gatewayRequestDisplayKind,
+  gatewayWebSocketStatusKey,
   getGatewayRequestsPerMinute,
   isGatewayRequestUsageApplicable,
   normalizeAttemptCounts,
   requestExportPrefix,
   requestLineText,
+  resolveGatewayRequestRange,
+  resolveGatewayUsageRange,
   shouldShowBodyComparison,
 } from '../../../../../features/coding/gateway/utils/gatewayFormatters.ts';
+
+test('WebSocket request status uses the delivered terminal and keeps handshake fallback distinct', () => {
+  for (const outcome of ['completed', 'failed', 'incomplete', 'canceled']) {
+    assert.equal(gatewayWebSocketStatusKey({ transport: 'websocket', stream_outcome: outcome, status_code: 0, success: outcome === 'completed' }), `gateway.page.requests.websocket.${outcome}`);
+  }
+  assert.equal(gatewayWebSocketStatusKey({ transport: 'websocket', request_kind: 'websocket_handshake', status_code: 426, success: false }), 'gateway.page.requests.websocket.fallback');
+  assert.equal(gatewayWebSocketStatusKey({ transport: 'websocket', request_kind: 'websocket_handshake', status_code: 401, success: false }), null);
+  assert.equal(gatewayWebSocketStatusKey({ status_code: 200, success: true }), null);
+  assert.equal(gatewayWebSocketStatusKey({ transport: 'websocket', status_code: null, success: false }), 'gateway.page.requests.websocket.failed');
+});
+
+test('WebSocket handshake and warmup do not pretend to be ordinary model usage', () => {
+  const request = { method: 'WS', path: '/openai/v1/responses', requested_model: 'gpt-5', transport: 'websocket' as const };
+  assert.equal(gatewayRequestDisplayKind(request), 'model');
+  assert.equal(isGatewayRequestUsageApplicable(request), true);
+  const handshake = { ...request, method: 'GET', request_kind: 'websocket_handshake' as const };
+  assert.equal(gatewayRequestDisplayKind(handshake), 'connectionProbe');
+  assert.equal(isGatewayRequestUsageApplicable(handshake), false);
+  const warmup = { ...request, request_kind: 'websocket_warmup' as const };
+  assert.equal(isGatewayRequestUsageApplicable(warmup), false);
+  assert.equal(isGatewayRequestUsageApplicable({ ...warmup, total_tokens: 0 }), false);
+  assert.equal(isGatewayRequestUsageApplicable({ ...warmup, total_tokens: 12 }), true);
+});
+
+test('request presets use the statistics ranges and refresh their relative end time', () => {
+  const now = new Date(2026, 8, 12, 22, 24, 0).getTime();
+  for (const preset of ['today', '1d', '7d', '14d', '30d'] as const) {
+    const expected = resolveGatewayUsageRange({ preset }, now);
+    assert.deepEqual(resolveGatewayRequestRange({ preset }, now), {
+      start_date: expected.startDate,
+      end_date: expected.endDate,
+    });
+    assert.equal(resolveGatewayRequestRange({ preset }, now + 60_000).end_date, expected.endDate + 60);
+  }
+  assert.equal(resolveGatewayRequestRange({ preset: 'today' }, now).start_date, new Date(2026, 8, 12).getTime() / 1000);
+});
+
+test('request all-time and cleared custom ranges preserve the unbounded search', () => {
+  assert.deepEqual(resolveGatewayRequestRange({ preset: 'all' }), { start_date: null, end_date: null });
+  assert.deepEqual(resolveGatewayRequestRange({ preset: 'custom', customRange: null }), { start_date: null, end_date: null });
+});
+
+test('request custom timestamps remain fixed when refreshing and keep open-ended bounds', () => {
+  const start = { toDate: () => new Date(2026, 8, 10, 9, 30) };
+  const end = { toDate: () => new Date(2026, 8, 12, 22, 24) };
+  const selection = { preset: 'custom' as const, customRange: [start, end] as [typeof start, typeof end] };
+  const expected = { start_date: start.toDate().getTime() / 1000, end_date: end.toDate().getTime() / 1000 };
+  assert.deepEqual(resolveGatewayRequestRange(selection, 0), expected);
+  assert.deepEqual(resolveGatewayRequestRange(selection, 60_000), expected);
+  assert.deepEqual(resolveGatewayRequestRange({ preset: 'custom', customRange: [start, null] }), { ...expected, end_date: null });
+});
 
 test('duration pairs preserve subsecond TTFT and long-request precision', () => {
   assert.equal(formatDurationPair(13_600, 400), '0.4s/13.6s');
@@ -92,6 +146,8 @@ test('request rate follows the CLI filter and keeps no traffic distinct from unl
   assert.equal(getGatewayRequestsPerMinute(status, 'claude_desktop'), 6);
   assert.equal(getGatewayRequestsPerMinute(status, 'codex'), 16);
   assert.equal(getGatewayRequestsPerMinute(status, 'gemini'), 0);
+  assert.equal(getGatewayRequestsPerMinute(status, 'pi'), null);
+  assert.equal(getGatewayRequestsPerMinute(status, 'hermes'), null);
   assert.equal(getGatewayRequestsPerMinute(null), null);
   assert.equal(getGatewayRequestsPerMinute(undefined, 'codex'), null);
   assert.equal(getGatewayRequestsPerMinute({ requests_per_minute: 0, requests_per_minute_by_cli: {} }, 'claude'), 0);

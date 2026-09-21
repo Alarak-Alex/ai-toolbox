@@ -805,10 +805,50 @@ fn providers_dict_mut(config: &mut Value) -> Result<&mut Map<String, Value>, Str
     Ok(providers.as_object_mut().unwrap())
 }
 
+fn write_provider_with_credential(
+    config_path: &Path,
+    config: &Value,
+    credentials_path: &Path,
+    credential: &DshCredentialInput,
+) -> Result<(), String> {
+    fn snapshot(path: &Path) -> Result<Option<Vec<u8>>, String> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("Failed to read {}: {error}", path.display())),
+        }
+    }
+    let previous_config = snapshot(config_path)?;
+    let previous_credentials = snapshot(credentials_path)?;
+    let mut credentials = CredentialsDocument::read(credentials_path)?;
+    if credential.ref_name.trim().is_empty() {
+        return Err("Credential ref is required".to_string());
+    }
+    credentials.set_ref(credential.ref_name.trim(), Some(credential.value.trim()));
+    let result = credentials.write(credentials_path)
+        .and_then(|()| write_yaml_object(config_path, config));
+    if let Err(error) = result {
+        let mut failures = Vec::new();
+        for (path, previous) in [(config_path, previous_config), (credentials_path, previous_credentials)] {
+            let restore = match previous {
+                Some(bytes) => fs::write(path, bytes),
+                None => match fs::remove_file(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+            };
+            if let Err(restore_error) = restore { failures.push(format!("{}: {restore_error}", path.display())); }
+        }
+        set_credentials_file_permissions(credentials_path);
+        return Err(if failures.is_empty() { error } else { format!("{error}; rollback failed: {}", failures.join("; ")) });
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub async fn save_dsh_models_provider(
+pub async fn save_dsh_models_provider<R: tauri::Runtime>(
     state: tauri::State<'_, SqliteDbState>,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
     input: DshModelsProviderInput,
 ) -> Result<DshRuntimeConfig, String> {
     let provider_key = input.provider_key.trim();
@@ -831,7 +871,12 @@ pub async fn save_dsh_models_provider(
     let providers = providers_dict_mut(&mut config)?;
     providers.insert(provider_key.to_string(), payload);
 
-    write_yaml_object(&config_path, &config)?;
+    if let Some(credential) = &input.credential {
+        let credentials_path = get_dsh_credentials_path_async(&db).await?;
+        write_provider_with_credential(&config_path, &config, &credentials_path, credential)?;
+    } else {
+        write_yaml_object(&config_path, &config)?;
+    }
     emit_config_changed(&app, "window");
     read_dsh_runtime_config(state).await
 }
@@ -1361,7 +1406,7 @@ pub async fn save_dsh_local_prompt_config(
 pub async fn open_dsh_web_ui(path: Option<String>) -> Result<(), String> {
     use super::web_ui;
 
-    let port = web_ui::resolve_web_port();
+    let port = web_ui::DSH_WEB_DEFAULT_PORT;
     if !web_ui::probe_web_up(port).await {
         return Err("DSh Web UI 未运行,请先启动 dsh web".to_string());
     }
@@ -1651,6 +1696,29 @@ mod tests {
     }
 
     #[test]
+    fn provider_and_credential_write_rolls_back_both_files_when_config_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("settings.yaml");
+        let credentials_path = dir.path().join(".credentials.yaml");
+        let original_config = b"# Keep the original bytes\nagent: { enabled: true }\n";
+        let original_credentials = b"version: 1\nrefs: { OLD_KEY: keep-key }\nrecords: { login: { key: keep-login } }\n";
+        fs::write(&config_path, original_config).unwrap();
+        fs::write(&credentials_path, original_credentials).unwrap();
+        let input = DshCredentialInput { ref_name: "NEW_KEY".to_string(), value: "new-key".to_string() };
+        // The second writer rejects a non-mapping after the credential write.
+        let result = write_provider_with_credential(&config_path, &Value::Null, &credentials_path, &input);
+        assert!(result.is_err());
+        assert_eq!(fs::read(&config_path).unwrap(), original_config);
+        assert_eq!(fs::read(&credentials_path).unwrap(), original_credentials);
+
+        let new_config = dir.path().join("new/settings.yaml");
+        let new_credentials = dir.path().join("new/.credentials.yaml");
+        assert!(write_provider_with_credential(&new_config, &Value::Null, &new_credentials, &input).is_err());
+        assert!(!new_config.exists());
+        assert!(!new_credentials.exists());
+    }
+
+    #[test]
     fn delete_missing_ref_is_tolerated_noop() {
         let mut document = credentials_document(json!({
             "version": 1,
@@ -1779,7 +1847,11 @@ const AGENT_INSTRUCTIONS_PLUGIN_ID: &str = "agent-instructions";
 
 /// `config.maxBytes` written when enabling the plugin: 256 KiB, so the
 /// workspace-instruction baseline budget can fit both `~/.dsh/AGENTS.md` and
-/// a sizeable project `AGENTS.md`, instead of the bundle default 65536 bytes.
+/// a sizeable project `AGENTS.md`, instead of the base bundle default 65536.
+///
+/// This value only reaches base-backed profiles. On the Web surface the live
+/// `agent-instructions` row is mounted per session from an agent preset, so the
+/// home patch writes below cannot change the budget there.
 const AGENT_INSTRUCTIONS_MAX_BYTES: u64 = 256 * 1024;
 
 /// Resolve the home-level `cordis.patch.yml` path via DB-priority config dir.
@@ -1788,12 +1860,18 @@ async fn get_dsh_cordis_patch_path(db: &SqliteDbState) -> Result<PathBuf, String
     Ok(root.join("cordis.patch.yml"))
 }
 
-/// Check whether the `agent-instructions` plugin is enabled.
+/// Check whether the **home-level** `cordis.patch.yml` enables `agent-instructions`.
 ///
-/// The dsh-web-app bundle disables it by default. Users enable it by adding
-/// `- id: agent-instructions, disabled: false` to the home-level
-/// `cordis.patch.yml`. When the home patch has no override for this plugin,
-/// the bundle default (disabled) applies.
+/// Scope, and it matters: this reports the home patch's override only. The home
+/// patch governs base-backed profiles (tui / headless), where the base bundle
+/// disables the plugin and a user enables it with
+/// `- id: agent-instructions, disabled: false`. When the home patch carries no
+/// override, that base default (disabled) applies.
+///
+/// It deliberately says nothing about the Web surface: there the web bundle's
+/// row is a `disabled: true` tombstone and the live row is mounted per session
+/// from an agent preset, so the home patch neither reflects nor controls it.
+/// Callers must not present this result as "the global prompt is (in)active".
 #[tauri::command]
 pub async fn check_dsh_agent_instructions(
     state: tauri::State<'_, SqliteDbState>,
@@ -1817,6 +1895,9 @@ pub async fn check_dsh_agent_instructions(
 
 /// Enable the `agent-instructions` plugin by writing `disabled: false` and
 /// `config.maxBytes: 262144` (256 KiB) to the home-level `cordis.patch.yml`.
+///
+/// Base-backed profiles only — see [`check_dsh_agent_instructions`] for why the
+/// Web surface is out of reach from here.
 #[tauri::command]
 pub async fn enable_dsh_agent_instructions(
     state: tauri::State<'_, SqliteDbState>,

@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::schema::{sql_string_literal, DbTable, JsonFieldPath, ALL_TABLES};
 
-pub const TARGET_SCHEMA_VERSION: i32 = 19;
+pub const TARGET_SCHEMA_VERSION: i32 = 22;
 const FUTURE_SCHEMA_ERROR_PREFIX: &str = "AI_TOOLBOX_SQLITE_SCHEMA_TOO_NEW";
 
 pub fn run_all(conn: &mut Connection) -> Result<(), String> {
@@ -64,6 +64,15 @@ pub fn run_all(conn: &mut Connection) -> Result<(), String> {
     }
     if current_version < 19 {
         run_migration_step(conn, 19, migrate_v19)?;
+    }
+    if current_version < 20 {
+        run_migration_step(conn, 20, migrate_v20)?;
+    }
+    if current_version < 21 {
+        run_migration_step(conn, 21, migrate_v21)?;
+    }
+    if current_version < 22 {
+        run_migration_step(conn, 22, migrate_v22)?;
     }
 
     Ok(())
@@ -398,6 +407,54 @@ fn migrate_v19(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn migrate_v20(conn: &Connection) -> Result<(), String> {
+    add_column_if_missing(conn, "proxy_request_logs", "usage_metadata", "BLOB")?;
+    add_column_if_missing(
+        conn,
+        "proxy_request_logs",
+        "usage_request_count",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    // Some native providers report orchestration usage outside the four
+    // billable categories. Preserve it in totals without inventing a price.
+    for table in ["proxy_request_logs", "usage_daily_rollups"] {
+        add_column_if_missing(conn, table, "extra_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_proxy_native_match
+         ON proxy_request_logs(app_type, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, created_at);",
+    ).map_err(|error| format!("Failed to index native usage reconciliation: {error}"))
+}
+
+fn migrate_v21(conn: &Connection) -> Result<(), String> {
+    add_column_if_missing(
+        conn,
+        "proxy_request_logs",
+        "transport",
+        "TEXT NOT NULL DEFAULT 'http'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "proxy_request_logs",
+        "request_kind",
+        "TEXT NOT NULL DEFAULT 'request'",
+    )
+}
+
+fn migrate_v22(conn: &Connection) -> Result<(), String> {
+    create_jsonb_table(conn, DbTable::OhMyPiAgentsConfig)?;
+    create_json_index(
+        conn,
+        DbTable::OhMyPiAgentsConfig,
+        &JsonFieldPath::new("is_applied")?,
+    )?;
+    create_json_index(
+        conn,
+        DbTable::OhMyPiAgentsConfig,
+        &JsonFieldPath::new("sort_index")?,
+    )
+}
+
 fn create_jsonb_table(conn: &Connection, table: DbTable) -> Result<(), String> {
     let table_name = table.name();
     conn.execute_batch(&format!(
@@ -425,6 +482,7 @@ fn create_initial_indexes(conn: &Connection) -> Result<(), String> {
         DbTable::OhMyOpenCodeSlimConfig,
         DbTable::CodexOfficialAccount,
         DbTable::GeminiCliOfficialAccount,
+        DbTable::OhMyPiAgentsConfig,
     ] {
         create_json_index(conn, table, &JsonFieldPath::new("is_applied")?)?;
     }
@@ -445,6 +503,7 @@ fn create_initial_indexes(conn: &Connection) -> Result<(), String> {
         DbTable::OhMyOpenCodeSlimConfig,
         DbTable::CodexOfficialAccount,
         DbTable::GeminiCliOfficialAccount,
+        DbTable::OhMyPiAgentsConfig,
     ] {
         create_json_index(conn, table, &JsonFieldPath::new("sort_index")?)?;
     }

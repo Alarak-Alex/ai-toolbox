@@ -25,37 +25,43 @@ import {
   getProxyGatewayRequestLogDetail,
   importProxyGatewaySessionUsage,
   listProxyGatewayRequestLogs,
-  type GatewayCliKey,
+  type GatewayUsageTool,
+  GATEWAY_USAGE_TOOLS,
   type GatewayRequestLogDetail,
   type GatewayRequestLogFilters,
   type GatewayRequestLogItem,
 } from '@/services';
 import {
+  calculateCacheHitRate,
   deriveGatewayRequestDisplay,
   formatCompactInteger,
   formatDateTime,
   formatDuration,
-  formatDurationPair,
+  formatCacheHitRate,
   formatGatewayError,
+  gatewayWebSocketStatusKey,
   formatInteger,
   formatModelWithEffort,
   formatTps,
   formatUsd,
+  GATEWAY_USAGE_RANGE_PRESETS,
   isGatewayRequestUsageApplicable,
   joinClassNames,
   normalizeAttemptCounts,
   requestExportPrefix,
   requestLineText,
+  resolveGatewayRequestRange,
   sanitizeGatewayFileNamePart,
   shouldShowBodyComparison,
   stringifyDetailValue,
+  type GatewayRequestRangeSelection,
 } from '../utils/gatewayFormatters';
 import styles from './GatewayRequestsView.module.less';
 
 const { RangePicker } = DatePicker;
 
 type RequestDetailTabKey = 'record' | 'body' | 'headers' | 'response';
-type GatewayCliFilter = 'all' | GatewayCliKey;
+type GatewayCliFilter = 'all' | GatewayUsageTool;
 
 const REQUEST_DETAIL_TABS: RequestDetailTabKey[] = ['record', 'body', 'headers', 'response'];
 const COLLAPSED_LINE_LIMIT = 10;
@@ -110,24 +116,22 @@ interface GatewayRequestsViewProps {
   refreshKey?: number;
 }
 
-interface DateLike {
-  toDate: () => Date;
-}
-
 interface RequestFilterDraft {
   cliKey: GatewayCliFilter;
+  dataSource: 'all' | 'proxy' | 'session';
   statusCode: string;
   providerName: string;
   model: string;
-  dateRange: [DateLike | null, DateLike | null] | null;
+  range: GatewayRequestRangeSelection;
 }
 
 const defaultDraft: RequestFilterDraft = {
   cliKey: 'all',
+  dataSource: 'all',
   statusCode: 'all',
   providerName: '',
   model: '',
-  dateRange: null,
+  range: { preset: 'all' },
 };
 
 const lineCountOf = (content: string) => content.split(/\r\n|\r|\n/).length;
@@ -138,24 +142,31 @@ const tokenBreakdownText = (
     GatewayRequestLogItem | GatewayRequestLogDetail,
     'input_tokens' | 'output_tokens' | 'cache_read_tokens' | 'cache_creation_tokens' | 'total_tokens'
   >,
-) => t('gateway.page.requests.tokensValue', {
-  input: formatInteger(value.input_tokens),
-  output: formatInteger(value.output_tokens),
-  cacheRead: formatInteger(value.cache_read_tokens),
-  cacheCreation: formatInteger(value.cache_creation_tokens),
-  total: formatInteger(value.total_tokens),
-});
+) => {
+  const breakdown = t('gateway.page.requests.tokensValue', {
+    input: formatInteger(value.input_tokens),
+    output: formatInteger(value.output_tokens),
+    cacheRead: formatInteger(value.cache_read_tokens),
+    cacheCreation: formatInteger(value.cache_creation_tokens),
+    total: formatInteger(value.total_tokens),
+  });
+  const extra = (value.total_tokens ?? 0) - (value.input_tokens ?? 0) - (value.output_tokens ?? 0)
+    - (value.cache_read_tokens ?? 0) - (value.cache_creation_tokens ?? 0);
+  return extra > 0 ? `${breakdown} · ${t('gateway.page.requests.nativeUsage.extraShort', { value: formatInteger(extra) })}` : breakdown;
+};
 
 const providerDisplayName = (
   t: ReturnType<typeof useTranslation>['t'],
   providerId?: string | null,
   providerName?: string | null,
+  nativeProvider?: string | null,
 ) => {
   if (providerName) {
     return providerName;
   }
   if (providerId === 'session') {
-    return t('gateway.page.requests.localSession');
+    const source = t('gateway.page.requests.localSession');
+    return nativeProvider ? `${source} · ${nativeProvider}` : source;
   }
   if (!providerId || providerId === 'unknown') {
     return t('gateway.page.requests.providerUnselected');
@@ -165,7 +176,7 @@ const providerDisplayName = (
 
 const providerDisplayMeta = (
   t: ReturnType<typeof useTranslation>['t'],
-  cliKey: GatewayCliKey,
+  cliKey: GatewayUsageTool,
   providerId?: string | null,
 ) => {
   const cliLabel = t(`settings.gateway.cli.${cliKey}`);
@@ -183,14 +194,12 @@ const buildRequestDetailExportFileName = (detail: GatewayRequestLogDetail) => {
 };
 
 const buildFilters = (draft: RequestFilterDraft): GatewayRequestLogFilters => {
-  const [start, end] = draft.dateRange ?? [];
   return {
+    data_source: draft.dataSource === 'all' ? null : draft.dataSource,
     cli_key: draft.cliKey === 'all' ? null : draft.cliKey,
     status_code: draft.statusCode === 'all' ? null : Number(draft.statusCode),
     provider_name: draft.providerName.trim() || null,
     model: draft.model.trim() || null,
-    start_date: start ? Math.floor(start.toDate().getTime() / 1000) : null,
-    end_date: end ? Math.floor(end.toDate().getTime() / 1000) : null,
   };
 };
 
@@ -288,6 +297,7 @@ const CollapsiblePre: React.FC<CollapsiblePreProps> = ({ content, fallback }) =>
 const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 0 }) => {
   const { t } = useTranslation();
   const [draft, setDraft] = React.useState<RequestFilterDraft>(defaultDraft);
+  const [appliedRange, setAppliedRange] = React.useState(defaultDraft.range);
   const [filters, setFilters] = React.useState<GatewayRequestLogFilters>(() => ({
     exclude_model_list: readExcludeModelListPreference() ? true : null,
     only_failed: readOnlyFailedPreference() ? true : null,
@@ -337,7 +347,8 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
     setLoading(true);
     setError(null);
     try {
-      const result = await listProxyGatewayRequestLogs(filters, Math.max(page - 1, 0), PAGE_SIZE);
+      const requestFilters = { ...filters, ...resolveGatewayRequestRange(appliedRange) };
+      const result = await listProxyGatewayRequestLogs(requestFilters, Math.max(page - 1, 0), PAGE_SIZE);
       if (revision !== requestRevisionRef.current) return;
       setLogs(result.data);
       setTotal(result.total);
@@ -351,7 +362,7 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
     } finally {
       if (revision === requestRevisionRef.current) setLoading(false);
     }
-  }, [closeDetail, filters, page, t]);
+  }, [appliedRange, closeDetail, filters, page, t]);
 
   const loadDetail = React.useCallback(
     async (traceId: string) => {
@@ -383,6 +394,7 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
   }, [loadRequests, refreshKey, importRefreshRevision]);
 
   const applyFilters = () => {
+    setAppliedRange(draft.range);
     setFilters((current) => ({
       ...buildFilters(draft),
       // Title-bar switches are independent from the search form.
@@ -394,6 +406,7 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
 
   const resetFilters = () => {
     setDraft(defaultDraft);
+    setAppliedRange(defaultDraft.range);
     setFilters((current) => ({
       exclude_model_list: current.exclude_model_list,
       only_failed: current.only_failed,
@@ -510,6 +523,9 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
     if (activeDetailTab === 'record') {
       const attemptCounts = normalizeAttemptCounts(detail);
       const providerAttempts = detail.provider_attempts ?? [];
+      const websocketStatusKey = gatewayWebSocketStatusKey(detail);
+      const handshakeAttemptsText = detail.websocket?.handshake_attempts?.map((attempt) =>
+        `${attempt.provider_name ?? attempt.provider_id ?? '-'}: ${attempt.status_code ?? '-'}`).join(' → ');
       const requestDisplay = deriveGatewayRequestDisplay(detail);
       const requestDisplayTitle = detail.data_source === 'session' && !requestDisplay.modelApplicable
         ? t('gateway.page.requests.localSession')
@@ -526,6 +542,35 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
           <code>{requestLineText(detail, t('gateway.page.requests.requestPathUnavailable'))}</code>
           <span>{t('gateway.page.requests.fields.provider')}</span>
           <strong>{providerDisplayName(t, detail.provider_id, detail.provider_name)}</strong>
+          {detail.data_source === 'session' && (
+            <>
+              <span>{t('gateway.page.requests.nativeUsage.provider')}</span>
+              <strong>{detail.usage_metadata?.native_provider || t('gateway.page.requests.nativeUsage.unknown')}</strong>
+              <span>{t('gateway.page.requests.nativeUsage.callCount')}</span>
+              <strong>{formatInteger(detail.usage_metadata?.call_count ?? (detail.usage_metadata?.granularity && detail.usage_metadata.granularity !== 'request' ? null : 1))}</strong>
+              <span>{t('gateway.page.requests.nativeUsage.completeness')}</span>
+              <strong>{t(detail.usage_metadata?.incomplete ? 'gateway.page.requests.nativeUsage.incomplete' : 'gateway.page.requests.nativeUsage.recorded')}</strong>
+              <span>{t('gateway.page.requests.nativeUsage.costSource')}</span>
+              <strong>{t(`gateway.page.requests.nativeUsage.cost.${detail.usage_metadata?.cost_source ?? 'model_pricing'}`)}</strong>
+              {detail.usage_metadata?.granularity === 'session' && (
+                <>
+                  <span>{t('gateway.page.requests.nativeUsage.window')}</span>
+                  <strong>{[
+                    detail.usage_metadata.window_start,
+                    detail.usage_metadata.window_end,
+                  ].map((time) => time == null ? '-' : formatDateTime(new Date(time * 1000).toISOString())).join(' → ')}</strong>
+                  <span>{t('gateway.page.requests.nativeUsage.timeMeaning')}</span>
+                  <strong className={styles.detailNote}>{t('gateway.page.requests.nativeUsage.cumulativeHint')}</strong>
+                </>
+              )}
+              {detail.usage_metadata?.reported_total_tokens != null && (
+                <>
+                  <span>{t('gateway.page.requests.nativeUsage.reportedTotal')}</span>
+                  <strong>{formatInteger(detail.usage_metadata.reported_total_tokens)}</strong>
+                </>
+              )}
+            </>
+          )}
           <span>{t('gateway.page.requests.fields.model')}</span>
           <strong>{requestDisplay.modelApplicable
             ? formatModelWithEffort(requestDisplay.modelText, detail.reasoning_effort)
@@ -534,7 +579,8 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
               : t('gateway.page.requests.notApplicable')}</strong>
           <span>{t('gateway.page.requests.fields.status')}</span>
           <strong title={detail.data_source === 'session' ? t('gateway.page.requests.localSessionHint') : undefined}>
-            {detail.data_source === 'session' ? '-' : detail.status_code ?? '-'}
+            {detail.data_source === 'session' ? '-' : websocketStatusKey
+              ? t(websocketStatusKey) : detail.status_code ?? '-'}
           </strong>
           {detail.upstream_status_code != null && (
             <>
@@ -542,14 +588,54 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
               <strong>{detail.upstream_status_code}</strong>
             </>
           )}
-          <span>{t('gateway.page.requests.fields.duration')}</span>
-          <strong>{detail.data_source === 'session' ? '-' : formatDuration(detail.duration_ms)}</strong>
+          {detail.transport === 'websocket' && (
+            <>
+              <span>{t('gateway.page.requests.websocket.transport')}</span>
+              <strong>WebSocket{detail.request_kind === 'websocket_warmup' ? ` · ${t('gateway.page.requests.websocket.warmup')}` : ''}</strong>
+              {detail.websocket && (
+                <>
+                  <span>{t('gateway.page.requests.websocket.connection')}</span>
+                  <code title={detail.websocket.connection_id}>{detail.websocket.connection_id}</code>
+                  <span>{t('gateway.page.requests.websocket.handshake')}</span>
+                  <strong>{detail.websocket.handshake_status} / {detail.websocket.upstream_handshake_status ?? '-'}</strong>
+                  {(detail.websocket.handshake_attempts?.length ?? 0) > 1 && <>
+                    <span>{t('gateway.page.requests.websocket.handshakeAttempts')}</span>
+                    <code title={handshakeAttemptsText}>{handshakeAttemptsText}</code>
+                  </>}
+                  <span>{t('gateway.page.requests.websocket.response')}</span>
+                  <code title={detail.websocket.response_id ?? undefined}>{detail.websocket.response_id ?? '-'}</code>
+                  <span>{t('gateway.page.requests.websocket.previous')}</span>
+                  <code title={detail.websocket.previous_response_id ?? undefined}>{detail.websocket.previous_response_id ?? '-'}</code>
+                  <span>{t('gateway.page.requests.websocket.stream')}</span>
+                  <code title={detail.websocket.stream_id ?? undefined}>{detail.websocket.stream_id ?? '-'}</code>
+                  {detail.websocket.error_status != null && <>
+                    <span>{t('gateway.page.requests.websocket.errorStatus')}</span>
+                    <strong>{detail.websocket.error_status}</strong>
+                  </>}
+                  {detail.websocket.fallback_reason && <>
+                    <span>{t('gateway.page.requests.websocket.fallback')}</span>
+                    <strong className={styles.detailNote}>{detail.websocket.fallback_reason}</strong>
+                  </>}
+                </>
+              )}
+            </>
+          )}
           <span title={t('gateway.page.requests.durationHint')}>{t('gateway.page.requests.fields.firstToken')}</span>
           <strong>{detail.first_token_ms != null ? formatDuration(detail.first_token_ms) : '-'}</strong>
+          <span>{t('gateway.page.requests.fields.duration')}</span>
+          <strong>{detail.data_source === 'session' ? '-' : formatDuration(detail.duration_ms)}</strong>
           <span>{t('gateway.page.requests.fields.streaming')}</span>
           <strong>{detail.data_source === 'session' ? '-' : detail.is_streaming ? t('common.yes') : t('common.no')}</strong>
           <span>{t('gateway.page.requests.fields.tokens')}</span>
           <strong>{isGatewayRequestUsageApplicable(detail) ? tokenBreakdownText(t, detail) : '-'}</strong>
+          <span title={t('gateway.page.requests.cacheHitRateHint')}>{t('gateway.page.statistics.columns.cacheHitRate')}</span>
+          <strong>{isGatewayRequestUsageApplicable(detail)
+            ? formatCacheHitRate(calculateCacheHitRate(
+              detail.input_tokens ?? 0,
+              detail.cache_read_tokens ?? 0,
+              detail.cache_creation_tokens ?? 0,
+            ))
+            : '-'}</strong>
           <span title={t('gateway.page.requests.tpsHint')}>{t('gateway.page.requests.tpsLabel')}</span>
           <strong>{formatTps(detail) ?? '-'}</strong>
           <span>{t('gateway.page.requests.fields.attempts')}</span>
@@ -585,6 +671,20 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
           <code>{detail.upstream_url ?? '-'}</code>
           <span>{t('gateway.page.requests.fields.error')}</span>
           <strong>{detail.error_category ?? '-'}</strong>
+          {detail.privacy && (detail.privacy.matched_values > 0 || detail.privacy.restored_values > 0 || detail.privacy.failed) && (
+            <>
+              <span>{t('gateway.privacy.title')}</span>
+              <div className={styles.detailStack}>
+                <strong>{detail.privacy.failed ? t('gateway.privacy.detail.failed') : t('gateway.privacy.detail.applied', {
+                  matched: detail.privacy.matched_values, restored: detail.privacy.restored_values,
+                })}</strong>
+                {Object.keys(detail.privacy.rules).length > 0 && <span className={styles.detailSubtitle}>{t('gateway.privacy.detail.rules', {
+                  rules: Object.entries(detail.privacy.rules).map(([rule, count]) => `${rule} (${count})`).join(', '),
+                })}</span>}
+                {detail.privacy.log_redacted && <span className={styles.detailSubtitle}>{t('gateway.privacy.detail.logs')}</span>}
+              </div>
+            </>
+          )}
         </div>
       );
     }
@@ -607,12 +707,12 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
     if (activeDetailTab === 'headers') {
       return (
         <div className={styles.detailStack}>
-          <span className={styles.detailSubtitle}>{t('gateway.page.requests.requestHeaders')}</span>
+          <span className={styles.detailSubtitle}>{t(detail.transport === 'websocket' ? 'gateway.page.requests.websocket.requestHeaders' : 'gateway.page.requests.requestHeaders')}</span>
           <CollapsiblePre
             content={stringifyDetailValue(detail.request_headers) || null}
             fallback={detailEmptyMessage}
           />
-          <span className={styles.detailSubtitle}>{t('gateway.page.requests.responseHeaders')}</span>
+          <span className={styles.detailSubtitle}>{t(detail.transport === 'websocket' ? 'gateway.page.requests.websocket.responseHeaders' : 'gateway.page.requests.responseHeaders')}</span>
           <CollapsiblePre
             content={stringifyDetailValue(detail.response_headers) || null}
             fallback={detailEmptyMessage}
@@ -648,8 +748,8 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
       dataIndex: 'provider_name',
       render: (_, record) => (
         <div className={styles.tableMainCell}>
-          <strong title={providerDisplayName(t, record.provider_id, record.provider_name)}>{providerDisplayName(t, record.provider_id, record.provider_name)}</strong>
-          <small>{providerDisplayMeta(t, record.cli_key, record.provider_id)}</small>
+          <strong title={providerDisplayName(t, record.provider_id, record.provider_name, record.usage_metadata?.native_provider)}>{providerDisplayName(t, record.provider_id, record.provider_name, record.usage_metadata?.native_provider)}</strong>
+          <small>{record.transport === 'websocket' ? 'WS · ' : ''}{record.request_kind === 'websocket_warmup' ? `${t('gateway.page.requests.websocket.warmup')} · ` : ''}{providerDisplayMeta(t, record.cli_key, record.provider_id)}</small>
         </div>
       ),
     },
@@ -673,7 +773,7 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
                     </span>
                   ) : null}
                 </div>
-                <small>
+                <small title={record.usage_metadata?.incomplete ? t('gateway.page.requests.nativeUsage.incompleteHint') : undefined}>
                   {requestDisplay.kind === 'model' || record.data_source === 'session'
                     ? t('gateway.page.requests.tokensShort', {
                         input: formatCompactInteger(record.input_tokens),
@@ -681,6 +781,8 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
                         cache: formatCompactInteger(record.cache_read_tokens + record.cache_creation_tokens),
                       })
                     : requestLineText(record, t('gateway.page.requests.requestPathUnavailable'))}
+                  {record.usage_metadata?.incomplete ? ` · ${t('gateway.page.requests.nativeUsage.incomplete')}` : ''}
+                  {record.extra_tokens ? ` · ${t('gateway.page.requests.nativeUsage.extraShort', { value: formatCompactInteger(record.extra_tokens) })}` : ''}
                 </small>
               </>
             );
@@ -689,31 +791,54 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
       ),
     },
     {
-      title: t('gateway.page.requests.columns.status'),
-      dataIndex: 'status_code',
-      width: 90,
-      align: 'right',
-      render: (value: number, record) => record.data_source === 'session' ? (
-        <span title={t('gateway.page.requests.localSessionHint')}>-</span>
-      ) : (
-        <span className={record.success ? styles.statusCodeSuccess : styles.statusCodeError}>
-          {value}
-        </span>
-      ),
-    },
-    {
       title: t('gateway.page.requests.columns.tokens'),
       dataIndex: 'total_tokens',
-      width: 110,
+      width: 120,
       align: 'right',
-      render: (value: number, record) => isGatewayRequestUsageApplicable(record) ? (
-        <div className={styles.tokenCell}>
-          <span>{formatCompactInteger(value)}</span>
-          <small title={t('gateway.page.requests.tpsHint')}>
-            {formatTps(record) ?? '-'}
-          </small>
-        </div>
-      ) : '-',
+      render: (value: number, record) => {
+        if (!isGatewayRequestUsageApplicable(record)) {
+          return '-';
+        }
+        const hitRate = calculateCacheHitRate(
+          record.input_tokens ?? 0,
+          record.cache_read_tokens ?? 0,
+          record.cache_creation_tokens ?? 0,
+        );
+        return (
+          <div className={styles.tokenCell}>
+            <span>{t('gateway.page.requests.tokenTotalCell', { value: formatInteger(value) })}</span>
+            <small>{hitRate == null
+              ? '-'
+              : t('gateway.page.requests.cacheHitCell', { rate: formatCacheHitRate(hitRate) })}</small>
+          </div>
+        );
+      },
+    },
+    {
+      title: <span title={t('gateway.page.requests.durationHint')}>{t('gateway.page.requests.columns.duration')}</span>,
+      dataIndex: 'duration_ms',
+      width: 140,
+      align: 'right',
+      render: (value: number, record) => {
+        if (record.data_source === 'session') {
+          return '-';
+        }
+        return (
+          <div className={styles.tokenCell}>
+            <small>{t('gateway.page.requests.durationFirstCell', {
+              value: record.first_token_ms != null ? formatDuration(record.first_token_ms) : '-',
+            })}</small>
+            <span>{t('gateway.page.requests.durationTotalCell', { value: formatDuration(value) })}</span>
+          </div>
+        );
+      },
+    },
+    {
+      title: <span title={t('gateway.page.requests.tpsHint')}>{t('gateway.page.requests.columns.tps')}</span>,
+      dataIndex: 'tps',
+      width: 90,
+      align: 'right',
+      render: (_, record) => formatTps(record) ?? '-',
     },
     {
       title: t('gateway.page.requests.columns.cost'),
@@ -724,11 +849,24 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
         isGatewayRequestUsageApplicable(record) ? formatUsd(value, 6) : '-',
     },
     {
-      title: <span title={t('gateway.page.requests.durationHint')}>{t('gateway.page.requests.columns.duration')}</span>,
-      dataIndex: 'duration_ms',
-      width: 130,
+      title: t('gateway.page.requests.columns.status'),
+      dataIndex: 'status_code',
+      width: 90,
       align: 'right',
-      render: (value: number, record) => record.data_source === 'session' ? '-' : formatDurationPair(value, record.first_token_ms),
+      ellipsis: true,
+      render: (value: number, record) => {
+        if (record.data_source === 'session') {
+          return <span title={t('gateway.page.requests.localSessionHint')}>-</span>;
+        }
+        const statusKey = gatewayWebSocketStatusKey(record);
+        const statusText = statusKey ? t(statusKey) : String(value);
+        return (
+          <span title={statusText} className={record.request_kind === 'websocket_handshake' && value === 426
+            ? undefined : record.success ? styles.statusCodeSuccess : styles.statusCodeError}>
+            {statusText}
+          </span>
+        );
+      },
     },
   ];
 
@@ -751,6 +889,7 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
         <div className={styles.filterSection}>
           <Terminal className={styles.filterIcon} size={14} aria-hidden="true" />
           <Select
+            aria-label={t('gateway.page.requests.filters.allCli')}
             variant="borderless"
             size="small"
             value={draft.cliKey}
@@ -758,13 +897,7 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
             popupMatchSelectWidth={false}
             options={[
               { value: 'all', label: t('gateway.page.requests.filters.allCli') },
-              { value: 'claude', label: t('settings.gateway.cli.claude') },
-              { value: 'claude_desktop', label: t('settings.gateway.cli.claude_desktop') },
-              { value: 'codex', label: t('settings.gateway.cli.codex') },
-              { value: 'grok', label: t('settings.gateway.cli.grok') },
-              { value: 'kimi', label: t('settings.gateway.cli.kimi') },
-              { value: 'gemini', label: t('settings.gateway.cli.gemini') },
-              { value: 'opencode', label: t('settings.gateway.cli.opencode') },
+              ...GATEWAY_USAGE_TOOLS.map((tool) => ({ value: tool, label: t(`settings.gateway.cli.${tool}`) })),
             ]}
             onChange={(value) => setDraft((current) => ({ ...current, cliKey: value }))}
           />
@@ -772,14 +905,73 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
         <div className={styles.filterDivider} />
 
         <div className={styles.filterSection}>
+          <CalendarDays className={styles.filterIcon} size={14} aria-hidden="true" />
+          <Select<GatewayRequestRangeSelection['preset']>
+            aria-label={t('gateway.page.requests.filters.dateRange')}
+            variant="borderless"
+            size="small"
+            className={styles.rangeSelect}
+            popupMatchSelectWidth={false}
+            value={draft.range.preset}
+            options={[
+              { value: 'all', label: t('gateway.page.requests.filters.allTime') },
+              ...GATEWAY_USAGE_RANGE_PRESETS.map((preset) => ({
+                value: preset,
+                label: t(`gateway.page.statistics.range.${preset}`),
+              })),
+            ]}
+            onChange={(preset) => setDraft((current) => ({
+              ...current,
+              range: {
+                preset,
+                customRange: preset === 'custom' ? current.range.customRange : undefined,
+              },
+            }))}
+          />
+        </div>
+        {draft.range.preset === 'custom' ? (
+          <RangePicker
+            showTime
+            variant="borderless"
+            size="small"
+            className={styles.customRangePicker}
+            value={draft.range.customRange as never}
+            onChange={(dates) => setDraft((current) => ({
+              ...current,
+              range: { preset: 'custom', customRange: dates as never },
+            }))}
+          />
+        ) : null}
+        <div className={styles.filterDivider} />
+
+        <div className={styles.filterSection}>
           <Select
+            aria-label={t('gateway.page.requests.nativeUsage.source')}
+            variant="borderless"
+            size="small"
+            value={draft.dataSource}
+            className={styles.statusSelect}
+            popupMatchSelectWidth={false}
+            options={[
+              { value: 'all', label: t('gateway.page.requests.nativeUsage.allSources') },
+              { value: 'proxy', label: t('gateway.page.requests.nativeUsage.proxy') },
+              { value: 'session', label: t('gateway.page.requests.localSession') },
+            ]}
+            onChange={(value) => setDraft((current) => ({ ...current, dataSource: value }))}
+          />
+        </div>
+        <div className={styles.filterDivider} />
+
+        <div className={styles.filterSection}>
+          <Select
+            aria-label={t('gateway.page.requests.filters.allStatus')}
             variant="borderless"
             size="small"
             value={draft.statusCode}
             className={styles.statusSelect}
             popupMatchSelectWidth={false}
             options={[
-              { value: 'all', label: t('common.all') },
+              { value: 'all', label: t('gateway.page.requests.filters.allStatus') },
               { value: '200', label: '200' },
               { value: '400', label: '400' },
               { value: '401', label: '401' },
@@ -812,19 +1004,6 @@ const GatewayRequestsView: React.FC<GatewayRequestsViewProps> = ({ refreshKey = 
           onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))}
           onPressEnter={applyFilters}
         />
-        <div className={styles.filterDivider} />
-
-        <div className={styles.filterSectionShrink}>
-          <CalendarDays className={styles.filterIcon} size={14} aria-hidden="true" />
-          <RangePicker
-            showTime
-            variant="borderless"
-            size="small"
-            className={styles.dateRange}
-            value={draft.dateRange as never}
-            onChange={(dates) => setDraft((current) => ({ ...current, dateRange: dates as never }))}
-          />
-        </div>
         <div className={styles.filterDivider} />
 
         <div className={styles.filterActions}>

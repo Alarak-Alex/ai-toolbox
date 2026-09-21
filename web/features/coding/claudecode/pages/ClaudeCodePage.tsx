@@ -72,8 +72,10 @@ import {
   getGatewayProviderProfilesVersion,
   isGatewayConfigFlagEnabled,
   providerNeedsGatewayProxy,
+  resolveGatewayReengageMode,
   saveProviderWithGatewayReengage,
   subscribeGatewayProviderProfiles,
+  toGatewayAggregateReengageConfig,
 } from '@/features/coding/shared/gateway';
 import ProviderConnectivityTestModal, {
   buildClaudeProviderConnectivityInfo,
@@ -1068,16 +1070,20 @@ const ClaudeCodePage: React.FC = () => {
 
       let savedProviderId = isLocalTemp ? '__local__' : '';
       let savedProvider: ClaudeCodeProvider | null = null;
-      const gatewayModeBeforeSave = gatewayCliStatus?.mode;
+      const gatewayModeBeforeSave = resolveGatewayReengageMode(gatewayCliStatus);
+      const gatewayAggregateBeforeSave = toGatewayAggregateReengageConfig(gatewayCliStatus);
       const shouldReengageGatewayProxy =
         Boolean(editingProvider && !isCopyMode && !isLocalTemp && editingProvider.isApplied) &&
-        (gatewayModeBeforeSave === 'single' || gatewayModeBeforeSave === 'failover');
+        gatewayModeBeforeSave !== null;
 
       await saveProviderWithGatewayReengage({
         gatewayMode: shouldReengageGatewayProxy ? gatewayModeBeforeSave : null,
+        aggregateConfig: shouldReengageGatewayProxy ? gatewayAggregateBeforeSave : null,
         restoreDirect: () => restoreProxyGatewayCliDirect('claude'),
         engageSingle: () => engageProxyGatewaySingle('claude', savedProviderId),
         engageFailover: () => engageProxyGatewayFailover('claude'),
+        // No `engageAggregate`: aggregate mode is Codex-only, so this CLI can
+        // never report it and the re-engage helper would reject the replay.
         onGatewayStatusChange: setGatewayCliStatus,
         saveProvider: async () => {
           if (isLocalTemp) {

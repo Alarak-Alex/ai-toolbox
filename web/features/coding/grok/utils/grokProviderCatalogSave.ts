@@ -25,6 +25,7 @@ export async function saveGrokProviderCatalogWithGatewayReengage<TStatus>({
   engageFailover,
   onGatewayStatusChange,
 }: SaveGrokProviderCatalogOptions<TStatus>): Promise<GrokProvider> {
+  // Grok has no aggregate mode (Codex-only), so the mode list stops at failover.
   const shouldReengageGateway = provider.isApplied
     && (gatewayMode === 'single' || gatewayMode === 'failover');
 

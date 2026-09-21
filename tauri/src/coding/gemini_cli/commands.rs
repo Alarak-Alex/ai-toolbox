@@ -19,14 +19,11 @@ use crate::db::helpers::{
 use crate::db::schema::{DbTable, JsonFieldPath, OrderDirection, OrderField, OrderSpec};
 use crate::db::SqliteDbState;
 use crate::http_client;
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 
-fn gemini_cli_gateway_takeover_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
-    app.path()
-        .app_data_dir()
-        .map(ProxyGatewayPaths::new)
-        .map(|paths| cli_proxy::provider_switch_locked_by_manifest(&paths, GatewayCliKey::Gemini))
-        .unwrap_or(false)
+fn gemini_cli_gateway_takeover_active<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> bool {
+    let paths = ProxyGatewayPaths::new(crate::app_paths::resolved_data_dir());
+    cli_proxy::provider_switch_locked_by_manifest(&paths, GatewayCliKey::Gemini)
 }
 
 fn ensure_gemini_cli_gateway_direct<R: tauri::Runtime>(
@@ -1274,9 +1271,9 @@ pub async fn create_gemini_cli_provider(
 
 /// Pure async core of `create_gemini_cli_provider`, callable in-process (e.g.
 /// from the deep-link import path) without a `tauri::State` wrapper.
-pub async fn create_gemini_cli_provider_inner(
+pub async fn create_gemini_cli_provider_inner<R: tauri::Runtime>(
     state: &SqliteDbState,
-    app: &tauri::AppHandle,
+    app: &tauri::AppHandle<R>,
     provider: GeminiCliProviderInput,
 ) -> Result<GeminiCliProvider, String> {
     let db = state.db();

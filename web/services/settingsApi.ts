@@ -47,6 +47,12 @@ export interface BackupFileFilterPathOption {
   file_path: string;
 }
 
+/** Optional backup encryption: switch + credential-store reference only (no password). */
+export interface BackupEncryptionConfig {
+  enabled: boolean;
+  credential_ref: string;
+}
+
 // Session detail filter chips (role + content visibility), persisted to SQLite
 // under the `session_detail_filters` key of the settings singleton record.
 export interface SessionDetailRoleFilter {
@@ -126,6 +132,7 @@ export interface AppSettings {
   backup_cli_config_files_enabled: boolean;
   backup_custom_entries: BackupCustomEntry[];
   backup_file_filter_rules: BackupFileFilterRule[];
+  backup_encryption: BackupEncryptionConfig;
   launch_on_startup: boolean;
   minimize_to_tray_on_close: boolean;
   start_minimized: boolean;
@@ -183,6 +190,10 @@ export const defaultSettings: AppSettings = {
   backup_cli_config_files_enabled: true,
   backup_custom_entries: [],
   backup_file_filter_rules: [],
+  backup_encryption: {
+    enabled: false,
+    credential_ref: 'keyring:ai-toolbox-backup-encryption',
+  },
   launch_on_startup: true,
   minimize_to_tray_on_close: true,
   start_minimized: false,
@@ -355,6 +366,35 @@ export const getAutoLaunchStatus = async (): Promise<boolean> => {
  */
 export const restartApp = async (): Promise<void> => {
   await invoke('restart_app');
+};
+
+/** Custom data-directory configuration (issue #345). */
+export interface AppDataDirInfo {
+  /** The override path stored in the bootstrap file, if any (null = default). */
+  override: string | null;
+  /** The directory actually in effect for the current running session. */
+  effective: string;
+  /** The platform-default directory (no override). */
+  default: string;
+  /** These describe the running session and the separately saved next start. */
+  is_custom: boolean;
+  next_start: string;
+  restart_required: boolean;
+}
+
+/**
+ * Read the current data-directory configuration for the settings UI.
+ */
+export const getAppDataDirInfo = async (): Promise<AppDataDirInfo> => {
+  return invoke<AppDataDirInfo>('get_app_data_dir_info');
+};
+
+/**
+ * Set or clear the custom data directory. Requires a restart to take effect.
+ * Pass null/empty to revert to the platform default.
+ */
+export const setAppDataDirOverride = async (path: string | null): Promise<AppDataDirInfo> => {
+  return invoke<AppDataDirInfo>('set_app_data_dir_override', { path });
 };
 
 /**

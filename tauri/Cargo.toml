@@ -1,8 +1,9 @@
 [package]
 name = "ai-toolbox"
-version = "1.1.4"
+version = "1.1.7"
 description = "AI Toolbox - Personal AI Tools Collection"
 authors = ["you"]
+license = "AGPL-3.0-or-later"
 edition = "2021"
 
 [lib]
@@ -24,6 +25,7 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-deep-link = "2"
 
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "process"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 serde_yaml = "0.9"
@@ -63,6 +65,9 @@ rusty-leveldb = "4.0.1"
 toml = { version = "0.8.2", features = ["preserve_order"] }
 toml_edit = "0.22"
 sha2 = "0.10"
+ring = "0.17"
+zeroize = "1"
+keyring = { version = "4.2", features = ["apple-native-keyring-store"] }
 hex = "0.4"
 anyhow = "1.0"
 glob = "0.3"

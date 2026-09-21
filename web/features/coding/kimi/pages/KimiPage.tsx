@@ -39,6 +39,7 @@ import { useTranslation } from 'react-i18next';
 import SectionSidebarLayout, {
   type SidebarSectionMarker,
 } from '@/components/layout/SectionSidebarLayout/SectionSidebarLayout';
+import { useProviderSharing } from '@/features/coding/shared/providerShare';
 import SidebarSettingsModal from '@/components/common/SidebarSettingsModal';
 import CliManualPathSetting from '@/components/common/CliManualPathSetting';
 import RootDirectoryModal from '@/features/coding/shared/RootDirectoryModal';
@@ -50,6 +51,7 @@ import {
   getGatewayProviderProfilesVersion,
   openAiApiFormatFromBaseUrl,
   providerNeedsGatewayProxy,
+  resolveGatewayReengageMode,
   subscribeGatewayProviderProfiles,
 } from '@/features/coding/shared/gateway';
 import {
@@ -148,6 +150,7 @@ const KIMI_OFFICIAL_PROVIDER_TEMPLATE: KimiProviderInput = {
 
 const KimiPage: React.FC = () => {
   const { t } = useTranslation();
+  const { shareProvider, shareModal } = useProviderSharing('kimi', () => loadConfig());
   const { modal } = App.useApp();
   const { sidebarHiddenByPage, setSidebarHidden } = useSettingsStore();
   const [loading, setLoading] = React.useState(false);
@@ -308,7 +311,7 @@ const KimiPage: React.FC = () => {
 
   const handleSaveProvider = async (values: KimiProviderInput) => {
     const plan = buildKimiProviderSavePlan(editingProvider, values, { isCopy: isCopyMode });
-    const gatewayModeBeforeSave = gatewayCliStatus?.mode;
+    const gatewayModeBeforeSave = resolveGatewayReengageMode(gatewayCliStatus);
     const shouldReengageGatewayProxy = shouldReengageKimiGatewayOnSave(editingProvider, gatewayModeBeforeSave);
 
     let savedProviderId = editingProvider?.id ?? '';
@@ -318,6 +321,8 @@ const KimiPage: React.FC = () => {
       restoreDirect: () => restoreProxyGatewayCliDirect('kimi'),
       engageSingle: () => engageProxyGatewaySingle('kimi', savedProviderId),
       engageFailover: () => engageProxyGatewayFailover('kimi'),
+      // No `engageAggregate`: aggregate mode is Codex-only, so this CLI can
+      // never report it and the re-engage helper would reject the replay.
       onGatewayStatusChange: setGatewayCliStatus,
       saveProvider: async () => {
         switch (plan.action) {
@@ -907,6 +912,7 @@ const KimiPage: React.FC = () => {
                                   onToggleDisabled={handleToggleDisabled}
                                   onTest={handleTestProvider}
                                   onCopy={handleCopyProvider}
+                                  onShare={shareProvider}
                                   connectivityStatus={connectivityStatuses[provider.id]}
                                   selectable={providerBatch.selectionMode && providerBatch.isSelectable(provider.id)}
                                   selected={providerBatch.selectedIds.has(provider.id)}
@@ -1106,6 +1112,8 @@ const KimiPage: React.FC = () => {
         data={previewData}
         onClose={() => setPreviewModalOpen(false)}
       />
+
+      {shareModal}
     </SectionSidebarLayout>
   );
 };

@@ -1,3 +1,8 @@
+import {
+  resolveModelConnection,
+  type ProviderModelConnections,
+} from './modelConnection';
+
 export interface ProviderConnectivityInfo {
   providerId: string;
   providerName: string;
@@ -6,19 +11,27 @@ export interface ProviderConnectivityInfo {
     options?: {
       baseURL?: string;
       apiKey?: string;
+      headers?: Record<string, unknown>;
     };
   };
   modelIds: string[];
   reasoningEffort?: string;
+  apiFormat?: 'openai-codex-responses';
+  configValueMode?: 'pi' | 'omp';
+  /** Models whose own api/baseUrl overrides the provider connection (OMP). */
+  modelConnections?: ProviderModelConnections;
 }
 
 export interface ProviderConnectivityBatchTarget {
   providerId: string;
   request?: {
     npm: string;
+    apiFormat?: 'openai-codex-responses';
+    configValueMode?: 'pi' | 'omp';
     providerId: string;
     baseUrl: string;
     apiKey?: string;
+    headers?: Record<string, unknown>;
     reasoningEffort?: string;
     prompt: string;
     stream: boolean;
@@ -65,7 +78,22 @@ export function buildProviderConnectivityBatchTarget(
     ? options.preferredModelId
     : info.modelIds[0];
 
-  if (options.requireBaseUrl && !baseUrl) {
+  // OMP models may carry their own api/baseUrl; the batch probes one model per
+  // provider, so that model's own connection wins over the provider's.
+  const connection = resolveModelConnection(
+    {
+      npm,
+      baseUrl,
+      ...(info.apiFormat ? { apiFormat: info.apiFormat } : {}),
+    },
+    modelId ?? '',
+    info.modelConnections,
+  );
+  const requestNpm = connection.npm;
+  const requestBaseUrl = connection.baseUrl.trim();
+  const requestApiFormat = connection.apiFormat;
+
+  if (options.requireBaseUrl && !requestBaseUrl) {
     return {
       providerId: info.providerId,
       errorMessage: options.errorMessages.missingBaseUrl,
@@ -101,10 +129,13 @@ export function buildProviderConnectivityBatchTarget(
         }
       : {
           request: {
-            npm,
+            npm: requestNpm,
+            ...(requestApiFormat ? { apiFormat: requestApiFormat } : {}),
+            ...(info.configValueMode ? { configValueMode: info.configValueMode } : {}),
             providerId: info.providerId,
-            baseUrl,
+            baseUrl: requestBaseUrl,
             ...(apiKey ? { apiKey } : {}),
+            ...(providerOptions.headers ? { headers: providerOptions.headers } : {}),
             ...(info.reasoningEffort ? { reasoningEffort: info.reasoningEffort } : {}),
             prompt: options.prompt || DEFAULT_CONNECTIVITY_PROMPT,
             stream: true,

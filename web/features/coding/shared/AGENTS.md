@@ -12,17 +12,20 @@
 
 ## 核心设计决策（Why）
 
+- 供应商「分享」从当前记录或 runtime view 生成快照，复用 `deepLink/ProviderTransferModal` 和统一后端导入入口；新增卡片入口使用 `providerShare/useProviderSharing` 保持完成事件刷新。独立 API Key 才可迁移，官方 OAuth 不随分享导出；模型目录的不同连接分别分享。协议与边界见 `web/features/shared/deepLink/AGENTS.md`。
+
 - `useRootDirectoryConfig` + `RootDirectoryModal` 把 Claude/Codex 的根目录编辑语义统一起来，避免两个页面对 `custom/env/shell/default` 的解释漂移。
 - Claude/Codex/Grok CLI/Gemini CLI 复用共享根目录交互，而 OpenCode/OpenClaw 继续使用各自的配置文件路径弹窗；这是“根目录模块”和“文件路径模块”的前端分层，不要为了复用把两类语义硬揉到一个 modal 里。
 - `favoriteProviders.ts` 用 source 前缀和 payload 约定把 OpenCode/Claude/Codex/OpenClaw 的收藏 provider 统一建模，避免不同页面各存一套不兼容 key。
 - `GlobalPromptSettings`、`SessionManagerPanel`、`ProviderConnectivityTestModal` 等共享组件都要求业务方通过 service/api 注入，不自己硬编码某个模块的存储细节。
+- 连通性 `apiFormat` 与 npm 分开传递；OMP 的 Codex 专用 Responses 标记必须贯穿单项弹窗和批量请求，批量也必须保留供应商 headers。专用 Codex 诊断强制流式，禁用不适用的温度/输出上限控件；端点转换由调用方负责，不回写收藏或运行时配置。
 - Grok 连通性测试的 modelIds 只能是上游模型 ID。`settingsConfig.defaultModelKey` 是本地 catalog key（可能是 `custom`），不是 API model 名；必须从 `modelCatalog.models[].model` 取。
 - `SessionManagerPanel` 的标题栏可通过 `extra` 注入模块自有动作；动作归 owning page 处理，shared 面板只负责摆放入口，不接管模块业务状态。
 - `sessionManager/detail/` 是共享会话详情二级页和 workbench。它只消费后端 normalized message/block 契约，并通过 domain helpers 做搜索、过滤、导航、工具块配对和工具展示归一化；不要在 renderer 组件里直接读取某个 CLI 的 raw message shape。
 - `allApiHub` 共享 modal 和模型缓存属于“共享交互层”，不是某个页面的私有实现。
 - `gateway/providerProfiles.ts` 是前端 Gateway 内置供应商 profile 的共享内存态，启动时从后端缓存/bundled defaults 加载，再由远端刷新更新。它只提供 catalog、订阅和 endpoint 推断 helper，不持久化业务 provider。当前共享 tool key 覆盖 Claude Code、Claude Desktop、Codex、Grok CLI、Kimi Code 和 Gemini CLI；其中 Kimi Code 只是类型上被接受，bundled catalog 暂无 `tools.kimi` 节点（Kimi 暂无已验证内置 endpoint，后端 runtime 不解析其 gatewayProfile 引用）。新增内置 endpoint 时应按对应 `tools.claude` / `tools.codex` / `tools.grok` / `tools.gemini` 写入（为 Kimi 提供 endpoint 时需同步后端 `SUPPORTED_PROFILE_TOOLS` 与 catalog `tools.kimi`），而不是让页面靠模型名或 URL 猜供应商。Grok endpoint 默认机械复用已验证的 Codex OpenAI 兼容 endpoint 数据，协议差异继续由 Grok `api_backend` 和 Gateway transformer 处理。
 - `management/` 下的控件和 `VirtualGrid` 只提供高密度管理页的纯 UI 行为，例如原生按钮、菜单、搜索、分段控件、空/加载态和可视区渲染；它们不保存业务选择、搜索、分组、排序或同步状态。
-- `providerList/` 是全部 coding tab 供应商列表共享的搜索 / 排序 / 最近使用语义层（纯函数 + `useProviderListSort` + `ProviderSortDropdown` + `ProviderSearchInput`）。排序模式与最近使用时间存储在后端 settings 单例的 `provider_sort_modes` / `provider_last_used` 嵌套 key（`tauri/src/settings/provider_list_state.rs`，commands 为 `get_provider_list_state` / `save_provider_sort_mode` / `record_provider_last_used`），module key 沿用 `favoriteProviders.ts` 的 source 前缀约定。排序模式只是前端展示层操作，永远不改后端 provider 返回顺序；`custom`（默认）即拖拽落盘的 `sort_index` / 配置文件顺序。
+- `providerList/` 是全部 coding tab 供应商列表共享的搜索 / 排序 / 最近使用语义层（纯函数 + `useProviderListSort` + `ProviderSortDropdown` + `ProviderSearchInput`）。排序模式与最近使用时间存储在后端 settings 单例的 `provider_sort_modes` / `provider_last_used` 嵌套 key（`tauri/src/settings/provider_list_state.rs`，commands 为 `get_provider_list_state` / `save_provider_sort_mode` / `record_provider_last_used`），module key 沿用 `favoriteProviders.ts` 的 source 前缀约定。排序模式只是前端展示层操作，永远不改后端 provider 返回顺序；`custom`（默认）即拖拽落盘的 `sort_index` / 配置文件顺序。这张 `sort_index` 顺序是「供应商优先顺序」的唯一事实源：网关聚合模式的站点顺序直接复用它（见 `coding/gateway/AGENTS.md` 的聚合站点顺序约束），不要在别的页面再存第二份顺序。
 - `management/useAutoGridColumns` 是排序模式复用浏览模式自适应列数的共享 hook：浏览分支由 `VirtualGrid` 内部按容器宽度算列数，排序分支（完整列表渲染、不走虚拟化）用「每行展示自动」(`gridColumnSetting === 'auto'`) 时没有那个计算，容易各自写死列数导致同一行卡片数在浏览/排序间漂移。该 hook 用 callback ref 挂 `ResizeObserver`，与 `VirtualGrid` 用同一套 `Math.max(1, Math.min(maxColumns, Math.floor((w + gap) / minColumnWidth)))` 公式，消费方把 `containerRef` 放到排序列表容器、用返回的 `columnCount` 写 `--management-grid-columns` CSS 变量即可。选 callback ref 而非 `useRef + useEffect`，是因为排序/浏览分支切换时容器是条件挂载、ref 在 layout 后才可靠；`enabled=false` 时不监听并返回 `undefined`，让固定列（`gridColumnSetting !== 'auto'`）路径完全不受影响。容器 CSS 的 `--management-grid-columns` 回退值要选接近宽屏 auto 结果的稳定常数（如 `repeat(3, minmax(0,1fr))`），避免 `ResizeObserver` 首个回调落地前首帧跳到 4 列再回跳。
 - `magicContext/` 是 OpenCode 和 Pi 共用的 CortexKit 用户级配置管理入口。它只消费后端 `magic_context` 文件命令和调用方传入的安装状态，不拥有插件安装、扩展安装、项目级配置或配置主数据。
 - `toolIcon/` 是 Skills 与 MCP 共用的工具品牌图标组件（见 `shared/toolIcon/AGENTS.md`）。它只做图标解析与暗色适配，不持有工具清单；Skills/MCP 都从共享路径导入，不再在各自模块内维护第二套品牌映射。
@@ -76,15 +79,20 @@ sequenceDiagram
 - `SessionManagerPanel` 在 KeepAlive 隐藏页里即使放弃提示或结果回写，也不能漏掉本地 loading 收尾。尤其是列表请求失败后，路径筛选器这类局部 loading 必须按请求代次自行复位，不能完全绑在“当前页面仍可见”这个条件上。
 - `SessionManagerPanel` 做整页 reload 时，不要把“刷新列表”和“刷新路径下拉”拆成两次 `forceRefresh` 请求去重扫同一份会话索引。优先复用同一次列表结果里派生出的 path options，避免一次删除/导入/手动刷新触发两轮整库扫描。
 - `SessionManagerPanel` 的产品理念是“先让用户看到最近会话，再后台补齐完整事实源”，不是分页列表。首屏 `cache-first` 只是快速快照，不代表第一页；后台 `full` 完成后必须一次性替换成完整列表；`hasMore` 只能作为旧 API 兼容字段，不能驱动 UI。
+- `SessionManagerPanel` 的时间筛选（issue #372）是 Collapse 头部 `headerExtra` 里“全部/本机/WSL”分段控件左侧的紧凑 `Select`（日历 prefix，默认“全部”），预设与后端 `SessionTimeRange` 一一对应（`SESSION_TIME_RANGE_OPTIONS` 是两侧契约，`web/test/.../sessionTimeRange.test.ts` 守护）。选中具体时间档后最终列表一定是后端按 `last_active_at` 过滤的全量结果：cache-first 命中 fresh 完整缓存立即得到过滤后完整列表，否则 quick recent 只是 partial 过渡态，由既有后台 `full` 机制补全；不要为此新增“先只出首屏再等手动刷新”的分叉语义。`timeRange` 必须参与首屏去重 key、完整快照 key 和后台补全 key，快照本身存的是时间过滤后的列表，切换本机/WSL 从它本地派生。时间筛选状态用模块级 remembered 变量（进程内记住、重启回“全部”），不落库。
 - `SessionManagerPanel` 禁止出现“加载更多”按钮或滚动翻页 sentinel。首屏加载时，如果还没有任何可展示列表，可以显示内容区全局 loading；首屏已有快照后，后台完整补全只能在列表底部显示轻量 loading 文案，不能遮罩已展示内容；`full` 完成后底部 loading 必须消失，也不能再显示任何“更多”入口。
+- 会话列表的完整数据与可见 DOM 必须分开：`SessionList` 复用单列 `management/VirtualGrid`，只挂载可见行和 overscan；完整结果仍留在面板中用于筛选、计数和批量操作。“选择已加载”必须覆盖完整过滤结果，不能缩成屏幕内的行。选择以 `sourcePath` 为身份，使用集合查询；后台替换结果也要清理不再存在的选中项。搜索框状态不能让全部卡片重新渲染，列表/卡片和传入回调需保持稳定。长路径允许换行并由虚拟行实测高度，继续消费外层 `main` 滚动容器和 KeepAlive 的返回位置。
 - `SessionManagerPanel` 的用户主动刷新和后台补全必须区分。用户点击标题右侧刷新按钮时才进入可感知的完整刷新，可以显示标题刷新状态和内容区 loading；自动后台 `full`、正文深搜、导入/删除后的静默收敛不能把已显示列表盖住。折叠关闭时要清理刷新 nonce/loading，避免下次普通展开重放旧的手动刷新。
 - `SessionManagerPanel` 的首屏加载 effect 必须按 `tool/sourceMode/query/pathFilter/refreshNonce` 这类真实请求条件去重，不能只依赖一个会被父组件状态、i18n 或列表结果重建的 callback。后台 `full` 返回 `availableSources`、路径选项或完整列表后，不能因此重新触发同条件 `cache-first` 并打开全局 loading。
 - `SessionManagerPanel` 的后台 `full` 必须等首屏 `cache-first` 请求已经落地后才能启动；初次展开时不能同时出现内容区全局 loading 和底部“正在加载完整会话”。如果已有完整 `all` 列表快照，切换本机/WSL 应从这份快照本地派生并作废旧请求，不能再发起后台完整刷新。
 - `SessionManagerPanel` 的搜索先用已加载或缓存 metadata 立即响应，包括 `session_id`、标题、摘要、项目目录、`sourcePath`、runtime source/distro。完整 `session_id` 匹配必须短路。只有后台 `full/refresh` 才继续做正文深搜；正文深搜期间用搜索区域状态提示用户等待，不使用全局 loading，也不把 `cache-first` 放大成全库正文扫描。
 - 高密度管理列表可复用 `management/VirtualGrid`，但拖拽排序模式不要和虚拟化混用。排序应继续渲染完整可排序集合，普通浏览/分组展开才使用虚拟网格，避免 dnd 命中区域和虚拟占位高度漂移。
+- `VirtualGrid` 的行高测量必须忽略 `0`：KeepAlive 用 `display:none` 隐藏缓存页，ref / ResizeObserver 此时读到的零高度不是有效行高。写入它会逐步压缩虚拟占位高度，切回深处滚动位置时出现空白或错位；隐藏期间应保留最后一次可见测量。
+- 虚拟网格的位置不只随滚动和自身尺寸变化。上方配置区展开/收起会改变 `listOffsetTop`，但网格宽高和 `scrollTop` 可以都不变；应沿网格到 `main` 的布局链监听尺寸变化并更新偏移，否则列表进入视口后可能只挂载首行，必须滚动一下才恢复。
 - `management/ManagementMenu` 是按需 portal 渲染的轻量菜单。不要为了每张卡片重新引入常驻 overlay 菜单或 tooltip；几百项列表里这会明显放大 DOM 和事件监听成本。
 - `management/ManagementMenu` 的 portal 弹层必须按实际菜单尺寸收敛到视口内，不能只靠 `transform` 做左右对齐；卡片工具行为空或接近右侧边缘时，触发按钮可能贴近窗口边界。
 - `shared/gateway/GatewayFailoverButton` 主要负责已进入 single/failover 后的故障转移开关；single 的“网关代理”入口和常规“恢复直连”动作属于各 CLI 的已应用 provider 卡片。进入或退出 single/failover 后要刷新系统托盘，因为托盘 provider 菜单也必须随 Gateway 接管状态锁定/解锁。但弹窗内必须保留基于 `status.can_restore_direct` 的兜底恢复入口，避免 provider 被删除、解析失败或列表为空时用户无法解除接管。若当前 P0 provider 的目标协议与 CLI 原生协议不一致，弹窗右下角“恢复直连”必须禁用并展示提示，因为该 provider 离开 Gateway 协议转换后不可直连使用。
+- `shared/gateway/GatewayFailoverButton` 与 `shared/gateway/GatewayAggregateButton`（provider 列表标题行里的接管状态胶囊和聚合模式入口）必须共用 `shared/gateway/gatewayStatusChip.module.less` 这一套 chip 样式，不要再让其中一个退回 AntD 默认 `size="small"` 灰边框按钮，也不要各自复制一份胶囊几何。胶囊基线为 22px 高、11px 字号、11px 圆角、无边框；状态色语义固定为：成功色 `chipActive` 表示接管中，主色 `chipCurrent` 表示当前就是这个模式，中性灰表示可进入的入口。新增第三个同级 chip 时同样接入该模块，`web/test/features/coding/shared/gateway/gatewayStatusChip.test.ts` 会守住这条约束。
 - `providerBilling/` 只封装 provider 表单里的供应商级计费 UI 和 meta 读写语义。计费开关关闭时必须从 meta 删除 `costMultiplier` 与 `pricingModelSource`；UI 的“继承全局默认”也不写 `pricingModelSource`。后端现有存储值是 `requested` / `upstream`，不要把 UI 文案里的“请求模型/返回模型”保存成 `request` / `response`。渠道表单中的高级设置、计费配置和备注应使用共享的自绘折叠区样式，不要混用 AntD Collapse/Switch/Select。
 - 内置供应商 profile 的 endpoint 是 provider 兼容能力、API 格式、默认 URL 和默认模型/模型目录的事实源；消费页面保存内置 provider 时只写 `meta.gatewayProfile={tool,profileId,endpointId}` 引用和用户覆盖项，不再把 `providerType` / `apiFormat` / `apiKeyField` / `reasoningField` / `defaultMaxTokens` / 图片策略 / `codexChatReasoning` 这类 profile 派生快照固化到 provider meta。Base URL 允许用户在表单中覆盖，保存时必须使用用户当前输入值而不是无条件写回 endpoint 默认 URL。
 - 已保存内置 provider 重新打开表单时，优先用 `meta.gatewayProfile.profileId + endpointId` 回显 endpoint；Base URL 是可编辑连接地址，不参与 endpoint 身份判断。没有 `gatewayProfile` 的 legacy provider 只能在 `providerType + apiFormat` 唯一命中时自动回显内置 endpoint，多匹配时必须回到自定义渠道，等待用户从渠道下拉显式选择。`providerType + apiFormat` 是 runtime effective compat 输出，不是内置渠道身份。
@@ -112,4 +120,5 @@ sequenceDiagram
 
 - 至少验证：一个共享改动在两个以上消费页面中仍表现一致。
 - 至少验证：favorite provider 和 session manager 的 key/sourcePath 契约未被破坏。
+- 会话虚拟列表使用 `node scripts/benchmark-session-list.mjs --verify-only` 验证真实面板的全选、过滤、深处返回、KeepAlive、变高行和主题；需要已安装的 Chrome/Edge，可通过 `--browser` 指定路径。性能对照用 `--baseline <commit> --repetitions 3`，只比较同一元数据夹具的前端渲染，不把它当作真实磁盘扫描或 Tauri WebView FPS 测量。
 - 供应商批量操作回归覆盖整批备份失败不删除、部分删除后保留剩余选择、搜索/默认项变更后的选择清理；见 `web/test/features/coding/shared/providerList/providerBatchOperations.test.ts`。

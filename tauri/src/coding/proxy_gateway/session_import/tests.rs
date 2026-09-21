@@ -1,7 +1,18 @@
 use super::*;
-use crate::coding::proxy_gateway::{types::GatewayRequestLogFilters, usage_stats};
+use crate::coding::proxy_gateway::types::GatewayCliKey;
+use crate::coding::proxy_gateway::{
+    pricing,
+    types::{GatewayRequestLogFilters, ModelPricing},
+    usage_stats,
+};
 use serde_json::{json, Value};
 use std::io::Write;
+
+#[path = "native_tests.rs"]
+mod native_tests;
+
+#[path = "websocket_tests.rs"]
+mod websocket_tests;
 
 const NOW: i64 = 1_800_000_100;
 const THEN: i64 = NOW - 60;
@@ -23,14 +34,14 @@ fn claude_message(id: &str, output: u64) -> Value {
 
 fn run_sync(
     db: &SqliteDbState,
-    cli: GatewayCliKey,
+    cli: impl Into<GatewayUsageTool>,
     root: &Path,
 ) -> GatewaySessionUsageImportResult {
-    sync_sources(db, &[(cli, root.to_path_buf())], NOW).unwrap()
+    sync_sources(db, &[(cli.into(), root.to_path_buf())], NOW).unwrap()
 }
 
 fn count(db: &SqliteDbState) -> u64 {
-    usage_stats::usage_summary(db, None, None, None)
+    usage_stats::usage_summary(db, None, None, None, true)
         .unwrap()
         .total_requests
 }
@@ -56,7 +67,7 @@ fn claude_sync_is_incremental_updates_final_usage_and_prices_without_gateway() {
         run_sync(&db, GatewayCliKey::Claude, root.path()).inserted_records,
         1
     );
-    let summary = usage_stats::usage_summary(&db, None, None, None).unwrap();
+    let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
     assert_eq!(summary.total_tokens, 210);
     assert_eq!(summary.total_cost_usd, "0.000306");
     assert_eq!(
@@ -72,7 +83,8 @@ fn claude_sync_is_incremental_updates_final_usage_and_prices_without_gateway() {
         1
     );
     assert_eq!(count(&db), 1);
-    let logs = usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10).unwrap();
+    let logs =
+        usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10, true).unwrap();
     assert_eq!(logs.data[0].output_tokens, 30);
     assert_eq!(logs.data[0].data_source, "session");
     let detail = usage_stats::request_log_detail_from_summary(&db, "SESSION:msg-1")
@@ -89,11 +101,12 @@ fn claude_sync_is_incremental_updates_final_usage_and_prices_without_gateway() {
         },
         0,
         10,
+        true,
     )
     .unwrap();
     assert_eq!(http_successes.total, 0);
     assert_eq!(
-        usage_stats::usage_summary(&db, None, None, None)
+        usage_stats::usage_summary(&db, None, None, None, true)
             .unwrap()
             .total_cost_usd,
         "0.000386"
@@ -135,9 +148,14 @@ fn claude_zero_token_responses_are_counted_once_and_can_receive_final_usage() {
         run_sync(&db, GatewayCliKey::Claude, root.path()).inserted_records,
         1
     );
-    let models =
-        usage_stats::model_stats(&db, Some(THEN - 1), Some(NOW), Some(GatewayCliKey::Claude))
-            .unwrap();
+    let models = usage_stats::model_stats(
+        &db,
+        Some(THEN - 1),
+        Some(NOW),
+        Some(GatewayCliKey::Claude.into()),
+        true,
+    )
+    .unwrap();
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].model, "glm-5.2");
     assert_eq!(models[0].request_count, 1);
@@ -156,7 +174,7 @@ fn claude_zero_token_responses_are_counted_once_and_can_receive_final_usage() {
         run_sync(&db, GatewayCliKey::Claude, root.path()).updated_records,
         1
     );
-    let summary = usage_stats::usage_summary(&db, None, None, None).unwrap();
+    let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
     assert_eq!(summary.total_requests, 1);
     assert_eq!(summary.total_tokens, 120);
 }
@@ -190,7 +208,7 @@ fn parser_revision_revisits_unchanged_claude_files_without_discarding_the_ledger
     let state = load_states(&db).unwrap().remove(source_id).unwrap();
     assert_eq!(
         state.parser_revision,
-        parsers::revision(GatewayCliKey::Claude)
+        parsers::revision(GatewayCliKey::Claude.into())
     );
     assert_eq!(state.records.len(), 2);
     assert_eq!(
@@ -268,6 +286,255 @@ fn token_event(total: u64, input: u64, output: u64, at: i64) -> Value {
     },"rate_limits":{"limit_id":"codex"}}})
 }
 
+fn codex_cache_write_event(input: u64, cached: u64, cache_creation: u64, output: u64) -> Value {
+    let usage = json!({
+        "input_tokens": input,
+        "cached_input_tokens": cached,
+        "cache_write_input_tokens": cache_creation,
+        "output_tokens": output,
+        "reasoning_output_tokens": 0,
+        "total_tokens": input + output,
+    });
+    json!({"type":"event_msg","timestamp":THEN,"payload":{"type":"token_count","info":{
+        "total_token_usage":usage,"last_token_usage":usage
+    },"rate_limits":{"limit_id":"codex"}}})
+}
+
+fn write_codex_cache_write_session(path: &Path, events: &[Value]) {
+    let mut records = vec![
+        json!({"type":"session_meta","timestamp":THEN - 10,"payload":{"id":PARENT}}),
+        json!({"type":"turn_context","payload":{"model":"gpt-6-astra"}}),
+    ];
+    records.extend_from_slice(events);
+    write_jsonl(path, &records);
+}
+
+fn insert_codex_cache_write_proxy(db: &SqliteDbState) {
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO proxy_request_logs (request_id, provider_id, app_type, model,
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                created_at, duration_ms, status_code, stream_outcome, data_source, total_cost_usd)
+             VALUES ('codex-cache-write-proxy', 'provider', 'codex', 'gpt-6-astra',
+                3, 808, 223222, 7211, ?1, 123590, 200, 'completed', 'proxy', '0.353790')",
+            [THEN - 1],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn insert_codex_cache_write_pricing(db: &SqliteDbState) {
+    pricing::upsert_model_pricing(
+        db,
+        ModelPricing {
+            model_id: "gpt-6-astra".into(),
+            display_name: "GPT-6 Astra".into(),
+            input_cost_per_million: "10".into(),
+            output_cost_per_million: "50".into(),
+            cache_read_cost_per_million: "1".into(),
+            cache_creation_cost_per_million: "12.5".into(),
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn codex_cache_writes_round_trip_through_native_usage_and_pricing() {
+    let root = tempfile::tempdir().unwrap();
+    write_codex_cache_write_session(
+        &root.path().join(format!("rollout-{PARENT}.jsonl")),
+        &[codex_cache_write_event(230436, 223222, 7211, 808)],
+    );
+    let db = SqliteDbState::in_memory_for_test().unwrap();
+    insert_codex_cache_write_pricing(&db);
+    assert_eq!(
+        run_sync(&db, GatewayCliKey::Codex, root.path()).inserted_records,
+        1
+    );
+    let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
+    assert_eq!(summary.total_input_tokens, 3);
+    assert_eq!(summary.total_cache_read_tokens, 223222);
+    assert_eq!(summary.total_cache_creation_tokens, 7211);
+    assert_eq!(summary.total_output_tokens, 808);
+    assert_eq!(summary.total_tokens, 231244);
+    assert_eq!(summary.total_cost_usd, "0.353790");
+    let logs =
+        usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10, true).unwrap();
+    assert_eq!(logs.data[0].input_tokens, 3);
+    assert_eq!(logs.data[0].cache_creation_tokens, 7211);
+    assert_eq!(logs.data[0].data_source, "session");
+    assert_eq!(
+        run_sync(&db, GatewayCliKey::Codex, root.path()).parsed_records,
+        0
+    );
+}
+
+#[test]
+fn codex_cumulative_cache_writes_use_deltas_and_ignore_repeated_lanes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut first = codex_cache_write_event(100, 20, 60, 10);
+    first["payload"]["info"]
+        .as_object_mut()
+        .unwrap()
+        .remove("last_token_usage");
+    let mut duplicate = first.clone();
+    duplicate["payload"]["rate_limits"]["limit_id"] = json!("review");
+    let mut second = codex_cache_write_event(180, 40, 100, 30);
+    second["timestamp"] = json!(THEN + 1);
+    second["payload"]["info"]
+        .as_object_mut()
+        .unwrap()
+        .remove("last_token_usage");
+    write_codex_cache_write_session(
+        &root.path().join(format!("rollout-{PARENT}.jsonl")),
+        &[first, duplicate, second],
+    );
+    let db = SqliteDbState::in_memory_for_test().unwrap();
+    assert_eq!(
+        run_sync(&db, GatewayCliKey::Codex, root.path()).inserted_records,
+        2
+    );
+    let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
+    assert_eq!(summary.total_input_tokens, 40);
+    assert_eq!(summary.total_cache_read_tokens, 40);
+    assert_eq!(summary.total_cache_creation_tokens, 100);
+    assert_eq!(summary.total_output_tokens, 30);
+    assert_eq!(summary.total_tokens, 210);
+}
+
+#[test]
+fn codex_cache_writes_deduplicate_in_either_arrival_order() {
+    for gateway_first in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        write_codex_cache_write_session(
+            &root.path().join(format!("rollout-{PARENT}.jsonl")),
+            &[codex_cache_write_event(230436, 223222, 7211, 808)],
+        );
+        let db = SqliteDbState::in_memory_for_test().unwrap();
+        if gateway_first {
+            insert_codex_cache_write_proxy(&db);
+        }
+        assert_eq!(
+            run_sync(&db, GatewayCliKey::Codex, root.path()).parsed_records,
+            1
+        );
+        if !gateway_first {
+            insert_codex_cache_write_proxy(&db);
+        }
+        run_sync(&db, GatewayCliKey::Codex, root.path());
+        let logs =
+            usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10, true)
+                .unwrap();
+        assert_eq!(logs.total, 1, "gateway_first={gateway_first}");
+        assert_eq!(logs.data[0].data_source, "proxy");
+        let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
+        assert_eq!(summary.total_requests, 1);
+        assert_eq!(summary.total_tokens, 231244);
+        assert_eq!(summary.total_cost_usd, "0.353790");
+        assert_eq!(
+            run_sync(&db, GatewayCliKey::Codex, root.path()).updated_records,
+            0
+        );
+    }
+}
+
+#[test]
+fn codex_cache_write_revision_repairs_unchanged_native_rows_and_keeps_the_ledger() {
+    for with_proxy in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join(format!("rollout-{PARENT}.jsonl"));
+        let db_path = root.path().join("usage.db");
+        let db = SqliteDbState::open(db_path.clone()).unwrap();
+        insert_codex_cache_write_pricing(&db);
+        let event = codex_cache_write_event(230436, 223222, 7211, 808);
+        let mut legacy_event = event.clone();
+        for counters in ["total_token_usage", "last_token_usage"] {
+            legacy_event["payload"]["info"][counters]
+                .as_object_mut()
+                .unwrap()
+                .remove("cache_write_input_tokens");
+        }
+        write_codex_cache_write_session(&file, &[legacy_event]);
+        run_sync(&db, GatewayCliKey::Codex, root.path());
+        assert_eq!(
+            usage_stats::usage_summary(&db, None, None, None, true)
+                .unwrap()
+                .total_cost_usd,
+            "0.335762"
+        );
+        write_codex_cache_write_session(&file, &[event]);
+        let source_before = fs::read(&file).unwrap();
+        let mut states = load_states(&db).unwrap();
+        let (source_id, state) = states
+            .iter_mut()
+            .find(|(_, state)| !state.records.is_empty())
+            .unwrap();
+        // Simulate revision 2 having scanned this exact file but dropped cache writes.
+        let metadata = fs::metadata(&file).unwrap();
+        state.parser_revision = 2;
+        state.modified_nanos = modified_nanos(&metadata);
+        state.size = metadata.len();
+        state.pending = false;
+        db.with_conn(|conn| save_state(conn, source_id, state))
+            .unwrap();
+        if with_proxy {
+            insert_codex_cache_write_proxy(&db);
+        }
+
+        let result = run_sync(&db, GatewayCliKey::Codex, root.path());
+        assert_eq!(result.failed_files, 0);
+        assert_eq!(result.inserted_records, 0);
+        assert_eq!(result.updated_records, 1);
+        assert_eq!(fs::read(&file).unwrap(), source_before);
+        let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
+        assert_eq!(summary.total_requests, 1);
+        assert_eq!(summary.total_input_tokens, 3);
+        assert_eq!(summary.total_cache_creation_tokens, 7211);
+        assert_eq!(summary.total_cost_usd, "0.353790");
+        let state = load_states(&db).unwrap().remove(source_id).unwrap();
+        assert_eq!(
+            state.parser_revision,
+            parsers::revision(GatewayUsageTool::Codex)
+        );
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(
+            state
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .matched_proxy_id
+                .as_deref(),
+            with_proxy.then_some("codex-cache-write-proxy")
+        );
+        drop(db);
+        let db = SqliteDbState::open(db_path).unwrap();
+        assert_eq!(
+            run_sync(&db, GatewayCliKey::Codex, root.path()).parsed_records,
+            0
+        );
+        assert_eq!(
+            usage_stats::usage_summary(&db, None, None, None, true).unwrap(),
+            summary
+        );
+    }
+}
+
+#[test]
+fn codex_known_cache_write_mismatch_does_not_merge_independent_calls() {
+    let root = tempfile::tempdir().unwrap();
+    write_codex_cache_write_session(
+        &root.path().join(format!("rollout-{PARENT}.jsonl")),
+        &[codex_cache_write_event(230436, 223222, 7210, 808)],
+    );
+    let db = SqliteDbState::in_memory_for_test().unwrap();
+    insert_codex_cache_write_proxy(&db);
+    run_sync(&db, GatewayCliKey::Codex, root.path());
+    assert_eq!(count(&db), 2);
+}
+
 #[test]
 fn codex_prefers_per_request_usage_and_ignores_repeated_snapshot_lanes() {
     let root = tempfile::tempdir().unwrap();
@@ -288,7 +555,7 @@ fn codex_prefers_per_request_usage_and_ignores_repeated_snapshot_lanes() {
     let db = SqliteDbState::in_memory_for_test().unwrap();
     let result = run_sync(&db, GatewayCliKey::Codex, root.path());
     assert_eq!(result.inserted_records, 2);
-    let summary = usage_stats::usage_summary(&db, None, None, None).unwrap();
+    let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
     assert_eq!(summary.total_input_tokens, 75);
     assert_eq!(summary.total_cache_read_tokens, 75);
     assert_eq!(summary.total_output_tokens, 15);
@@ -321,7 +588,7 @@ fn codex_child_does_not_rebill_the_parent_replay_prefix() {
         2
     );
     assert_eq!(
-        usage_stats::usage_summary(&db, None, None, None)
+        usage_stats::usage_summary(&db, None, None, None, true)
             .unwrap()
             .total_tokens,
         165
@@ -381,7 +648,7 @@ fn gemini_json_and_jsonl_use_fresh_input_and_keep_paid_rewound_messages() {
         run_sync(&db, GatewayCliKey::Gemini, root.path()).inserted_records,
         3
     );
-    let summary = usage_stats::usage_summary(&db, None, None, None).unwrap();
+    let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
     assert_eq!(summary.total_input_tokens, 60);
     assert_eq!(summary.total_cache_read_tokens, 240);
     assert_eq!(summary.total_output_tokens, 55);
@@ -460,7 +727,7 @@ fn distinct_claude_envelopes_are_not_merged_when_usage_matches() {
                 "gateway_first={gateway_first}, zero_usage={zero_usage}"
             );
             assert_eq!(
-                usage_stats::usage_summary(&db, None, None, None)
+                usage_stats::usage_summary(&db, None, None, None, true)
                     .unwrap()
                     .total_tokens,
                 (input + output + read + creation) as u64 * 2,
@@ -523,7 +790,7 @@ fn final_usage_rechecks_an_earlier_heuristic_proxy_match() {
         run_sync(&db, GatewayCliKey::Gemini, root.path()).inserted_records,
         1
     );
-    let summary = usage_stats::usage_summary(&db, None, None, None).unwrap();
+    let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
     assert_eq!(summary.total_requests, 2);
     assert_eq!(summary.total_output_tokens, 50);
     assert_eq!(
@@ -555,7 +822,8 @@ fn gateway_and_session_usage_converge_in_either_arrival_order() {
         run_sync(&db, GatewayCliKey::Gemini, root.path());
         assert_eq!(count(&db), 1, "gateway_first={gateway_first}");
         let logs =
-            usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10).unwrap();
+            usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10, true)
+                .unwrap();
         assert_eq!(logs.data[0].data_source, "proxy");
     }
 }
@@ -575,6 +843,87 @@ fn one_proxy_record_cannot_suppress_two_distinct_native_invocations() {
     insert_proxy(&db, "one-gateway-call");
     run_sync(&db, GatewayCliKey::Gemini, root.path());
     assert_eq!(count(&db), 2);
+}
+
+#[test]
+fn proxy_execution_interval_and_delayed_session_writes_converge() {
+    // Local Codex evidence: session timestamps precede gateway completion by
+    // 109/119 seconds inside long requests. Issue #340 also shows a 21-second
+    // delay after completion. Neither is a separate invocation.
+    for (session_offset, duration_ms) in [(-109, 151_653), (-119, 239_252), (21, 9_800)] {
+        for gateway_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut message = gemini_message("interval", 10);
+            message["timestamp"] = json!(THEN + session_offset);
+            write_jsonl(&root.path().join("session-interval.jsonl"), &[message]);
+            let db = SqliteDbState::in_memory_for_test().unwrap();
+            let insert_gateway = || {
+                insert_proxy(&db, "gateway-interval");
+                db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE proxy_request_logs SET duration_ms = ?1 WHERE request_id = 'gateway-interval'",
+                        [duration_ms],
+                    ).map_err(|error| error.to_string())?;
+                    Ok(())
+                }).unwrap();
+            };
+            if gateway_first {
+                insert_gateway();
+            }
+            run_sync(&db, GatewayCliKey::Gemini, root.path());
+            if !gateway_first {
+                insert_gateway();
+            }
+            // Revisit an unchanged source and a native row older than one hour.
+            let result = sync_sources(
+                &db,
+                &[(GatewayCliKey::Gemini.into(), root.path().to_path_buf())],
+                NOW + 7200,
+            )
+            .unwrap();
+            assert_eq!(result.failed_files, 0);
+            assert_eq!(
+                count(&db),
+                1,
+                "offset={session_offset}, gateway_first={gateway_first}"
+            );
+            let logs =
+                usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10, true)
+                    .unwrap();
+            assert_eq!(logs.data[0].data_source, "proxy");
+            assert_eq!(
+                run_sync(&db, GatewayCliKey::Gemini, root.path()).updated_records,
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn interval_matching_rejects_outside_timestamps_and_ambiguous_candidates() {
+    for (offset, second_proxy, expected) in [(-163, false, 2), (31, false, 2), (21, true, 3)] {
+        let root = tempfile::tempdir().unwrap();
+        let mut message = gemini_message("bounded", 10);
+        message["timestamp"] = json!(THEN + offset);
+        write_jsonl(&root.path().join("session-bounded.jsonl"), &[message]);
+        let db = SqliteDbState::in_memory_for_test().unwrap();
+        insert_proxy(&db, "gateway-one");
+        if second_proxy {
+            insert_proxy(&db, "gateway-two");
+        }
+        db.with_conn(|conn| {
+            conn.execute("UPDATE proxy_request_logs SET duration_ms = 151653", [])
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        run_sync(&db, GatewayCliKey::Gemini, root.path());
+        assert_eq!(
+            count(&db),
+            expected,
+            "offset={offset}, second_proxy={second_proxy}"
+        );
+    }
 }
 
 #[test]
@@ -615,11 +964,12 @@ fn final_native_usage_replaces_a_partial_row_when_the_proxy_arrives() {
         run_sync(&db, GatewayCliKey::Gemini, root.path()).updated_records,
         0
     );
-    let logs = usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10).unwrap();
+    let logs =
+        usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10, true).unwrap();
     assert_eq!(logs.data[0].data_source, "proxy");
     assert_eq!(logs.data[0].output_tokens, 15);
     assert_eq!(
-        usage_stats::usage_summary(&db, None, None, None)
+        usage_stats::usage_summary(&db, None, None, None, true)
             .unwrap()
             .total_cost_usd,
         "0.012345"
@@ -682,7 +1032,7 @@ fn legacy_manual_import_is_adopted_without_duplicate_usage() {
         .with_conn(|conn| usage_stats::request_exists(conn, &legacy_id))
         .unwrap());
     assert_eq!(
-        usage_stats::usage_summary(&db, None, None, None)
+        usage_stats::usage_summary(&db, None, None, None, true)
             .unwrap()
             .total_tokens,
         110
@@ -730,7 +1080,7 @@ fn legacy_snapshot_rows_converge_when_the_canonical_record_already_exists() {
         run_sync(&db, GatewayCliKey::Gemini, root.path());
         assert_eq!(count(&db), 1, "canonical_exists={canonical_exists}");
         assert_eq!(
-            usage_stats::usage_summary(&db, None, None, None)
+            usage_stats::usage_summary(&db, None, None, None, true)
                 .unwrap()
                 .total_tokens,
             120,
@@ -754,7 +1104,7 @@ fn pending_usage_is_rechecked_without_another_file_write() {
     );
     let result = sync_sources(
         &db,
-        &[(GatewayCliKey::Claude, root.path().to_path_buf())],
+        &[(GatewayCliKey::Claude.into(), root.path().to_path_buf())],
         NOW + 4,
     )
     .unwrap();
@@ -776,13 +1126,14 @@ fn native_history_is_automatically_archived_without_gateway_and_not_reimported()
         1
     );
     assert_eq!(count(&db), 1);
-    let logs = usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10).unwrap();
+    let logs =
+        usage_stats::request_logs(&db, &GatewayRequestLogFilters::default(), 0, 10, true).unwrap();
     assert!(logs.data.is_empty());
-    let models = usage_stats::model_stats(&db, None, None, None).unwrap();
+    let models = usage_stats::model_stats(&db, None, None, None, true).unwrap();
     assert_eq!(models[0].model, "unknown");
     assert_eq!(models[0].avg_latency_ms, None);
     assert_eq!(models[0].total_tokens, 210);
-    let providers = usage_stats::provider_stats(&db, None, None, None).unwrap();
+    let providers = usage_stats::provider_stats(&db, None, None, None, true).unwrap();
     assert_eq!(providers[0].avg_latency_ms, None);
     assert_eq!(providers[0].cache_hit_rate, Some(0.4));
 
@@ -794,7 +1145,7 @@ fn native_history_is_automatically_archived_without_gateway_and_not_reimported()
     );
     assert_eq!(count(&db), 2);
     assert_eq!(
-        usage_stats::usage_summary(&db, None, None, None)
+        usage_stats::usage_summary(&db, None, None, None, true)
             .unwrap()
             .total_output_tokens,
         40
@@ -827,7 +1178,7 @@ fn opencode_reads_wal_updates_and_deduplicates_legacy_json_without_writing_nativ
     let db = SqliteDbState::in_memory_for_test().unwrap();
     run_sync(&db, GatewayCliKey::OpenCode, root.path());
     assert_eq!(count(&db), 1);
-    let summary = usage_stats::usage_summary(&db, None, None, None).unwrap();
+    let summary = usage_stats::usage_summary(&db, None, None, None, true).unwrap();
     assert_eq!(summary.total_input_tokens, 100);
     assert_eq!(summary.total_output_tokens, 15);
     assert_eq!(summary.total_cost_usd, "0.001200");
@@ -844,7 +1195,7 @@ fn opencode_reads_wal_updates_and_deduplicates_legacy_json_without_writing_nativ
         1
     );
     assert_eq!(
-        usage_stats::usage_summary(&db, None, None, None)
+        usage_stats::usage_summary(&db, None, None, None, true)
             .unwrap()
             .total_output_tokens,
         25

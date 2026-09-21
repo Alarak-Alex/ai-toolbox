@@ -10,7 +10,7 @@ import {
   HolderOutlined,
 } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
-import { BarChart2 } from 'lucide-react';
+import { BarChart2, Share2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { useSortable } from '@dnd-kit/sortable';
@@ -34,6 +34,9 @@ import {
   getGatewayProviderApiFormatFromMeta,
   getGatewayProviderProfilesVersion,
   hasNonClaudeModelIds,
+  isGatewayAggregateMode,
+  isGatewayFailoverMode,
+  isGatewayProxyMode,
   providerNeedsGatewayProxy,
   subscribeGatewayProviderProfiles,
 } from '@/features/coding/shared/gateway';
@@ -64,6 +67,7 @@ interface ClaudeDesktopProviderCardProps {
   onEdit: (provider: ClaudeDesktopProvider) => void;
   onDelete: (provider: ClaudeDesktopProvider) => void;
   onCopy: (provider: ClaudeDesktopProvider) => void;
+  onShare?: (provider: ClaudeDesktopProvider) => void;
   onTest: (provider: ClaudeDesktopProvider) => void;
   onSelect: (provider: ClaudeDesktopProvider) => void;
   onToggleDisabled: (provider: ClaudeDesktopProvider, isDisabled: boolean) => void;
@@ -82,6 +86,7 @@ const ClaudeDesktopProviderCard: React.FC<ClaudeDesktopProviderCardProps> = ({
   onEdit,
   onDelete,
   onCopy,
+  onShare,
   onTest,
   onSelect,
   onToggleDisabled,
@@ -198,8 +203,9 @@ const ClaudeDesktopProviderCard: React.FC<ClaudeDesktopProviderCardProps> = ({
       hasNonClaudeModelIds(configuredModelIds));
   const gatewayCanApplyProxy = canApplyProviderWithGatewayProxy(gatewayStatus);
   const gatewayMode = gatewayStatus?.mode ?? null;
-  const gatewayFailoverActive = gatewayMode === 'failover';
-  const gatewayProxyActive = gatewayMode === 'single' || gatewayFailoverActive;
+  const gatewayFailoverActive = isGatewayFailoverMode(gatewayMode);
+  const gatewayAggregateActive = isGatewayAggregateMode(gatewayMode);
+  const gatewayProxyActive = isGatewayProxyMode(gatewayMode);
   const priorityEntry = gatewayFailoverActive
     ? gatewayStatus?.provider_priorities.find((entry) => entry.provider_id === provider.id)
     : undefined;
@@ -217,6 +223,9 @@ const ClaudeDesktopProviderCard: React.FC<ClaudeDesktopProviderCardProps> = ({
   const canShowRestoreDirectButton = canRestoreDirect;
   const canSwitchGatewayProvider =
     gatewayProxyActive &&
+    // Aggregate has no single primary to switch; its site list is edited in the
+    // gateway settings aggregate block, so hide the P0-style switch action.
+    !gatewayAggregateActive &&
     !isApplied &&
     !provider.isDisabled &&
     !isOfficialProvider;
@@ -265,6 +274,10 @@ const ClaudeDesktopProviderCard: React.FC<ClaudeDesktopProviderCardProps> = ({
       icon: <CopyOutlined />,
       onClick: () => onCopy(provider),
     },
+    ...(onShare ? [{
+      key: 'share', label: t('common.share'), icon: <Share2 size={14} />,
+      onClick: () => onShare(provider),
+    }] : []),
     {
       type: 'divider' as const,
     },

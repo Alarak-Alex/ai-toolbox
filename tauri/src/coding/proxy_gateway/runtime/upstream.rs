@@ -22,7 +22,10 @@ use super::middleware::{
     BillingHeaderCchMiddleware, EnsureMaxTokensMiddleware, Middleware, PipelineContext,
 };
 use super::pipeline::Pipeline;
-use super::providers::{ProviderAuthStrategy, UpstreamModelMapping, UpstreamProvider};
+use super::providers::{
+    resolve_aggregate_route_with_selection, ProviderAuthStrategy, UpstreamModelMapping,
+    UpstreamProvider,
+};
 use super::routes::{build_target_url, match_gateway_route, split_request_target, GatewayRoute};
 use super::side_stores::{
     record_gemini_sse_stream, record_responses_sse_stream, GeminiShadowSessionKey,
@@ -30,11 +33,13 @@ use super::side_stores::{
 use super::GatewayRuntimeContext;
 use super::{cache_injector, thinking_budget};
 use crate::coding::proxy_gateway::model_health::{self, GatewayFailureKind};
+use crate::coding::proxy_gateway::privacy::PrivacyRequest;
 use crate::coding::proxy_gateway::transformer::{
     append_utf8_safe, check_lossy_conversion, convert_error_response_body,
     convert_request_body_with_context, convert_response_body_with_context,
-    convert_sse_stream_with_context, strip_sse_field, AiProtocol, ConversionContext,
-    ConversionRoute,
+    convert_sse_stream_with_context, merge_gemini_function_call_part,
+    normalize_chat_system_messages, placement_for_protocol, strip_sse_field, AiProtocol,
+    ConversionContext, ConversionRoute, InstructionPlacement,
 };
 use crate::coding::proxy_gateway::types::{
     CodexChatReasoningMeta, GatewayCliKey, GatewayFailoverEvent, GatewayProviderAttempt,
@@ -144,7 +149,7 @@ fn snapshot_response_stream(
 
 #[derive(Clone)]
 pub(super) struct UpstreamHeaders {
-    map: HeaderMap,
+    pub(super) map: HeaderMap,
     preserved: Vec<PreservedHeader>,
 }
 
@@ -706,6 +711,24 @@ pub(super) async fn route_request(
     route_request_with_options(request, context, &GatewayRequestOptions::default()).await
 }
 
+fn privacy_error_value(route: &GatewayRoute, status: u16, code: &str, message: &str) -> Value {
+    match source_protocol_from_route(route) {
+        Some(AiProtocol::AnthropicMessages) => json!({
+            "type":"error",
+            "error":{"type":if status < 500 { "invalid_request_error" } else { "api_error" },"message":message,"code":code}
+        }),
+        Some(AiProtocol::GeminiNative) => {
+            crate::coding::proxy_gateway::transformer::gemini_stream_error(
+                &status.to_string(),
+                message,
+            )
+        }
+        _ => {
+            json!({"error":{"type":if status < 500 { "invalid_request_error" } else { "server_error" },"message":message,"code":code}})
+        }
+    }
+}
+
 pub(super) async fn route_request_with_options(
     request: &DebugHttpRequest,
     context: &GatewayRuntimeContext,
@@ -782,7 +805,81 @@ pub(super) async fn route_request_with_options(
         );
     };
 
-    forward_to_upstream(request, db, context, &route, options).await
+    let privacy =
+        match if matches!(request.method.as_str(), "GET" | "HEAD") && request.body.is_empty() {
+            Ok(None)
+        } else {
+            context.privacy.begin(
+                route.cli_key.as_str(),
+                &request.headers,
+                &request.body,
+                None,
+            )
+        } {
+            Ok(privacy) => privacy,
+            Err(error) => {
+                let mut response = json_response(
+                    400,
+                    "Bad Request",
+                    privacy_error_value(&route, 400, "privacy_request_blocked", &error),
+                    route.route_name,
+                    None,
+                    &error,
+                );
+                response.cli_key = Some(route.cli_key);
+                response.error_category = Some("privacy_request_blocked".into());
+                return response;
+            }
+        };
+    let mut response =
+        forward_to_upstream(request, db, context, &route, options, privacy.as_ref()).await;
+    if let Some(privacy) = privacy {
+        privacy.set_usage_provider(response.provider_type.clone());
+        if let Some(stream) = response.body_stream.take() {
+            response.body_stream = Some(
+                crate::coding::proxy_gateway::privacy::stream::restore_sse_stream(
+                    stream,
+                    privacy.clone(),
+                ),
+            );
+        } else {
+            if let Ok(value) = serde_json::from_slice(&response.body) {
+                privacy.remember_response(&value);
+            }
+            match privacy.restore(&response.body) {
+                Ok(body) => {
+                    let original = std::mem::replace(&mut response.body, body);
+                    if original != response.body && response.upstream_response_body.is_none() {
+                        response.upstream_response_body_bytes = original.len() as u64;
+                        response.upstream_response_body = Some(original);
+                    }
+                    response.response_body_bytes = response.body.len() as u64;
+                    response.headers.retain(|(name, _)| {
+                        !name.eq_ignore_ascii_case("content-length")
+                            && !name.eq_ignore_ascii_case("etag")
+                    });
+                }
+                Err(error) => {
+                    privacy.fail();
+                    if response.upstream_url.is_some() && response.upstream_status_code.is_none() {
+                        response.upstream_status_code = Some(response.status_code);
+                    }
+                    response.status_code = 502;
+                    response.status_text = "Bad Gateway".into();
+                    response.body =
+                        privacy_error_value(&route, 502, "privacy_restore_failed", &error)
+                            .to_string()
+                            .into_bytes();
+                    response.response_body_bytes = response.body.len() as u64;
+                    response.headers = vec![("Content-Type".into(), "application/json".into())];
+                    response.error_category = Some("privacy_restore_failed".into());
+                    response.note = error;
+                }
+            }
+        }
+        response.privacy = Some(privacy);
+    }
+    response
 }
 
 fn is_cli_route_probe(request: &DebugHttpRequest, route: &GatewayRoute) -> bool {
@@ -817,6 +914,7 @@ async fn forward_to_upstream(
     context: &GatewayRuntimeContext,
     route: &GatewayRoute,
     options: &GatewayRequestOptions,
+    privacy: Option<&PrivacyRequest>,
 ) -> DebugHttpResponse {
     let requested_model =
         extract_requested_model(request, route).unwrap_or_else(|| "unknown".to_string());
@@ -885,14 +983,124 @@ async fn forward_to_upstream(
     }
     // Connectivity tests pin a provider and model; never rewrite those requests.
     let allow_provider_model_mapping = options.provider_override_id.is_none();
+    // Aggregate mode resolves the target site from the model prefix instead of
+    // from the manifest's primary provider. The prefix is authoritative, so the
+    // per-channel default/family mapping must not run for it.
+    let aggregate_selection = provider_candidates
+        .selection
+        .as_ref()
+        .filter(|selection| selection.mode == GatewayProxyMode::Aggregate);
     // Claude family + Codex default-model rewrite only run in failover mode.
     // Grok always rewrites when allowed (CLI takeover hardcodes model=grok-build).
     let apply_failover_model_mapping = allow_provider_model_mapping
+        && aggregate_selection.is_none()
         && !provider_candidates
             .selection
             .as_ref()
             .is_some_and(|selection| selection.mode == GatewayProxyMode::Single);
-    let providers = provider_candidates.providers;
+    let mut providers = provider_candidates.providers;
+
+    // Aggregate mode: keep the site named by the model prefix first, and keep
+    // the other sites that declare the same upstream model as fallbacks.
+    let mut aggregate_upstream_model: Option<String> = None;
+    // `true` when the model name itself selected the site (a published slug or a
+    // `<site><sep><model>` prefix). Those already name the exact upstream model,
+    // so user rewrite rules must not touch them; a bare model name still runs
+    // them, exactly like the non-aggregate paths.
+    let mut aggregate_model_is_explicit = false;
+    if let Some(selection) = aggregate_selection {
+        let resolved =
+            match resolve_aggregate_route_with_selection(&requested_model, selection, &providers) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let mut response = json_response(
+                        404,
+                        "Not Found",
+                        json!({
+                            "error": "gateway_aggregate_model_unknown",
+                            "message": error,
+                        }),
+                        route.route_name,
+                        None,
+                        "aggregate model slug did not resolve",
+                    );
+                    response.cli_key = Some(route.cli_key);
+                    response.requested_model = Some(requested_model);
+                    response.error_category = Some("model_not_found".to_string());
+                    return response;
+                }
+            };
+        aggregate_upstream_model = Some(resolved.upstream_model.clone());
+        aggregate_model_is_explicit = resolved.explicit;
+        // The slug or prefix named the site/group; a bare model name names only
+        // the model. Either way the site has to be an enabled candidate right now —
+        // a site that was disabled since engage keeps its published slug in the
+        // Codex list, so fall back to whichever candidate still declares that
+        // upstream model instead of failing the request outright.
+        //
+        let target = resolved
+            .site_id
+            .as_deref()
+            .and_then(|site_id| providers.iter().position(|provider| provider.id == site_id))
+            .map(|index| providers.remove(index));
+        let model = resolved.upstream_model.clone();
+        // A fallback site only makes sense when it actually offers the same
+        // upstream model. Aggregate manifests declare the visible catalog, so
+        // never send a model to a site that does not declare it.
+        let mut fallbacks = aggregate_model_candidates(
+            providers,
+            &model,
+            aggregate_model_is_explicit,
+            allow_provider_model_mapping,
+        );
+        // 跨站故障转移开关：关闭时本次请求只能由一个站点服务，绝不把请求转给
+        // 其它站点；开启时保留“声明同一上游模型的站点互为兜底”的原有行为。
+        //
+        // The cross-site gate is applied here, before the retry loop, so the
+        // narrowed list also governs the health filter and every failover
+        // branch below: with a single candidate they can no longer reach
+        // another site. Same-site retries (`per_provider_retry_count`) are
+        // unaffected.
+        providers = if selection.cross_site_failover {
+            match target {
+                Some(target) => {
+                    let mut ordered = Vec::with_capacity(fallbacks.len() + 1);
+                    ordered.push(target);
+                    ordered.append(&mut fallbacks);
+                    ordered
+                }
+                None => fallbacks,
+            }
+        } else {
+            match target {
+                Some(target) => vec![target],
+                // Nothing was named, or the named site is disabled or no longer
+                // a candidate: this request has no authorised site, so it fails
+                // instead of being handed to whichever site happens to declare
+                // the same model.
+                None => Vec::new(),
+            }
+        };
+        if providers.is_empty() {
+            let mut response = json_response(
+                404,
+                "Not Found",
+                json!({
+                    "error": "gateway_aggregate_model_unknown",
+                    "message": format!(
+                        "No enabled aggregate site declares model '{model}'. Pick a model from the Codex model list.",
+                    ),
+                }),
+                route.route_name,
+                None,
+                "aggregate model did not match any declared catalog",
+            );
+            response.cli_key = Some(route.cli_key);
+            response.requested_model = Some(requested_model);
+            response.error_category = Some("model_not_found".to_string());
+            return response;
+        }
+    }
 
     let settings = context.settings_snapshot();
     let app_config = settings.effective_app_config(route.cli_key);
@@ -918,23 +1126,44 @@ async fn forward_to_upstream(
     let mut last_failure_response = None;
     let mut provider_attempts = Vec::new();
     let mut skipped_by_health = Vec::new();
-    let is_single_provider = providers.len() == 1;
+    // The single-provider shortcut below means "this deployment has one
+    // candidate site", not "the cross-site gate pinned *this* request to one
+    // site". With cross-site failover disabled the list is narrowed on purpose,
+    // so the cooldown filter has to stay on: otherwise a cooling site would be
+    // hammered with requests it is expected to fail, instead of answering
+    // `model_temporarily_unavailable` (`error_category: cooling_down`) as the
+    // request-level policy intends.
+    let is_single_provider = providers.len() == 1
+        && aggregate_selection.is_none_or(|selection| selection.cross_site_failover);
 
     'providers: for provider in providers {
-        let upstream_model_id = resolve_upstream_model_id(
-            request,
-            &requested_model,
-            &provider,
-            apply_failover_model_mapping,
-            allow_provider_model_mapping,
-        );
+        // Aggregate mode never runs the per-CLI default/family mapping: the
+        // prefix (or the published slug) already names the exact upstream
+        // model. A bare model name, though, is a user-typed model id exactly
+        // like in the other modes, so its per-channel rewrite rules still apply.
+        let upstream_model_id = match aggregate_upstream_model.as_deref() {
+            Some(model) => resolve_aggregate_upstream_model(
+                model,
+                aggregate_model_is_explicit,
+                &provider,
+                allow_provider_model_mapping,
+            ),
+            None => resolve_upstream_model_id(
+                request,
+                &requested_model,
+                &provider,
+                apply_failover_model_mapping,
+                allow_provider_model_mapping,
+            ),
+        };
         let health_key = ProviderModelHealthKey {
             cli_key: route.cli_key,
             provider_id: provider.id.clone(),
             upstream_model_id: upstream_model_id.clone(),
         };
 
-        // 单渠道代理跳过健康过滤，始终尝试转发。
+        // 单渠道代理跳过健康过滤，始终尝试转发；但“跨站故障转移已禁用”把本次
+        // 请求收窄到单站点时不算单渠道部署，冷却过滤必须继续生效（见上）。
         if !is_single_provider && !is_model_available(context, &health_key) {
             skipped_by_health.push(provider.name.clone());
             continue;
@@ -974,6 +1203,7 @@ async fn forward_to_upstream(
                 app_config.non_streaming_timeout_secs,
                 app_config.streaming_idle_timeout_secs,
                 upstream_response_snapshot_limit,
+                privacy,
             )
             .await
             {
@@ -1207,6 +1437,7 @@ async fn send_upstream_request(
     non_streaming_timeout_secs: u64,
     streaming_idle_timeout_secs: u64,
     upstream_response_snapshot_limit: Option<usize>,
+    privacy: Option<&PrivacyRequest>,
 ) -> Result<DebugHttpResponse, GatewayForwardError> {
     let compact_compat = CodexResponsesCompactCompat::new(route, provider);
     let source_protocol = source_protocol_from_route(route);
@@ -1253,6 +1484,14 @@ async fn send_upstream_request(
         compact_compat,
     ) {
         strip_known_invalid_responses_ciphers(context, provider, &mut upstream_body)?;
+    }
+    if let Some(privacy) = privacy {
+        upstream_body = privacy
+            .prepare(&upstream_body, &provider.id)
+            .map_err(|message| {
+                privacy.fail();
+                GatewayForwardError::new(message, GatewayFailureKind::RequestSchema)
+            })?;
     }
     let upstream_body_snapshot = upstream_body.clone();
     let target_streaming = request_declares_streaming(request) || route_declares_streaming(route);
@@ -1398,7 +1637,17 @@ async fn send_upstream_request(
                 compact_compat,
                 &upstream_body_snapshot,
             )? {
-                let rectified_body = rectified.body;
+                let rectified_body = match privacy {
+                    Some(privacy) => {
+                        privacy
+                            .prepare(&rectified.body, &provider.id)
+                            .map_err(|message| {
+                                privacy.fail();
+                                GatewayForwardError::new(message, GatewayFailureKind::RequestSchema)
+                            })?
+                    }
+                    None => rectified.body,
+                };
                 let rectified_context = rectified.conversion_context;
                 let rectified_lossy_warnings = rectified.lossy_warnings;
                 let rectified_pipeline = rectified.pipeline;
@@ -1861,6 +2110,7 @@ async fn build_gateway_response(
         );
 
         return Ok(DebugHttpResponse {
+            privacy: None,
             status_code: status.as_u16(),
             status_text: status.canonical_reason().unwrap_or("Unknown").to_string(),
             headers: response_headers,
@@ -1957,6 +2207,7 @@ async fn build_gateway_response(
             pipeline_context.clone(),
         );
         let gateway_response = DebugHttpResponse {
+            privacy: None,
             status_code: status.as_u16(),
             status_text: status.canonical_reason().unwrap_or("Unknown").to_string(),
             headers: response_headers,
@@ -2110,6 +2361,7 @@ async fn build_gateway_response(
         .unwrap_or(0);
 
     let gateway_response = DebugHttpResponse {
+        privacy: None,
         status_code: status.as_u16(),
         status_text: status.canonical_reason().unwrap_or("Unknown").to_string(),
         headers: response_headers,
@@ -2341,11 +2593,13 @@ fn ollama_chat_response_value_to_openai_chat(value: Value) -> Value {
         .and_then(Value::as_str)
         .filter(|thinking| !thinking.trim().is_empty())
         .map(str::to_string);
+    let tool_calls = ollama_tool_calls_to_openai_chat(&message, 0, false);
     let finish_reason = ollama_done_reason_to_openai(
         value
             .get("done_reason")
             .and_then(Value::as_str)
             .unwrap_or("stop"),
+        !tool_calls.is_empty(),
     );
 
     let mut openai_message = serde_json::Map::new();
@@ -2353,6 +2607,9 @@ fn ollama_chat_response_value_to_openai_chat(value: Value) -> Value {
     openai_message.insert("content".to_string(), Value::String(content));
     if let Some(thinking) = thinking {
         openai_message.insert("reasoning_content".to_string(), Value::String(thinking));
+    }
+    if !tool_calls.is_empty() {
+        openai_message.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
 
     json!({
@@ -2384,9 +2641,48 @@ fn ollama_usage_value(value: &Value) -> Value {
     })
 }
 
-fn ollama_done_reason_to_openai(reason: &str) -> &'static str {
+fn ollama_tool_calls_to_openai_chat(
+    message: &Value,
+    first_index: usize,
+    streaming: bool,
+) -> Vec<Value> {
+    message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(position, call)| {
+            let function = call.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            let arguments = function
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let arguments = arguments
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| arguments.to_string());
+            let index = first_index + position;
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_ollama_{index}"));
+            let mut call =
+                json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}});
+            if streaming {
+                call["index"] = json!(index);
+            }
+            Some(call)
+        })
+        .collect()
+}
+
+fn ollama_done_reason_to_openai(reason: &str, has_tool_calls: bool) -> &'static str {
     match reason.trim().to_ascii_lowercase().as_str() {
         "length" | "max_tokens" | "limit" => "length",
+        _ if has_tool_calls => "tool_calls",
         _ => "stop",
     }
 }
@@ -2397,6 +2693,7 @@ struct OllamaNdjsonSseState {
     pending: VecDeque<Vec<u8>>,
     sent_role: bool,
     done: bool,
+    next_tool_index: usize,
 }
 
 fn convert_ollama_ndjson_stream_to_openai_chat_sse(stream: DebugBodyStream) -> DebugBodyStream {
@@ -2407,6 +2704,7 @@ fn convert_ollama_ndjson_stream_to_openai_chat_sse(stream: DebugBodyStream) -> D
             pending: VecDeque::new(),
             sent_role: false,
             done: false,
+            next_tool_index: 0,
         },
         |mut state| async move {
             loop {
@@ -2421,7 +2719,10 @@ fn convert_ollama_ndjson_stream_to_openai_chat_sse(stream: DebugBodyStream) -> D
                     }
                     if !state.done {
                         state.done = true;
-                        return Some((Ok(b"data: [DONE]\n\n".to_vec()), state));
+                        return Some((
+                            Err("Ollama stream ended without a done event".into()),
+                            state,
+                        ));
                     }
                     return None;
                 };
@@ -2444,6 +2745,9 @@ fn convert_ollama_ndjson_stream_to_openai_chat_sse(stream: DebugBodyStream) -> D
 
 impl OllamaNdjsonSseState {
     fn push_line(&mut self, line: &[u8]) {
+        if self.done {
+            return;
+        }
         let trimmed = trim_ascii_line(line);
         if trimmed.is_empty() {
             return;
@@ -2451,6 +2755,21 @@ impl OllamaNdjsonSseState {
         let Ok(value) = serde_json::from_slice::<Value>(trimmed) else {
             return;
         };
+        if let Some(error) = value
+            .get("error")
+            .and_then(Value::as_str)
+            .filter(|error| !error.trim().is_empty())
+        {
+            self.done = true;
+            self.pending.push_back(
+                format!(
+                    "data: {}\n\n",
+                    json!({"error":{"message":error,"type":"server_error","code":"ollama_error"}})
+                )
+                .into_bytes(),
+            );
+            return;
+        }
         let model = value.get("model").and_then(Value::as_str).unwrap_or("");
         let mut delta = serde_json::Map::new();
         if !self.sent_role {
@@ -2474,7 +2793,17 @@ impl OllamaNdjsonSseState {
                 Value::String(thinking.to_string()),
             );
         }
+        let tool_calls = ollama_tool_calls_to_openai_chat(
+            value.get("message").unwrap_or(&Value::Null),
+            self.next_tool_index,
+            true,
+        );
+        self.next_tool_index += tool_calls.len();
+        if !tool_calls.is_empty() {
+            delta.insert("tool_calls".into(), Value::Array(tool_calls));
+        }
         let done = value.get("done").and_then(Value::as_bool).unwrap_or(false);
+        let emitted_delta = !delta.is_empty();
         if !delta.is_empty() || !done {
             let finish_reason = if done {
                 Some(ollama_done_reason_to_openai(
@@ -2482,6 +2811,7 @@ impl OllamaNdjsonSseState {
                         .get("done_reason")
                         .and_then(Value::as_str)
                         .unwrap_or("stop"),
+                    self.next_tool_index > 0,
                 ))
             } else {
                 None
@@ -2490,12 +2820,11 @@ impl OllamaNdjsonSseState {
                 model,
                 Value::Object(delta),
                 finish_reason,
-                None,
             ));
         }
         if done {
             self.done = true;
-            if delta_is_empty_done_without_chunk(&value) {
+            if !emitted_delta {
                 self.pending.push_back(openai_chat_sse_chunk(
                     model,
                     json!({}),
@@ -2504,8 +2833,8 @@ impl OllamaNdjsonSseState {
                             .get("done_reason")
                             .and_then(Value::as_str)
                             .unwrap_or("stop"),
+                        self.next_tool_index > 0,
                     )),
-                    None,
                 ));
             }
             if let Some(usage) = ollama_stream_usage_chunk(model, &value) {
@@ -2528,39 +2857,26 @@ fn trim_ascii_line(line: &[u8]) -> &[u8] {
     &line[start..end]
 }
 
-fn delta_is_empty_done_without_chunk(value: &Value) -> bool {
-    value
-        .pointer("/message/content")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-        && value
-            .pointer("/message/thinking")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-}
-
 fn ollama_stream_usage_chunk(model: &str, value: &Value) -> Option<Vec<u8>> {
-    let prompt_tokens = value.get("prompt_eval_count").and_then(Value::as_u64)?;
-    let completion_tokens = value.get("eval_count").and_then(Value::as_u64).unwrap_or(0);
-    Some(openai_chat_sse_chunk(
-        model,
-        json!({}),
-        None,
-        Some(json!({
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        })),
-    ))
+    value.get("prompt_eval_count").and_then(Value::as_u64)?;
+    Some(
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chatcmpl-ollama",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [],
+                "usage": ollama_usage_value(value)
+            })
+        )
+        .into_bytes(),
+    )
 }
 
-fn openai_chat_sse_chunk(
-    model: &str,
-    delta: Value,
-    finish_reason: Option<&str>,
-    usage: Option<Value>,
-) -> Vec<u8> {
-    let mut chunk = json!({
+fn openai_chat_sse_chunk(model: &str, delta: Value, finish_reason: Option<&str>) -> Vec<u8> {
+    let chunk = json!({
         "id": "chatcmpl-ollama",
         "object": "chat.completion.chunk",
         "created": 0,
@@ -2573,11 +2889,6 @@ fn openai_chat_sse_chunk(
             }
         ]
     });
-    if let Some(usage) = usage {
-        if let Some(object) = chunk.as_object_mut() {
-            object.insert("usage".to_string(), usage);
-        }
-    }
     let mut bytes = b"data: ".to_vec();
     bytes.extend_from_slice(
         serde_json::to_string(&chunk)
@@ -2999,20 +3310,9 @@ impl GeminiCandidateAggregate {
                 return;
             }
         }
-        if let Some(function_call) = part.get("functionCall") {
-            let name = function_call
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if let Some(existing) = self.parts.iter_mut().rev().find(|candidate_part| {
-                candidate_part
-                    .pointer("/functionCall/name")
-                    .and_then(Value::as_str)
-                    == Some(name)
-            }) {
-                merge_gemini_function_call(existing, function_call);
-                return;
-            }
+        if part.get("functionCall").is_some() {
+            merge_gemini_function_call_part(&mut self.parts, part);
+            return;
         }
         self.parts.push(part.clone());
     }
@@ -3047,37 +3347,6 @@ fn append_json_string_field(value: &mut Value, field: &str, suffix: &str) {
         field.to_string(),
         Value::String(format!("{current}{suffix}")),
     );
-}
-
-fn merge_gemini_function_call(existing_part: &mut Value, incoming_function_call: &Value) {
-    let Some(existing_call) = existing_part
-        .get_mut("functionCall")
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    if let Some(id) = incoming_function_call.get("id").cloned() {
-        existing_call.insert("id".to_string(), id);
-    }
-    if let Some(args) = incoming_function_call.get("args") {
-        let existing_args = existing_call
-            .entry("args".to_string())
-            .or_insert_with(|| json!({}));
-        merge_json_objects(existing_args, args);
-    }
-}
-
-fn merge_json_objects(existing: &mut Value, incoming: &Value) {
-    match (existing.as_object_mut(), incoming.as_object()) {
-        (Some(existing_object), Some(incoming_object)) => {
-            for (key, value) in incoming_object {
-                existing_object.insert(key.clone(), value.clone());
-            }
-        }
-        _ => {
-            *existing = incoming.clone();
-        }
-    }
 }
 
 /// Anthropic usage fields are cumulative snapshots, not per-event deltas.
@@ -4136,6 +4405,7 @@ fn buffered_gateway_response(
         .map(|body| body.len() as u64)
         .unwrap_or(0);
     DebugHttpResponse {
+        privacy: None,
         status_code,
         status_text,
         headers,
@@ -4309,14 +4579,18 @@ fn local_request_schema_failure_response(
     failover: bool,
 ) -> DebugHttpResponse {
     let message = error.message.clone();
-    let body = CodexResponsesCompactCompat::new(route, provider)
-        .request_schema_error_value(&message)
-        .unwrap_or_else(|| {
-            json!({
-                "error": "gateway_request_schema_rejected",
-                "message": message,
+    let body = if message.starts_with("privacy_") {
+        privacy_error_value(route, 400, "privacy_request_blocked", &message)
+    } else {
+        CodexResponsesCompactCompat::new(route, provider)
+            .request_schema_error_value(&message)
+            .unwrap_or_else(|| {
+                json!({
+                    "error": "gateway_request_schema_rejected",
+                    "message": message,
+                })
             })
-        });
+    };
     let mut response = json_response(
         400,
         "Bad Request",
@@ -4341,7 +4615,14 @@ fn local_request_schema_failure_response(
     response.target_protocol = Some(provider.target_protocol);
     response.upstream_response_body = error.upstream_response_body;
     response.upstream_response_body_bytes = error.upstream_response_body_bytes;
-    response.error_category = Some("request_schema".to_string());
+    response.error_category = Some(
+        if message.starts_with("privacy_") {
+            "privacy_request_blocked"
+        } else {
+            "request_schema"
+        }
+        .to_string(),
+    );
     response.attempt_count = attempt_count;
     response.provider_attempt_count = provider_attempt_count;
     response.failover = failover;
@@ -4909,7 +5190,7 @@ fn convert_buffered_error_body(
     body
 }
 
-fn can_retry_current_provider(
+pub(super) fn can_retry_current_provider(
     failure_kind: GatewayFailureKind,
     provider_retry_count: u32,
     per_provider_retry_count: u32,
@@ -4925,6 +5206,84 @@ async fn wait_before_retry(retry_interval_secs: u64) {
     if retry_interval_secs > 0 {
         tokio::time::sleep(Duration::from_secs(retry_interval_secs)).await;
     }
+}
+
+/// Keep the aggregate candidates that can serve `model`.
+///
+/// Membership is decided on the id that will actually be forwarded, so this
+/// must agree with `resolve_aggregate_upstream_model`: a site picked by slug or
+/// prefix is matched on the model verbatim, while a bare model name is matched
+/// on that site's own rewrite result. A provider that declares no catalog is
+/// dropped either way — there is nothing to match against, and the published
+/// Codex catalog only ever lists declared models.
+fn aggregate_model_candidates(
+    providers: Vec<UpstreamProvider>,
+    model: &str,
+    explicit: bool,
+    allow_provider_model_mapping: bool,
+) -> Vec<UpstreamProvider> {
+    providers
+        .into_iter()
+        .filter(|provider| {
+            let forwarded = resolve_aggregate_upstream_model(
+                model,
+                explicit,
+                provider,
+                allow_provider_model_mapping,
+            );
+            provider
+                .meta
+                .declared_models
+                .iter()
+                .any(|declared| declared == &forwarded)
+        })
+        .collect()
+}
+
+/// Resolve the upstream model for one aggregate-mode attempt.
+///
+/// Aggregate mode never runs the per-CLI family/default mapping: an explicit
+/// slug or `<site><sep><model>` prefix already names the exact upstream model.
+/// A bare model name is a user-typed model id, so it still honours the
+/// provider's `modelRewrites` exactly like the non-aggregate paths do.
+fn resolve_aggregate_upstream_model(
+    model: &str,
+    explicit: bool,
+    provider: &UpstreamProvider,
+    allow_provider_model_mapping: bool,
+) -> String {
+    if explicit {
+        return strip_one_m_context_marker(model).to_string();
+    }
+    resolve_model_rewrite_rule(provider, model, allow_provider_model_mapping)
+        .unwrap_or_else(|| strip_one_m_context_marker(model).to_string())
+}
+
+/// Apply one provider's user-defined exact model rewrite rule (`modelRewrites`).
+///
+/// Returns the mapped upstream model, or `None` when no rule matches. Kept
+/// separate from `resolve_upstream_model_id` because aggregate mode wants the
+/// rewrite but not the per-CLI family/default mapping that follows it.
+fn resolve_model_rewrite_rule(
+    provider: &UpstreamProvider,
+    requested_model: &str,
+    allow_provider_model_mapping: bool,
+) -> Option<String> {
+    if !allow_provider_model_mapping {
+        return None;
+    }
+    let normalized_model = strip_one_m_context_marker(requested_model)
+        .trim()
+        .to_ascii_lowercase();
+    if normalized_model.is_empty() {
+        return None;
+    }
+    provider
+        .model_mapping
+        .rewrite_rules
+        .iter()
+        .find(|rule| rule.from.trim().to_ascii_lowercase() == normalized_model)
+        .map(|rule| strip_one_m_context_marker(rule.to.trim()).to_string())
 }
 
 fn is_codex_auto_review_request(request: &DebugHttpRequest) -> bool {
@@ -4949,20 +5308,10 @@ fn resolve_upstream_model_id(
     // tests keep the pinned model. [1M] is stripped before matching and again
     // before forwarding so both the match key and the mapped target stay
     // clean upstream model IDs.
-    if allow_provider_model_mapping {
-        let normalized_model = strip_one_m_context_marker(requested_model)
-            .trim()
-            .to_ascii_lowercase();
-        if !normalized_model.is_empty() {
-            if let Some(rule) = provider
-                .model_mapping
-                .rewrite_rules
-                .iter()
-                .find(|rule| rule.from.trim().to_ascii_lowercase() == normalized_model)
-            {
-                return strip_one_m_context_marker(rule.to.trim()).to_string();
-            }
-        }
+    if let Some(mapped) =
+        resolve_model_rewrite_rule(provider, requested_model, allow_provider_model_mapping)
+    {
+        return mapped;
     }
     match provider.cli_key {
         GatewayCliKey::Claude => {
@@ -5168,6 +5517,83 @@ struct PreparedUpstreamBody {
     /// Request-scoped only: flat tool name → namespace identity for native xAI
     /// Responses passthrough restore. Empty when not applicable.
     xai_namespace_restore_map: HashMap<String, NamespacedName>,
+}
+
+/// Prepare a Responses event using the same model/provider policy as HTTP,
+/// while keeping WebSocket control fields owned by the transport.
+pub(super) fn prepare_websocket_request(
+    request: &DebugHttpRequest,
+    provider: &UpstreamProvider,
+    context: &GatewayRuntimeContext,
+    apply_failover_model_mapping: bool,
+) -> Result<(Vec<u8>, String, HashMap<String, NamespacedName>), String> {
+    let original: Value =
+        serde_json::from_slice(&request.body).map_err(|error| error.to_string())?;
+    let requested_model = original.get("model").and_then(Value::as_str).unwrap_or("");
+    if requested_model.trim().is_empty() {
+        return Err("response.create requires a model".to_string());
+    }
+    let upstream_model = resolve_upstream_model_id(
+        request,
+        requested_model,
+        provider,
+        apply_failover_model_mapping,
+        true,
+    );
+    let prepared = build_upstream_body_for_provider(
+        request,
+        requested_model,
+        &upstream_model,
+        false,
+        false,
+        GatewayCliKey::Codex,
+        Some(AiProtocol::OpenAiResponses),
+        AiProtocol::OpenAiResponses,
+        None,
+        Some(&provider.meta),
+        Some(context),
+        Some(provider),
+        false,
+        CodexResponsesCompactCompat::none(),
+    )
+    .map_err(|error| error.message)?;
+    let mut payload: Value =
+        serde_json::from_slice(&prepared.body).map_err(|error| error.to_string())?;
+    let object = payload
+        .as_object_mut()
+        .ok_or("response.create must be a JSON object")?;
+    object.remove("stream");
+    object.remove("background");
+    for key in [
+        "type",
+        "generate",
+        "stream_id",
+        "previous_response_id",
+        "event_id",
+    ] {
+        if let Some(value) = original.get(key) {
+            object.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok((
+        serde_json::to_vec(&payload).map_err(|error| error.to_string())?,
+        upstream_model,
+        prepared.xai_namespace_restore_map,
+    ))
+}
+
+pub(super) fn websocket_provider_url(
+    provider: &UpstreamProvider,
+    route: &GatewayRoute,
+) -> Result<reqwest::Url, String> {
+    build_provider_target_url(
+        provider,
+        &route.forwarded_path,
+        route.query.as_deref(),
+        None,
+        true,
+        "",
+    )
 }
 
 fn build_upstream_body_for_provider(
@@ -5442,7 +5868,10 @@ fn apply_xai_responses_passthrough_if_needed(
     Ok(restore_map)
 }
 
-fn restore_xai_namespace_json_body(body: &[u8], map: &HashMap<String, NamespacedName>) -> Vec<u8> {
+pub(super) fn restore_xai_namespace_json_body(
+    body: &[u8],
+    map: &HashMap<String, NamespacedName>,
+) -> Vec<u8> {
     if map.is_empty() {
         return body.to_vec();
     }
@@ -6105,10 +6534,18 @@ fn apply_outbound_adapter_compat_value(
     }
 
     if target_protocol == AiProtocol::OpenAiChat {
+        // Anthropic (Claude Code) sources must keep instruction order: Codex's
+        // `developer` instruction blocks are stable and safe to merge, Claude Code's
+        // per-turn `<total_tokens>` reminders are not. See
+        // `transformer/shared/system_messages.rs`.
+        let placement = conversion_route.map_or(InstructionPlacement::MergeToHead, |route| {
+            placement_for_protocol(route.source)
+        });
         normalize_openai_chat_for_provider_compat(
             value,
             provider_kind,
             should_preserve_chat_reasoning_effort(provider_kind, codex_chat_reasoning),
+            placement,
         );
     }
 
@@ -6275,10 +6712,30 @@ fn clear_gemini_vertex_function_ids(object: &mut serde_json::Map<String, Value>)
     let Some(contents) = object.get_mut("contents").and_then(Value::as_array_mut) else {
         return;
     };
+    let mut tool_calls = Vec::new();
     for content in contents {
         let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
             continue;
         };
+        if parts.iter().any(|part| part.get("functionCall").is_some()) {
+            tool_calls = parts
+                .iter()
+                .filter_map(|part| part.get("functionCall"))
+                .map(|call| {
+                    (
+                        call.get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(ToString::to_string),
+                        call.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect();
+        }
+        reorder_gemini_vertex_function_responses(parts, &tool_calls);
         for part in parts {
             if let Some(function_call) = part.get_mut("functionCall").and_then(Value::as_object_mut)
             {
@@ -6292,6 +6749,74 @@ fn clear_gemini_vertex_function_ids(object: &mut serde_json::Map<String, Value>)
             }
         }
     }
+}
+
+fn reorder_gemini_vertex_function_responses(
+    parts: &mut Vec<Value>,
+    tool_calls: &[(Option<String>, String)],
+) {
+    if tool_calls.is_empty()
+        || parts
+            .iter()
+            .filter(|part| part.get("functionResponse").is_some())
+            .count()
+            < 2
+    {
+        return;
+    }
+    let mut prefix = Vec::new();
+    let mut groups: Vec<(Option<usize>, Vec<Value>)> = Vec::new();
+    for part in std::mem::take(parts) {
+        if part.get("functionResponse").is_some() {
+            groups.push((None, vec![part]));
+        } else if let Some((_, group)) = groups.last_mut() {
+            // Keep Gemini 2.x marker/media parts attached to their result.
+            group.push(part);
+        } else {
+            prefix.push(part);
+        }
+    }
+    let mut pending_calls = tool_calls.iter().enumerate().collect::<Vec<_>>();
+    for (order, group) in &mut groups {
+        let Some(id) = group[0]
+            .pointer("/functionResponse/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if let Some(position) = pending_calls
+            .iter()
+            .position(|(_, (call_id, _))| call_id.as_deref() == Some(id))
+        {
+            *order = Some(pending_calls.remove(position).0);
+        }
+    }
+    // The transformer may already have removed synthetic IDs. Reserve native
+    // matches first, then place anonymous results in the remaining call slots.
+    for (order, group) in &mut groups {
+        let result = &group[0]["functionResponse"];
+        if result
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            continue;
+        }
+        let name = result
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some(position) = pending_calls
+            .iter()
+            .position(|(_, (_, call_name))| call_name == name)
+        {
+            *order = Some(pending_calls.remove(position).0);
+        }
+    }
+    groups.sort_by_key(|(order, _)| order.unwrap_or(usize::MAX));
+    prefix.extend(groups.into_iter().flat_map(|(_, group)| group));
+    *parts = prefix;
 }
 
 fn apply_provider_body_compat_after_generic(
@@ -6703,6 +7228,9 @@ fn convert_openai_chat_request_to_ollama_chat(value: Value) -> Value {
     let mut ollama = serde_json::Map::new();
     ollama.insert("model".to_string(), model);
     ollama.insert("messages".to_string(), Value::Array(messages));
+    if let Some(tools) = object.remove("tools") {
+        ollama.insert("tools".to_string(), tools);
+    }
     if let Some(Value::Bool(stream)) = stream {
         ollama.insert("stream".to_string(), Value::Bool(stream));
     } else {
@@ -6738,6 +7266,27 @@ fn openai_chat_message_to_ollama_message(message: Value) -> Option<Value> {
     }
     if let Some(reasoning) = first_reasoning_field_text(&message_object) {
         ollama_message.insert("thinking".to_string(), Value::String(reasoning));
+    }
+    if let Some(Value::Array(calls)) = message_object.remove("tool_calls") {
+        let calls = calls
+            .into_iter()
+            .filter_map(|call| {
+                let mut function = call.get("function")?.clone();
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    if let Ok(arguments) = serde_json::from_str::<Value>(arguments) {
+                        function["arguments"] = arguments;
+                    }
+                }
+                Some(json!({"function":function}))
+            })
+            .collect::<Vec<_>>();
+        ollama_message.insert("tool_calls".to_string(), Value::Array(calls));
+    }
+    if let Some(name) = message_object
+        .remove("name")
+        .or_else(|| message_object.remove("tool_name"))
+    {
+        ollama_message.insert("tool_name".to_string(), name);
     }
     Some(Value::Object(ollama_message))
 }
@@ -7570,6 +8119,7 @@ fn normalize_openai_chat_for_provider_compat(
     value: &mut Value,
     provider_kind: Option<ProviderBodyCompat>,
     preserve_reasoning_effort: bool,
+    placement: InstructionPlacement,
 ) {
     let Value::Object(object) = value else {
         return;
@@ -7584,7 +8134,7 @@ fn normalize_openai_chat_for_provider_compat(
 
     sanitize_openai_chat_tools(object);
     if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
-        sanitize_openai_chat_messages(messages);
+        sanitize_openai_chat_messages(messages, placement);
     }
 }
 
@@ -7612,7 +8162,7 @@ fn is_supported_openai_chat_tool(tool: &Value) -> bool {
             .is_some_and(|name| !name.trim().is_empty())
 }
 
-fn sanitize_openai_chat_messages(messages: &mut Vec<Value>) {
+fn sanitize_openai_chat_messages(messages: &mut Vec<Value>, placement: InstructionPlacement) {
     let mut removed_tool_call_ids = Vec::new();
     let mut filtered_messages = Vec::with_capacity(messages.len());
 
@@ -7637,36 +8187,7 @@ fn sanitize_openai_chat_messages(messages: &mut Vec<Value>) {
         filtered_messages.push(message);
     }
 
-    *messages = collapse_openai_chat_system_messages_to_head(filtered_messages);
-}
-
-fn collapse_openai_chat_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
-    let mut system_chunks = Vec::new();
-    let mut rest = Vec::with_capacity(messages.len());
-
-    for message in messages {
-        if message.get("role").and_then(Value::as_str) == Some("system") {
-            if let Some(content) = message.get("content").and_then(Value::as_str) {
-                if !content.trim().is_empty() {
-                    system_chunks.push(content.to_string());
-                }
-                continue;
-            }
-        }
-        rest.push(message);
-    }
-
-    if system_chunks.is_empty() {
-        return rest;
-    }
-
-    let mut normalized = Vec::with_capacity(rest.len() + 1);
-    normalized.push(json!({
-        "role": "system",
-        "content": system_chunks.join("\n\n")
-    }));
-    normalized.extend(rest);
-    normalized
+    *messages = normalize_chat_system_messages(filtered_messages, placement);
 }
 
 fn is_removed_tool_result_message(message: &Value, removed_tool_call_ids: &[String]) -> bool {
@@ -10082,6 +10603,13 @@ fn gateway_response_status_reports_error(status: &str) -> bool {
 }
 
 fn choice_has_meaningful_content(choice: &Value) -> bool {
+    if choice
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
+    {
+        return true;
+    }
     let message = choice
         .get("message")
         .or_else(|| choice.get("delta"))
@@ -10181,7 +10709,7 @@ fn extract_reasoning_like_text(value: &Value) -> Option<&str> {
         .filter(|text| !text.trim().is_empty())
 }
 
-fn classify_status_failure(status_code: u16) -> Option<GatewayFailureKind> {
+pub(super) fn classify_status_failure(status_code: u16) -> Option<GatewayFailureKind> {
     match status_code {
         200..=399 => None,
         400 => Some(GatewayFailureKind::UpstreamBadRequest),
@@ -10276,7 +10804,7 @@ fn should_use_header_preserving_raw(upstream_url: &reqwest::Url) -> bool {
     true
 }
 
-fn refresh_health_registry(context: &GatewayRuntimeContext) {
+pub(super) fn refresh_health_registry(context: &GatewayRuntimeContext) {
     let Some(registry) = context.health_registry.as_ref() else {
         return;
     };
@@ -10312,7 +10840,7 @@ pub(super) fn record_health_failure(
         .unwrap_or(false)
 }
 
-fn record_health_success(
+pub(super) fn record_health_success(
     context: &GatewayRuntimeContext,
     health_key: &ProviderModelHealthKey,
 ) -> bool {
@@ -10364,6 +10892,7 @@ mod tests {
 
     fn claude_provider(mapping: UpstreamModelMapping) -> UpstreamProvider {
         UpstreamProvider {
+            supports_websockets: None,
             cli_key: GatewayCliKey::Claude,
             id: "p1".to_string(),
             name: "Provider".to_string(),
@@ -10381,6 +10910,7 @@ mod tests {
 
     fn provider_for_cli(cli_key: GatewayCliKey) -> UpstreamProvider {
         UpstreamProvider {
+            supports_websockets: None,
             cli_key,
             id: "p1".to_string(),
             name: "Provider".to_string(),
@@ -10725,6 +11255,7 @@ mod tests {
     fn conversion_route_rewrites_codex_responses_to_anthropic_messages_path() {
         let route = gateway_route(GatewayCliKey::Codex, "/v1/responses");
         let provider = UpstreamProvider {
+            supports_websockets: None,
             cli_key: GatewayCliKey::Codex,
             id: "p1".to_string(),
             name: "Provider".to_string(),
@@ -12354,6 +12885,104 @@ data: {data}\r\n\r\n"
     }
 
     #[test]
+    fn aggregate_bare_model_still_honours_rewrite_rules_but_explicit_slug_does_not() {
+        let mut provider = provider_for_cli(GatewayCliKey::Codex);
+        provider.model_mapping.default_model = Some("p1-main".to_string());
+        provider.model_mapping.rewrite_rules = vec![ModelRewriteRule {
+            from: "gpt-5-luna".to_string(),
+            to: "gpt-5-mini".to_string(),
+        }];
+
+        // Bare model name (user-typed id): rewrites apply, like every other mode.
+        assert_eq!(
+            resolve_aggregate_upstream_model("gpt-5-luna", false, &provider, true),
+            "gpt-5-mini"
+        );
+        // Same model reached through a published slug / `<site><sep><model>`
+        // prefix: the prefix already named the upstream model, so it wins.
+        assert_eq!(
+            resolve_aggregate_upstream_model("gpt-5-luna", true, &provider, true),
+            "gpt-5-luna"
+        );
+        // The per-CLI default/auto-review mapping never applies in aggregate
+        // mode, with or without a prefix.
+        assert_eq!(
+            resolve_aggregate_upstream_model("unknown-model", false, &provider, true),
+            "unknown-model"
+        );
+        // Connectivity tests pin the model: mapping stays disabled.
+        assert_eq!(
+            resolve_aggregate_upstream_model("gpt-5-luna", false, &provider, false),
+            "gpt-5-luna"
+        );
+    }
+
+    #[test]
+    fn aggregate_model_candidates_match_on_the_forwarded_model() {
+        let declaring = |id: &str, models: &[&str]| {
+            let mut provider = provider_for_cli(GatewayCliKey::Codex);
+            provider.id = id.to_string();
+            provider.meta.declared_models = models.iter().map(|model| model.to_string()).collect();
+            provider
+        };
+        let with_rule = |mut provider: UpstreamProvider| {
+            provider.model_mapping.rewrite_rules = vec![ModelRewriteRule {
+                from: "gpt-5-luna".to_string(),
+                to: "gpt-5-mini".to_string(),
+            }];
+            provider
+        };
+        let kept_ids = |providers: Vec<UpstreamProvider>| -> Vec<String> {
+            providers.into_iter().map(|provider| provider.id).collect()
+        };
+
+        let site_a = with_rule(declaring("site-a", &["gpt-5-mini"]));
+        let site_b = declaring("site-b", &["glm-5"]);
+        let site_c = declaring("site-c", &[]);
+
+        // A bare model name reaches a declaration only through the site's own
+        // rewrite rule. The rewrite runs before forwarding, so it decides
+        // membership here too — otherwise the typed name would 404 even though
+        // the same request works in single/failover mode.
+        assert_eq!(
+            kept_ids(aggregate_model_candidates(
+                vec![site_a.clone(), site_b.clone(), site_c.clone()],
+                "gpt-5-luna",
+                false,
+                true,
+            )),
+            vec!["site-a"]
+        );
+        // An explicit slug is matched on the model verbatim: the rule must not
+        // widen the fallback set for a site the prefix already pinned.
+        assert_eq!(
+            kept_ids(aggregate_model_candidates(
+                vec![site_a.clone(), site_b.clone()],
+                "gpt-5-mini",
+                true,
+                true,
+            )),
+            vec!["site-a"]
+        );
+        assert!(
+            aggregate_model_candidates(vec![site_a.clone()], "gpt-5-luna", true, true).is_empty()
+        );
+        // Connectivity tests pin the provider and model: no mapping, no match.
+        assert_eq!(
+            kept_ids(aggregate_model_candidates(
+                vec![site_a.clone(), site_b.clone()],
+                "gpt-5-mini",
+                true,
+                false,
+            )),
+            vec!["site-a"]
+        );
+        assert!(aggregate_model_candidates(vec![site_a], "gpt-5-luna", false, false).is_empty());
+        // A site without a declared catalog is never a candidate.
+        assert!(aggregate_model_candidates(vec![site_c], "glm-5", true, true).is_empty());
+    }
+
+    #[test]
     fn codex_failover_exact_rewrite_rule_wins_over_default_model() {
         let mut provider = provider_for_cli(GatewayCliKey::Codex);
         provider.model_mapping.default_model = Some("p1-main".to_string());
@@ -12845,6 +13474,7 @@ data: {data}\r\n\r\n"
 
     fn protocol_error_debug_response(body: &[u8]) -> DebugHttpResponse {
         DebugHttpResponse {
+            privacy: None,
             status_code: 200,
             status_text: "OK".to_string(),
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
@@ -13546,6 +14176,82 @@ data: {data}\r\n\r\n"
         assert!(messages[1].get("tool_calls").is_none());
     }
 
+    fn late_reminder_chat_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [
+                {"role": "system", "content": "You are Claude Code."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+                {
+                    "role": "system",
+                    "content": "<total_tokens>14963538 tokens left</total_tokens>"
+                },
+                {"role": "user", "content": "Continue"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn outbound_adapter_keeps_claude_code_reminder_in_place_for_anthropic_source() {
+        let body = apply_outbound_adapter_compat(
+            late_reminder_chat_body(),
+            Some(ConversionRoute::new(
+                AiProtocol::AnthropicMessages,
+                AiProtocol::OpenAiChat,
+            )),
+            AiProtocol::OpenAiChat,
+        )
+        .unwrap();
+        let value = serde_json::from_slice::<Value>(&body).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+
+        // Anthropic (Claude Code) sources keep the reminder at its index with the
+        // role downgraded, so the prompt prefix stays stable across turns.
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are Claude Code.");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(
+            messages[3]["content"],
+            "<total_tokens>14963538 tokens left</total_tokens>"
+        );
+    }
+
+    #[test]
+    fn outbound_adapter_merges_late_system_message_for_non_anthropic_sources() {
+        // Direct Chat bodies (and every non-Anthropic source) keep the historical
+        // merge: one leading system, no mid-conversation system role.
+        for route in [
+            None,
+            Some(ConversionRoute::new(
+                AiProtocol::OpenAiResponses,
+                AiProtocol::OpenAiChat,
+            )),
+        ] {
+            let body = apply_outbound_adapter_compat(
+                late_reminder_chat_body(),
+                route,
+                AiProtocol::OpenAiChat,
+            )
+            .unwrap();
+            let value = serde_json::from_slice::<Value>(&body).unwrap();
+            let messages = value["messages"].as_array().unwrap();
+
+            assert_eq!(messages.len(), 4);
+            assert_eq!(messages[0]["role"], "system");
+            assert_eq!(
+                messages[0]["content"],
+                "You are Claude Code.\n\n<total_tokens>14963538 tokens left</total_tokens>"
+            );
+            assert!(messages
+                .iter()
+                .all(|message| message["role"].as_str() != Some("system")
+                    || message["content"].as_str() == messages[0]["content"].as_str()));
+        }
+    }
+
     #[test]
     fn outbound_adapter_normalizes_direct_chat_body_for_provider_compat() {
         let body = include_bytes!(
@@ -13869,6 +14575,122 @@ data: {data}\r\n\r\n"
             value["contents"][1]["parts"][0]["functionResponse"]["response"]["ok"],
             true
         );
+    }
+
+    #[test]
+    fn outbound_adapter_orders_vertex_parallel_results_before_removing_ids() {
+        let body = json!({"contents": [
+            {"role": "model", "parts": [
+                {"functionCall": {"id": "tool_a", "name": "read_file", "args": {"path": "first.txt"}}},
+                {"functionCall": {"id": "tool_b", "name": "read_file", "args": {"path": "second.txt"}}}
+            ]},
+            {"role": "user", "parts": [
+                {"functionResponse": {"id": "tool_b", "name": "read_file", "response": {"result": "second result"}}},
+                {"functionResponse": {"id": "tool_a", "name": "read_file", "response": {"result": "first result"}}}
+            ]}
+        ]});
+        for provider_type in ["google-vertex", "gemini-vertex", "gemini"] {
+            let bytes = apply_outbound_adapter_compat_for_provider_type(
+                serde_json::to_vec(&body).unwrap(),
+                None,
+                AiProtocol::GeminiNative,
+                provider_type,
+            )
+            .unwrap();
+            let converted: Value = serde_json::from_slice(&bytes).unwrap();
+            let parts = converted["contents"][1]["parts"].as_array().unwrap();
+            if provider_type == "gemini" {
+                assert_eq!(parts[0]["functionResponse"]["id"], "tool_b");
+                assert_eq!(
+                    parts[0]["functionResponse"]["response"]["result"],
+                    "second result"
+                );
+            } else {
+                assert!(parts[0]["functionResponse"].get("id").is_none());
+                assert!(parts[1]["functionResponse"].get("id").is_none());
+                assert_eq!(
+                    parts[0]["functionResponse"]["response"]["result"],
+                    "first result"
+                );
+                assert_eq!(
+                    parts[1]["functionResponse"]["response"]["result"],
+                    "second result"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outbound_adapter_keeps_vertex_media_attached_when_reordering_results() {
+        let body = json!({"contents": [
+            {"role": "model", "parts": [
+                {"functionCall": {"id": "tool_a", "name": "read_file", "args": {}}},
+                {"functionCall": {"id": "tool_b", "name": "read_file", "args": {}}}
+            ]},
+            {"role": "user", "parts": [
+                {"functionResponse": {"id": "tool_b", "name": "read_file", "response": {"result": "b"}}},
+                {"text": "media b"}, {"inlineData": {"mimeType": "image/png", "data": "IMAGE_B"}},
+                {"functionResponse": {"id": "tool_a", "name": "read_file", "response": {"result": "a"}}},
+                {"text": "media a"}, {"inlineData": {"mimeType": "image/png", "data": "IMAGE_A"}}
+            ]}
+        ]});
+        let bytes = apply_outbound_adapter_compat_for_provider_type(
+            serde_json::to_vec(&body).unwrap(),
+            None,
+            AiProtocol::GeminiNative,
+            "google-vertex",
+        )
+        .unwrap();
+        let converted: Value = serde_json::from_slice(&bytes).unwrap();
+        let parts = converted["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[0]["functionResponse"]["response"]["result"], "a");
+        assert_eq!(parts[1]["text"], "media a");
+        assert_eq!(parts[2]["inlineData"]["data"], "IMAGE_A");
+        assert_eq!(parts[3]["functionResponse"]["response"]["result"], "b");
+        assert_eq!(parts[4]["text"], "media b");
+        assert_eq!(parts[5]["inlineData"]["data"], "IMAGE_B");
+    }
+
+    #[test]
+    fn outbound_adapter_orders_vertex_mixed_native_and_idless_results() {
+        for result_order in [[0, 1, 2], [2, 0, 1]] {
+            let calls = (0..3)
+                .map(|index| {
+                    let mut call = json!({"name": "read_file", "args": {"file": index}});
+                    if index > 0 {
+                        call["id"] = json!(format!("call_{index}"));
+                    }
+                    json!({"functionCall": call})
+                })
+                .collect::<Vec<_>>();
+            let results = result_order
+                .into_iter()
+                .map(|index| {
+                    let mut result = json!({"name": "read_file", "response": {"file": index}});
+                    if index > 0 {
+                        result["id"] = json!(format!("call_{index}"));
+                    }
+                    json!({"functionResponse": result})
+                })
+                .collect::<Vec<_>>();
+            let body = json!({"contents": [
+                {"role": "model", "parts": calls}, {"role": "user", "parts": results}
+            ]});
+            let bytes = apply_outbound_adapter_compat_for_provider_type(
+                serde_json::to_vec(&body).unwrap(),
+                None,
+                AiProtocol::GeminiNative,
+                "google-vertex",
+            )
+            .unwrap();
+            let converted: Value = serde_json::from_slice(&bytes).unwrap();
+            for index in 0..3 {
+                let result = &converted["contents"][1]["parts"][index]["functionResponse"];
+                assert_eq!(result["response"]["file"], index, "{converted}");
+                assert!(result.get("id").is_none());
+            }
+        }
     }
 
     #[test]
@@ -15104,6 +15926,7 @@ data: {data}\r\n\r\n"
         .as_bytes()
         .to_vec())]));
         let mut response = DebugHttpResponse {
+            privacy: None,
             status_code: 200,
             status_text: "OK".to_string(),
             headers: vec![(CONTENT_TYPE.to_string(), "text/event-stream".to_string())],
@@ -15165,6 +15988,7 @@ data: {data}\r\n\r\n"
             Ok(delta.clone()),
         ]));
         let mut response = DebugHttpResponse {
+            privacy: None,
             status_code: 200,
             status_text: "OK".to_string(),
             headers: vec![(CONTENT_TYPE.to_string(), "text/event-stream".to_string())],
@@ -15574,6 +16398,95 @@ data: {data}\r\n\r\n"
             "rust"
         );
         assert_eq!(value["usageMetadata"]["totalTokenCount"], 8);
+    }
+
+    async fn aggregate_gemini_tool_parts_for_test(parts: Vec<Value>) -> Value {
+        let part_count = parts.len();
+        let chunks = parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let mut candidate =
+                    json!({"index": 0, "content": {"role": "model", "parts": [part]}});
+                if index + 1 == part_count {
+                    candidate["finishReason"] = json!("STOP");
+                }
+                Ok(format!(
+                    "data: {}\n\n",
+                    json!({"responseId": "gemini_aggregate_fixture", "candidates": [candidate]})
+                )
+                .into_bytes())
+            })
+            .collect::<Vec<Result<Vec<u8>, String>>>();
+        let (_, body) =
+            aggregate_gemini_sse_stream(Box::pin(futures_util::stream::iter(chunks)), None)
+                .await
+                .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gemini_sse_aggregate_keeps_distinct_ids_for_same_name_parallel_calls() {
+        let value = aggregate_gemini_tool_parts_for_test(vec![
+            json!({"functionCall": {"id": "tool_a", "name": "read_file", "args": {"path": "first.txt"}}, "thoughtSignature": "signature-a"}),
+            json!({"functionCall": {"id": "tool_b", "name": "read_file", "args": {"path": "second.txt"}}, "thoughtSignature": "signature-b"}),
+        ]).await;
+        let parts = value["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionCall"]["id"], "tool_a");
+        assert_eq!(parts[0]["functionCall"]["args"]["path"], "first.txt");
+        assert_eq!(parts[0]["thoughtSignature"], "signature-a");
+        assert_eq!(parts[1]["functionCall"]["id"], "tool_b");
+        assert_eq!(parts[1]["functionCall"]["args"]["path"], "second.txt");
+        assert_eq!(parts[1]["thoughtSignature"], "signature-b");
+    }
+
+    #[tokio::test]
+    async fn gemini_sse_aggregate_never_deduplicates_anonymous_calls_by_name_or_arguments() {
+        let call = json!({"functionCall": {"name": "read_file", "args": {"path": "same.txt"}}});
+        let value = aggregate_gemini_tool_parts_for_test(vec![call.clone(), call.clone()]).await;
+        assert_eq!(
+            value["candidates"][0]["content"]["parts"],
+            json!([call.clone(), call])
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_sse_aggregate_merges_same_id_snapshots_and_preserves_call_signature() {
+        let value = aggregate_gemini_tool_parts_for_test(vec![
+            json!({"functionCall": {"id": "tool_a", "name": "read_file", "args": {"path": "first.txt"}}, "thoughtSignature": "signature-a"}),
+            json!({"functionCall": {"id": "tool_a", "name": "read_file", "args": {"encoding": "utf8"}}}),
+        ]).await;
+        let parts = value["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0]["functionCall"]["args"],
+            json!({"path": "first.txt", "encoding": "utf8"})
+        );
+        assert_eq!(parts[0]["thoughtSignature"], "signature-a");
+    }
+
+    #[tokio::test]
+    async fn gemini_sse_aggregate_keeps_parallel_calls_with_interleaved_text() {
+        let value = aggregate_gemini_tool_parts_for_test(vec![
+            json!({"text": "before "}),
+            json!({"functionCall": {"id": "tool_a", "name": "read_file", "args": {}}}),
+            json!({"text": "between "}),
+            json!({"functionCall": {"id": "tool_b", "name": "read_file", "args": {}}}),
+            json!({"text": "after"}),
+        ])
+        .await;
+        let parts = value["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["text"], "before between after");
+        assert_eq!(parts[1]["functionCall"]["id"], "tool_a");
+        assert_eq!(parts[2]["functionCall"]["id"], "tool_b");
     }
 
     #[test]

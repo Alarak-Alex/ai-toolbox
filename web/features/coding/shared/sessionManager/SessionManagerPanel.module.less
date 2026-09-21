@@ -28,6 +28,21 @@
   color: var(--color-text-secondary);
 }
 
+.timeFilterSelect {
+  flex: 0 0 auto;
+  min-width: 110px;
+
+  // antd 6 的 Select 没有 .ant-select-selector：边框与内边距都挂在根元素上，
+  // 高度由 padding 撑出，small 变体不控制字号。用更高 specificity 的根元素
+  // 覆盖稳定加高，并保持与分段控件一致的 12px 字号。
+  &:global(.ant-select) {
+    height: 28px;
+    align-items: center;
+    padding-block: 0;
+    font-size: 12px;
+  }
+}
+
 .sourceSegmented {
   display: inline-flex;
   flex: 0 0 auto;
@@ -228,12 +243,6 @@
   font-size: 12px;
 }
 
-.list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
 .sessionCard {
   border: 1px solid var(--color-border-card);
   border-radius: 12px;
@@ -280,13 +289,25 @@
 }
 
 .sessionTitle {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font-family: inherit;
   font-size: 14px;
   font-weight: 600;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
   color: var(--color-text-primary);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.sessionTitle:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
 }
 
 .sessionMetaRow {
@@ -295,6 +316,11 @@
   gap: 8px 12px;
   font-size: 12px;
   color: var(--color-text-secondary);
+}
+
+.sessionProjectDir {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .runtimeSourceTagLocal,

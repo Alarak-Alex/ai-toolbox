@@ -17,7 +17,7 @@ use crate::coding::pi::constants::{
     PI_AUTH_FILE, PI_MCP_FILE, PI_MODELS_FILE, PI_PROMPT_FILE, PI_SETTINGS_FILE,
 };
 use crate::coding::runtime_location;
-use crate::db::helpers::{db_delete, db_delete_all, db_get, db_list, db_put};
+use crate::db::helpers::{db_delete, db_delete_all, db_get, db_list, db_patch_fields, db_put};
 use crate::db::schema::{DbTable, OrderDirection, OrderField, OrderSpec};
 use crate::db::SqliteDbState;
 use chrono::Local;
@@ -56,6 +56,37 @@ fn ssh_mapping_order() -> Result<OrderSpec, String> {
 
 fn load_ssh_config_record(state: &SqliteDbState) -> Result<Option<serde_json::Value>, String> {
     state.with_conn(|conn| db_get(conn, DbTable::SshSyncConfig, "config"))
+}
+
+fn patch_ssh_config_record(
+    state: &SqliteDbState,
+    fields: &[(&str, serde_json::Value)],
+) -> Result<(), String> {
+    state.with_conn(|conn| {
+        if db_get(conn, DbTable::SshSyncConfig, "config")?.is_none() {
+            db_put(
+                conn,
+                DbTable::SshSyncConfig,
+                "config",
+                &adapter::config_to_db_value(&SSHSyncConfig::default()),
+            )?;
+        }
+        db_patch_fields(conn, DbTable::SshSyncConfig, "config", fields)?;
+        Ok(())
+    })
+}
+
+fn save_ssh_config_record(state: &SqliteDbState, config: &SSHSyncConfig) -> Result<(), String> {
+    patch_ssh_config_record(
+        state,
+        &[
+            ("enabled", serde_json::json!(config.enabled)),
+            (
+                "active_connection_id",
+                serde_json::json!(config.active_connection_id),
+            ),
+        ],
+    )
 }
 
 fn load_ssh_connections(state: &SqliteDbState) -> Result<Vec<SSHConnection>, String> {
@@ -188,8 +219,7 @@ pub async fn ssh_save_config(
     }
 
     {
-        let config_data = adapter::config_to_db_value(&config);
-        state.with_conn(|conn| db_put(conn, DbTable::SshSyncConfig, "config", &config_data))?;
+        save_ssh_config_record(&state, &config)?;
 
         // Update file file_mappings
         for mapping in config.file_mappings.iter() {
@@ -216,13 +246,13 @@ pub async fn ssh_save_config(
         session.disconnect().await;
 
         // 清除同步状态，避免残留错误信息
-        let mut config_data = load_ssh_config_record(state.db())?
-            .unwrap_or_else(|| adapter::config_to_db_value(&SSHSyncConfig::default()));
-        if let Some(payload) = config_data.as_object_mut() {
-            payload.insert("last_sync_status".to_string(), serde_json::Value::Null);
-            payload.insert("last_sync_error".to_string(), serde_json::Value::Null);
-        }
-        state.with_conn(|conn| db_put(conn, DbTable::SshSyncConfig, "config", &config_data))?;
+        patch_ssh_config_record(
+            &state,
+            &[
+                ("last_sync_status", serde_json::Value::Null),
+                ("last_sync_error", serde_json::Value::Null),
+            ],
+        )?;
     }
 
     // Emit event to refresh UI
@@ -535,7 +565,16 @@ pub async fn do_full_sync(
     }
     if config.sync_skills {
         log::info!("SSH full sync entering Skills sync stage");
-        if let Err(e) = super::skills_sync::sync_skills_to_ssh(state, session, app.clone()).await {
+        let mut skills_warnings = Vec::new();
+        let skills_result = super::skills_sync::sync_skills_to_ssh_with_warnings(
+            state,
+            session,
+            app.clone(),
+            &mut skills_warnings,
+        )
+        .await;
+        result.warnings.extend(skills_warnings);
+        if let Err(e) = skills_result {
             log::warn!("Skills SSH sync failed: {}", e);
             result.errors.push(format!("Skills sync: {}", e));
             result.success = false;
@@ -797,6 +836,7 @@ async fn sync_file_mappings_with_progress(
         synced_files,
         skipped_files,
         errors,
+        warnings: vec![],
     }
 }
 
@@ -977,6 +1017,7 @@ pub async fn ssh_sync(
             synced_files: vec![],
             skipped_files: vec![],
             errors: vec!["SSH 同步未启用".to_string()],
+            warnings: vec![],
         });
     }
 
@@ -994,6 +1035,7 @@ pub async fn ssh_sync(
             synced_files: vec![],
             skipped_files: vec![],
             errors: vec!["另一个同步操作正在进行中".to_string()],
+            warnings: vec![],
         });
     }
 
@@ -1010,6 +1052,7 @@ pub async fn ssh_sync(
             synced_files: vec![],
             skipped_files: vec![],
             errors: vec![format!("SSH 连接失败: {}", e)],
+            warnings: vec![],
         });
     }
 
@@ -1071,6 +1114,7 @@ pub async fn ssh_get_status(
         last_sync_time: config.last_sync_time,
         last_sync_status: config.last_sync_status,
         last_sync_error: config.last_sync_error,
+        last_sync_warnings: config.last_sync_warnings,
     })
 }
 
@@ -1101,7 +1145,7 @@ async fn backfill_default_file_mappings(
     mut file_mappings: Vec<SSHFileMapping>,
 ) -> Vec<SSHFileMapping> {
     // Bump this number whenever new default file_mappings are added.
-    const CURRENT_DEFAULTS_VERSION: u64 = 15;
+    const CURRENT_DEFAULTS_VERSION: u64 = 17;
     const DEFAULTS_VERSION_BEFORE_AGENT_DIRECTORIES: u64 = 7;
     const DEFAULT_MAPPING_IDS_ADDED_IN_V8: &[&str] = &["opencode-agents"];
     const DEFAULT_MAPPING_IDS_ADDED_IN_V9: &[&str] =
@@ -1124,6 +1168,8 @@ async fn backfill_default_file_mappings(
         "kimi-credentials",
         "kimi-plugins",
     ];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V16: &[&str] = &["omp-agents-dir"];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V17: &[&str] = &["kimi-mcp"];
 
     // Read stored version
     let stored_version: u64 = db
@@ -1179,6 +1225,16 @@ async fn backfill_default_file_mappings(
                 15,
                 &default_mapping.id,
                 DEFAULT_MAPPING_IDS_ADDED_IN_V15,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                16,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V16,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                17,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V17,
             ))
         {
             let mapping_data = adapter::mapping_to_db_value(&default_mapping);
@@ -1489,6 +1545,13 @@ pub async fn resolve_dynamic_paths_with_db(
                         runtime_location::get_kimi_wsl_target_path_async(db, "config.toml").await;
                 }
             }
+            "kimi-mcp" => {
+                if let Ok(path) = runtime_location::get_kimi_mcp_config_path_async(db).await {
+                    mapping.local_path = path.to_string_lossy().to_string();
+                    mapping.remote_path =
+                        runtime_location::get_kimi_wsl_target_path_async(db, "mcp.json").await;
+                }
+            }
             "kimi-prompt" => {
                 if let Ok(path) = runtime_location::get_kimi_prompt_path_async(db).await {
                     mapping.local_path = path.to_string_lossy().to_string();
@@ -1618,6 +1681,18 @@ pub async fn resolve_dynamic_paths_with_db(
                         omp_remote_target_path_from_location(&location, "RULES.md");
                 }
             }
+            "omp-agents-dir" => {
+                if let Ok(location) =
+                    runtime_location::get_oh_my_pi_runtime_location_async(db).await
+                {
+                    mapping.local_path = location
+                        .host_path
+                        .join("agents")
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.remote_path = omp_remote_target_path_from_location(&location, "agents");
+                }
+            }
             "hermes-config" | "hermes-prompt" => {
                 if let Ok((config_dir, _)) =
                     crate::coding::hermes::get_hermes_config_dir_from_db_async(db).await
@@ -1708,24 +1783,27 @@ pub async fn update_sync_status(state: &SqliteDbState, result: &SyncResult) -> R
 
     let now = Local::now().to_rfc3339();
 
-    let mut config_data = load_ssh_config_record(state)?
-        .unwrap_or_else(|| adapter::config_to_db_value(&SSHSyncConfig::default()));
-    if let Some(payload) = config_data.as_object_mut() {
-        payload.insert("last_sync_time".to_string(), serde_json::Value::String(now));
-        payload.insert(
-            "last_sync_status".to_string(),
-            serde_json::Value::String(status),
-        );
-        payload.insert(
-            "last_sync_error".to_string(),
-            error
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null),
-        );
-    }
-    state.with_conn(|conn| db_put(conn, DbTable::SshSyncConfig, "config", &config_data))?;
+    patch_ssh_config_record(
+        state,
+        &[
+            ("last_sync_time", serde_json::json!(now)),
+            ("last_sync_status", serde_json::json!(status)),
+            ("last_sync_error", serde_json::json!(error)),
+        ],
+    )
+}
 
-    Ok(())
+/// Replace the persisted Skills sync warnings. Only the Skills sync chain
+/// calls this so that unrelated silent chains cannot clear or mix warnings
+/// from a different sub-run.
+pub(super) async fn update_sync_warnings(
+    state: &SqliteDbState,
+    warnings: &[String],
+) -> Result<(), String> {
+    patch_ssh_config_record(
+        state,
+        &[("last_sync_warnings", serde_json::json!(warnings))],
+    )
 }
 
 /// Get default file file_mappings for SSH sync
@@ -2184,6 +2262,20 @@ pub fn default_file_mappings() -> Vec<SSHFileMapping> {
             directory_excludes: vec![],
             cleanup_paths: vec![],
         },
+        SSHFileMapping {
+            // Subagents 集中配置渲染出的 `agents/*.md`(`<agentDir>/agents`)。
+            // 目录映射整体镜像,apply/clear applied 都会如实反映到远端。
+            id: "omp-agents-dir".to_string(),
+            name: "Oh My Pi Subagents 目录（agents）".to_string(),
+            module: "oh_my_pi".to_string(),
+            local_path: "~/.omp/agent/agents".to_string(),
+            remote_path: "~/.omp/agent/agents".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: true,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
         // Hermes - runtime config.yaml + authored global prompt.
         SSHFileMapping {
             id: "hermes-config".to_string(),
@@ -2265,6 +2357,19 @@ pub fn default_file_mappings() -> Vec<SSHFileMapping> {
             module: "kimi".to_string(),
             local_path: "~/.kimi-code/config.toml".to_string(),
             remote_path: "~/.kimi-code/config.toml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        // Kimi MCP servers live in <root>/mcp.json (not config.toml).
+        SSHFileMapping {
+            id: "kimi-mcp".to_string(),
+            name: "Kimi Code CLI MCP 配置".to_string(),
+            module: "kimi".to_string(),
+            local_path: "~/.kimi-code/mcp.json".to_string(),
+            remote_path: "~/.kimi-code/mcp.json".to_string(),
             enabled: true,
             is_pattern: false,
             is_directory: false,
@@ -2380,6 +2485,105 @@ fn shell_path_literal(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_sync_status_and_warnings_preserve_both_snapshots() {
+        let state = crate::db::SqliteDbState::in_memory_for_test().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for write_warnings in [true, false] {
+                let state = &state;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    for index in 0..32 {
+                        barrier.wait();
+                        if write_warnings {
+                            runtime
+                                .block_on(super::update_sync_warnings(
+                                    state,
+                                    &[format!("warning-{index}")],
+                                ))
+                                .unwrap();
+                        } else {
+                            runtime
+                                .block_on(super::update_sync_status(
+                                    state,
+                                    &super::SyncResult {
+                                        success: false,
+                                        synced_files: vec![],
+                                        skipped_files: vec![],
+                                        errors: vec![format!("error-{index}")],
+                                        warnings: vec![],
+                                    },
+                                ))
+                                .unwrap();
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        let record = super::load_ssh_config_record(&state).unwrap().unwrap();
+        assert_eq!(
+            record["last_sync_warnings"],
+            serde_json::json!(["warning-31"])
+        );
+        assert_eq!(record["last_sync_error"], "error-31");
+    }
+
+    #[tokio::test]
+    async fn saving_sync_preferences_preserves_latest_skills_warnings() {
+        let state = crate::db::SqliteDbState::in_memory_for_test().unwrap();
+        super::save_ssh_config_record(&state, &super::SSHSyncConfig::default()).unwrap();
+        let mut stale_config = super::adapter::config_from_db_value(
+            super::load_ssh_config_record(&state).unwrap().unwrap(),
+            vec![],
+            vec![],
+        );
+        let warnings = vec!["Keep external skill directory".to_string()];
+        super::update_sync_warnings(&state, &warnings)
+            .await
+            .unwrap();
+        let file_result = super::SyncResult {
+            success: false,
+            synced_files: vec![],
+            skipped_files: vec![],
+            errors: vec!["File sync failed".to_string()],
+            warnings: vec![],
+        };
+        super::update_sync_status(&state, &file_result)
+            .await
+            .unwrap();
+        let synced_record = super::load_ssh_config_record(&state).unwrap().unwrap();
+        stale_config.active_connection_id = "connection-2".to_string();
+        super::save_ssh_config_record(&state, &stale_config).unwrap();
+
+        let reloaded = super::adapter::config_from_db_value(
+            super::load_ssh_config_record(&state).unwrap().unwrap(),
+            vec![],
+            vec![],
+        );
+        assert_eq!(reloaded.active_connection_id, "connection-2");
+        assert_eq!(reloaded.last_sync_warnings, warnings);
+        assert_eq!(
+            reloaded.last_sync_time.as_deref(),
+            synced_record["last_sync_time"].as_str(),
+        );
+        assert_eq!(reloaded.last_sync_status, "error");
+        assert_eq!(
+            reloaded.last_sync_error.as_deref(),
+            Some("File sync failed")
+        );
+
+        super::update_sync_warnings(&state, &[]).await.unwrap();
+        let cleared = super::load_ssh_config_record(&state).unwrap().unwrap();
+        assert_eq!(cleared["last_sync_warnings"], serde_json::json!([]));
+        assert_eq!(cleared["last_sync_status"], "error");
+        assert_eq!(cleared["active_connection_id"], "connection-2");
+    }
+
     use super::{
         codex_config_uses_ai_toolbox_model_catalog, default_file_mappings,
         should_backfill_default_mapping, should_backfill_versioned_mapping,
@@ -2434,6 +2638,42 @@ mod tests {
         assert_eq!(mapping.local_path, "~/.pi/agent/mcp.json");
         assert_eq!(mapping.remote_path, "~/.pi/agent/mcp.json");
         assert!(!mapping.is_directory);
+    }
+
+    #[test]
+    fn omp_agents_dir_default_mapping_is_a_directory() {
+        let mapping = default_file_mappings()
+            .into_iter()
+            .find(|mapping| mapping.id == "omp-agents-dir")
+            .expect("omp-agents-dir default mapping exists");
+
+        assert_eq!(mapping.module, "oh_my_pi");
+        assert!(mapping.is_directory);
+        assert_eq!(mapping.local_path, "~/.omp/agent/agents");
+        assert_eq!(mapping.remote_path, "~/.omp/agent/agents");
+    }
+
+    #[test]
+    fn defaults_backfill_v16_only_adds_omp_agents_dir_for_existing_v15_users() {
+        let ids = ["omp-agents-dir"];
+        assert!(should_backfill_versioned_mapping(
+            15,
+            16,
+            "omp-agents-dir",
+            &ids
+        ));
+        assert!(!should_backfill_versioned_mapping(
+            15,
+            16,
+            "kimi-config",
+            &ids
+        ));
+        assert!(!should_backfill_versioned_mapping(
+            16,
+            16,
+            "omp-agents-dir",
+            &ids
+        ));
     }
 
     #[test]

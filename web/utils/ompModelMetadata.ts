@@ -17,6 +17,12 @@ const PI_EXTENDED_THINKING_LEVELS = new Set<string>(PI_EXTENDED_THINKING_LEVEL_K
 // OMP 模型 `thinking` 结构支持的思考级别词表(不含 off/auto,它们与列表正交)。
 const OMP_THINKING_EFFORT_KEYS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
+/** OMP 思考级别全词表:`off`/`auto` 加 EffortSchema 的 `minimal..max`。
+ *  与后端 `oh_my_pi::commands::OMP_THINKING_LEVEL_KEYS` 一致,用于判定
+ *  `provider/model:level` 里的后缀到底是不是思考级别。 */
+export const OMP_THINKING_LEVEL_KEYS = [...PI_THINKING_LEVEL_KEYS, 'auto'] as const;
+export const OMP_THINKING_LEVELS = new Set<string>(OMP_THINKING_LEVEL_KEYS);
+
 const asRecord = (value: unknown): Record<string, unknown> => (
   value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -202,3 +208,63 @@ export const buildOmpThinkingFromPreset = (
   }
   return thinking;
 };
+
+/** 从模型定义提取支持的思考级别下拉选项列表(含 off 与 auto)。若不支持 reasoning 返回空数组。 */
+export const getOmpModelThinkingLevelOptions = (
+  model: Record<string, unknown> | undefined,
+): Array<{ value: string; label: string }> => {
+  const levels = getOmpModelThinkingLevels(model);
+  if (levels.length === 0) {
+    return [];
+  }
+  const levelSet = new Set(levels);
+  const optionSet = new Set<string>();
+  const options: Array<{ value: string; label: string }> = [];
+  // `off`(关闭思考)是独立于级别区间的选项,恒可作为思考选项。
+  options.push({ value: 'off', label: 'off' });
+  optionSet.add('off');
+  // 标准级别始终打头,再附上模型声明的扩展级别(去重、保序)。
+  for (const levelKey of PI_THINKING_LEVEL_KEYS) {
+    if (levelSet.has(levelKey) && !optionSet.has(levelKey)) {
+      optionSet.add(levelKey);
+      options.push({ value: levelKey, label: levelKey });
+    }
+  }
+  for (const levelKey of levels) {
+    if (levelSet.has(levelKey) && !optionSet.has(levelKey)) {
+      optionSet.add(levelKey);
+      options.push({ value: levelKey, label: levelKey });
+    }
+  }
+  // OMP 支持 `auto`(自动选择思考级别)。
+  options.push({ value: 'auto', label: 'auto' });
+  return options;
+};
+
+/** 从 provider 配置(modelsProvider)中安全提取归一化的模型记录列表。 */
+export const getProviderModelRecords = (
+  providerConfig: Record<string, unknown> | undefined,
+): Array<{ id: string; model: Record<string, unknown> }> => {
+  if (!providerConfig) {
+    return [];
+  }
+  const models = providerConfig.models;
+  if (!Array.isArray(models)) {
+    return [];
+  }
+  return models
+    .map((model) => {
+      if (typeof model === 'string') {
+        return { id: model, model: { id: model } };
+      }
+      if (model && typeof model === 'object' && typeof (model as Record<string, unknown>).id === 'string') {
+        return {
+          id: (model as Record<string, string>).id,
+          model: model as Record<string, unknown>,
+        };
+      }
+      return null;
+    })
+    .filter((entry): entry is { id: string; model: Record<string, unknown> } => !!entry);
+};
+

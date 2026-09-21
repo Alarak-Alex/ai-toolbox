@@ -87,7 +87,7 @@
 - `instructions` 转 system message；`input` string/object/array 都要进入 messages。
 - `message.content` 支持 `input_text`、`output_text`、`input_image`、`refusal`、`compaction`、`compaction_summary`，annotations 从 content 中提取；standalone `input_image` item 要转 user image message，standalone `compaction` / `compaction_summary` item 要转 assistant compact part。
 - `function_call` / `function_call_output`、`custom_tool_call` / `custom_tool_call_output` 都要保留，custom tool 用 `ResponseCustomToolCall` 保留 call_id/name/input。
-- raw-only `input[]` item（例如 hosted/local tool 调用类 item）不能作为空 message 注入中间模型；应只进入 request-scoped raw sidecar，转回 Responses 时再按原顺序恢复。
+- raw-only `input[]` item（例如 hosted/local tool 调用类 item）不能作为空 message 注入中间模型；应只进入 request-scoped raw sidecar，转回 Responses 时再按原顺序恢复。sidecar 要按 IR message 边界定位，再用实际出站 item 数重算 index；assistant/commentary/reasoning 合并后不能直接复用旧 wire index，否则 raw item 会插进下一工具批次。
 - `reasoning` item 要转 assistant reasoning message，并尝试和紧随其后的 function/custom tool/message 合并到同一 assistant message（forward merge）。连续 reasoning item 必须先合并，不能覆盖或丢弃前项。input 末尾或 user 边界前的孤立 trailing reasoning 只允许 append 到**当前 user turn**内已出现的上一 assistant（不得双重追加，也不得再跑一遍 forward merge）；跨过 user boundary 必须重置归属，没有同轮 assistant 时保留 standalone assistant reasoning，不能静默丢弃或挂到更早轮次。input-item 级 `context` 经 `transformer_metadata["openai_responses_reasoning_context"]` 保真；**请求顶层** `reasoning.context`（如 `"all_turns"`）另用 `openai_responses_request_reasoning_context` sidecar。出站写 `reasoning` 时必须 merge `effort` + 顶层 `context`，禁止 `reasoning: { effort }` 覆盖掉 context。
 - `encrypted_content` 必须通过 `encode_signature(OpenAiResponses, ...)` 保存到 `reasoning_signature`；转回 Responses 时通过同 provider marker/heuristic 还原，转 Anthropic/Gemini 时不能泄漏。
 - Response 已承载 output message text/refusal/annotations、function/custom tool call、reasoning、usage、`created_at` / `created`、`previous_response_id`、status finish；`failed -> error`、`incomplete -> length`、tool call completed -> `tool_calls`。
@@ -120,8 +120,8 @@
 - `systemInstruction.parts` 只取非 `thought:true` 文本，并用 `\n` 连接；role `model` 转 assistant，缺省 user。
 - Text part 支持；`thought:true` text 同步写入 `reasoning_content` 与 `reasoning`，`thoughtSignature` 必须通过 `encode_signature(Gemini, ...)` 保存到 `reasoning_signature`。
 - `inlineData` / `fileData` 图片进入 image URL；document 的 inline/file data 进入 `DocumentUrl` 基础映射。video/audio、`responseModalities`、`topK`、logprobs、`safetySettings`、`cachedContent`、`imageConfig` 不承载。
-- `functionCall` 转 tool call，缺 id 时生成 `gemini_synth_<index>`；`functionCall.thoughtSignature` 或 part-level `thoughtSignature` 存入 tool call `transformer_metadata["gemini_thought_signature"]`，转回 Gemini 时优先恢复到同一个 functionCall part，不能移动到错误 tool。
-- `functionResponse` 转 tool message，缺 id 时可从当前请求历史 function call name 回填。
+- `functionCall` 转 tool call，缺 id 时 request/response/SSE 共用带 `gemini_synth_` 前缀的 UUID；不能用 part 下标生成跨轮可重复的身份。原生 ID 保留，签名仍存入 per-tool metadata，转回 Gemini 时恢复到同一个 functionCall part，不能移动到错误 tool。
+- `functionResponse` 转 tool message，显式 ID 优先占用对应调用；无 ID 的同名结果按当前请求内的未完成调用顺序逐个消费，不能使用 `name -> last_id` 或重复借用已完成调用。原生 ID 与匿名结果混合时也须先保留显式配对。
 - Function declarations 支持，schema type 要递归小写化；Google native tools `googleSearch`、`codeExecution`、`urlContext` 要保留。
 - `toolConfig.functionCallingConfig.allowedFunctionNames` 只有在 `mode:"ANY"` 下生效：单个 allowed 转 named，多个 allowed 转 required；`AUTO` 即 auto，`NONE` 即 none。
 - Response 支持 prompt block refusal、所有 candidates -> choices、text、thought text、functionCall、finish reason、usage thought tokens。
@@ -145,7 +145,7 @@
 - 入口：`openai/responses/mod.rs::llm_request_to_responses`、`llm_response_to_responses`，stream target 为 `OpenAiResponses`。
 - Request 输出 `model`、`input`、`instructions`、`max_output_tokens`、temperature、`top_p`、penalty、`service_tier`、`top_logprobs`、`user`、`reasoning.effort`、`stream`、`stop`、`tool_choice`、`tools`、`parallel_tool_calls`、`text.format` / verbosity、`prompt_cache_key`、`extra_body`；`metadata` 只在来源也是 OpenAI Chat/Responses 时作为 OpenAI 原生字段透传，Anthropic `metadata.user_id` 和任意自定义 metadata 只用于转回 Anthropic，不能泄漏到 Responses target。
 - `input` 当前统一输出 array，不保留 AxonHub 的 single string input optimization。
-- system/developer 合并为 `instructions`；user/assistant text/image/refusal/annotations 输出为 message content。
+- system/developer 按 `InstructionPlacement` 汇总为 `instructions`：`MergeToHead` 全部汇总；`PreserveOrder` 只汇总前导连续块，块之后的降级为 `user` 并按其原 index 留在 `input`，不能提进 `instructions`（前缀缓存，见「JSON 请求转换细节」）；user/assistant text/image/refusal/annotations 输出为 message content。
 - Assistant reasoning 输出为 reasoning item；function/custom tool call 与 output 都支持，custom output 通过当前 request 内 call id 判断 item type。
 - 无最终 tools 时清理 `tool_choice` / `parallel_tool_calls` 属于 Gateway runtime outbound adapter 兼容，不属于纯协议结构转换。
 - Tool call item 必须输出 `status:"completed"`。Responses `function_call.id` 是 item id，必须使用 `fc*` 形态；custom tool item id 必须使用 `ctc*` 形态；原始工具调用 id 保留在 `call_id`，不要把 Anthropic/Chat 的 `call_*` 直接写进 Responses item `id`。
@@ -168,6 +168,7 @@
 - 入口：`anthropic/outbound.rs::llm_request_to_anthropic`、`llm_response_to_anthropic`，stream target 为 `AnthropicMessages`。
 - Request 输出 `model`、`messages`、`system`、`max_tokens`、`thinking`、temperature、`top_p`、`stream`、`stop_sequences`、`tool_choice`、`tools`。
 - `max_tokens` 缺失时默认输出 `8192`，避免 Anthropic target 缺必填字段。
+- 该 writer 只接 `MergeToHead`：source 为 Anthropic Messages 时协议相同、走直通不进入本 writer，因此所有 system/developer 都汇总进顶层 `system`（顺序保留、空行连接）。
 - `metadata["user_id"]` 要输出到 Anthropic `metadata.user_id`。
 - 无最终 tools 时清理 `tool_choice` 属于 Gateway runtime outbound adapter 兼容，不属于纯协议结构转换。
 - URL/header/auth/Bedrock/Vertex/LongCat 平台差异不在本模块，由 Gateway runtime target protocol/header/auth 决策负责。
@@ -187,11 +188,13 @@
 - `max_tokens` / `max_completion_tokens`、temperature、`top_p`、presence/frequency penalty、`seed`、`stopSequences` 支持。
 - `reasoning_effort` 输出 `thinkingConfig`，支持 none/minimal/low/medium/high/xhigh，并通过 `shared/thinking_config.rs` 做 effort ↔ budget 映射。Gemini 2.x target 输出 `thinkingBudget` 且预算上限为 24576；Gemini 3 target 输出 `thinkingLevel`，不同时输出 `thinkingBudget`，其中 `xhigh`/`max` 降级为 Gemini 支持的 `high`。
 - `thoughtSignature` 仅从 Gemini marker/heuristic 或 per-tool metadata 还原；当 Gemini target 存在 reasoning thought 或 functionCall 但没有有效 Gemini signature 时，按 AxonHub 兼容策略补 `DEFAULT_GEMINI_THOUGHT_SIGNATURE` 到第一条适用 thought/functionCall part。不能把 Anthropic/OpenAI 私有签名写入 Gemini `thoughtSignature`。
+- 默认 Gemini signature 是兼容占位，不代表真实签名绑定。runtime/隐私层需要区分它时，必须复用此模块导出的同一常量，不能复制字符串或把任意 signature 都视为可改写；策略和原值映射仍留在 runtime。
 - `response_format` json_schema/json_object 输出 `responseMimeType` / `responseJsonSchema`；不要把完整 JSON Schema 写到 Gemini SDK 旧 `responseSchema` 字段。
 - system/developer 输出 `systemInstruction`；user/assistant/tool role 映射。
 - Text 和 reasoning thought text 支持；image data URL -> `inlineData`，普通 image URL -> `fileData.fileUri`，document data URL / regular URL -> `inlineData` / `fileData`。
 - video/audio、modalities、`imageConfig`、`safetySettings`、`topK`、logprobs、`responseLogprobs` 不承载。
-- Tool call 输出 `functionCall`；tool result 输出 `functionResponse`，并可根据前序 tool call id 找 name。
+- Tool call 输出 `functionCall`；tool result 输出 `functionResponse`，并可根据前序 tool call id 找 name。连续 IR tool messages 必须归为同一个 user content，Gemini 2.x marker/inline media 与 Gemini 3.x nested media 保持各自结果的归属。
+- 本地合成 ID 不发回 Gemini；移除前按调用顺序排列整批结果，避免同名工具逆序完成时交换结果。普通 Gemini 原生 ID 保留且不重排结果。Vertex 移除全部 ID 的 provider 决策及等价排序属于 runtime，不能把 provider 配置下沉本模块。
 - Function declarations、`parameters` / `parametersJsonSchema` 双路径和 Google native tools 支持；tool choice `NONE` / `ANY` / `allowedFunctionNames` 支持。转 Gemini target 时缺失或空对象 tool schema 必须输出 `{ "type": "object", "properties": {} }`；普通 Gemini Schema 可写 `parameters`，含 `$defs`、`additionalProperties`、`oneOf`、`const` 等 JSON Schema 关键字的富 schema 必须写 `parametersJsonSchema` 并移除顶层/嵌套 `$schema`。
 - Response 输出所有 choices -> candidates，支持 text/thought/tool call/finish/usage。
 - Gemini source stream 显式空字符串 `responseId` 视为 invalid response 并输出目标协议错误事件；缺失 `responseId` 的 usage-only chunk 仍可作为终止兜底处理。
@@ -202,9 +205,14 @@
 - Anthropic `system` 转 OpenAI Chat `system` message，转 Responses `instructions`，转 Gemini `systemInstruction.parts[].text`。
 - Anthropic 入站 `system` 如果是 array，要在 request-scoped `transformer_metadata` 中记录 array instructions marker；同一次 IR 出站回 Anthropic 时必须继续输出 array `system`，string system 仍输出 string。这个 marker 只在本次转换内有效，不能期望经 OpenAI Responses JSON 的 `instructions` 字符串再恢复原 Anthropic array shape。
 - Claude Code 可能在 Anthropic `system` 开头注入动态 `x-anthropic-billing-header:` 行；转换到非 Anthropic 目标前必须只剥离开头这一个动态 attribution 行，并保留后续稳定 prompt 文本。不要删除非开头位置的同名文本，避免误删用户内容。
-- 转 OpenAI Chat target 时，多个 `system` / `developer` 消息必须合并并移动到首条 system。cc-switch 对 Anthropic->Chat 和 Responses->Chat 都这样做，第三方 Chat 兼容接口更容易接受单首位 system，而不是多条或中途 system。
+- 转 OpenAI Chat target 时，instruction 消息（`system` / `developer`）的位置由 `shared/system_messages.rs::InstructionPlacement` **按转换来源方向**决定，不要在调用点自行拼装规则：
+  - `MergeToHead`（非 Anthropic 来源，含同协议直通 body）：**所有** instruction 消息合并到首条 system（`\n\n` 连接）——Codex（Responses 来源）的 `developer` 身份/指令块跨轮稳定，合并既保住"上游只接受单首位 system"的兼容性，也不破坏前缀缓存；cc-switch `transform_codex_chat.rs` 的 `collapse_system_messages_to_head` 就是无条件这样做。缺失文本的 instruction 消息原位保留，纯空白文本仍随消息丢弃（与旧实现一致）。
+  - `PreserveOrder`（Anthropic Messages 来源，即 Claude Code）：只有**前导连续**块合并到首条；块之后的 instruction 消息保持原 index、role 降级成 `user`、内容不动。Claude Code 每轮在对话尾部追加逐轮变化的 `role:"system"` 提醒（如 `<total_tokens>N tokens left</total_tokens>`），提到首条会让首条每轮变长、上游前缀缓存整段失效（issue #356：命中率 7.7%，同链路 Codex 98.4%）。
+  - 门控依据是"来源方向"而不是 CLI 名：Anthropic Messages 在本网关是 Claude Code 的入站协议，也是唯一由客户端在会话中途追加 `system` 注解的协议。cc-switch 同样按方向分裂（Anthropic->Chat 自 `b724f5dd revert(proxy): drop Anthropic system-message hoisting (#3775)` 起不再合并，其 release notes 记录合并期命中率 99%→20%，回归测试 `test_anthropic_to_openai_preserves_mid_conversation_system_in_place` 直接点名 `<total_tokens>`；Responses->Chat 继续无条件合并）；AxonHub 从另一侧得到同一结论（Chat 出站 1:1，Anthropic/Responses 出站照旧合并，另用 `llm/pipeline/cc/system_messages.go` 只对 Claude Code 客户端把前导块之后的 system 原位降级为 `user`）。"cc-switch 也把 Anthropic 的 system 合并到首条"是已过时说法，不要再用作依据。
+  - transformer 侧用 `placement_for_api_format(request.api_format)`，runtime 侧用 `placement_for_protocol(conversion_route.source)`（无转换即直通 body：`MergeToHead`）；两边必须复用同一实现，不要各自重新实现。
 - OpenAI Responses `instructions` 不一定只是一段字符串；数组形态要按 text parts 合并为 system 文本，不能因为 `as_str()` 失败而丢失 Codex instructions。
-- OpenAI Chat `system` 和 `developer` 都汇总到 Anthropic `system` 或 Responses `instructions`，顺序保留，用空行连接。
+- OpenAI Chat `system` 和 `developer` 汇总到 Anthropic `system` 或 Responses `instructions` 时按同一 `InstructionPlacement` 规则处理（见下节「JSON 请求转换细节」）：`MergeToHead` 全部汇总、顺序保留、用空行连接；`PreserveOrder` 只取前导连续块，块之后的 instruction 消息降级为 `user` 留在原位（Responses 在 `input`，Anthropic 走既有 role 映射）。三者共用 `shared/system_messages.rs` 的 `instruction_hoist_plan` / `downgrade_instruction_message`。
+- Anthropic target 实际只会收到 `MergeToHead`：`conversion_route()` 只在 source != target 时创建，所以 Anthropic Messages 来源走同协议直通，不会进入 `llm_request_to_anthropic`。
 - Anthropic `messages[].content` 支持 string 和 block array；OpenAI/Gemini 转入时统一输出 Anthropic block array。
 - 文本映射：
   - Anthropic `text` <-> Chat text / Responses `input_text`、`output_text` / Gemini `parts[].text`。
@@ -222,13 +230,14 @@
   - Anthropic `any` <-> OpenAI/Responses `required`；入站要同时兼容 `{ "type": "any" }` 和字符串 `"any"`，对齐 cc-switch。
   - Anthropic `{type:"tool", name}` <-> Chat `{type:"function", function:{name}}` <-> Responses `{type:"function", name}` <-> Gemini `allowedFunctionNames`。
 - 工具调用与工具结果：
+  - Responses 同一 turn 的 function/custom call、assistant commentary 与 reasoning 必须归为同一个 IR assistant；文本可在调用前、中、后出现，不能以 assistant 文本为边界再次拆开工具批次（issue #352）。普通调用与 reasoning forward merge 共用归并入口，保留内容且 reasoning 不重复追加。tool output、非 assistant 消息、独立输入、raw-only item 和 compaction 结束 turn；不跨轮归并，也不按工具名去重或重写原始 call_id。
   - Anthropic `tool_use` <-> Chat `tool_calls` / legacy `function_call` <-> Responses `function_call` <-> Gemini `functionCall`。
   - Anthropic `tool_result` <-> Chat `role:"tool"` <-> Responses `function_call_output` <-> Gemini `functionResponse`。
   - Anthropic 单条 user message 内允许多个 `tool_result` 和后续普通 text/image；入站不能在第一个 tool_result 处提前返回，出站应把连续 tool results 合并回同一个 Anthropic user content，保留 `cache_control` / `is_error`。
   - Responses `custom_tool_call` / `custom_tool_call_output` 必须和 Chat 兼容扩展 `responses_custom_tool` 双向保真；同一 request 内用前序 custom call id 判断后续 tool output 类型，不做跨请求影子状态。
   - Codex Responses 转第三方 OpenAI Chat 时，只有请求实际包含 `tool_search`、顶层 namespace 或历史 `tool_search_output` 才启用 cc-switch 风格 request-scoped context：暴露 `tool_search` 为普通 Chat function，把 `namespace` 子工具展平成 `namespace__tool` 名称，并把同请求 custom tool 包装成 `{input:string}` function；Chat 响应和 SSE 必须用同一 context 还原为 Responses `tool_search_call`、带 `namespace` 的 `function_call` 或 `custom_tool_call`。custom-only 请求继续使用通用 Chat 兼容扩展 `responses_custom_tool`。不要只做请求侧展平，否则 Codex 后续工具结果会丢 namespace/type；也不要无条件启用完整 context，否则 custom-only roundtrip 会被静默降级。
   - Responses `function_call` 还原到 Anthropic `tool_use` 时，对 `Read` 工具的空字符串 `pages` 参数做窄清理，删除 `pages:""`。这是 cc-switch 为 Claude/Codex 历史工具参数做的兼容，不能扩展成全局空字段删除。
-  - Gemini 缺少 functionCall id 时生成 `gemini_synth_<index>`；转回 Gemini 时不会把这个 synthetic id 作为真实 id 发上游。
+  - Gemini 缺少 functionCall id 时生成带 `gemini_synth_` 前缀的唯一 UUID；转回 Gemini 前按调用顺序排列无原生 ID 的结果，再移除合成 ID，不能把它当成真实上游身份。
   - Gemini `functionResponse.name` 和缺失的 id 通过同一请求里的历史 functionCall 做 best-effort 补全；没有历史时用 id/name fallback。Transformer 不做跨请求影子状态；runtime `GeminiShadowStore` 可在转换前后记录/回放带 `thoughtSignature` 的上一轮 model functionCall。
 - Reasoning 映射：
   - Chat `reasoning` / `reasoning_content`、Responses `reasoning.summary[].text`、Anthropic `thinking`、Gemini `thought: true` 文本互转。
@@ -314,6 +323,7 @@
 - OpenAI Chat -> Gemini：
   - `delta.tool_calls[].function.arguments` 不能按碎片直接输出 Gemini `functionCall.args`。Gemini target 必须按 tool index 暂存 id/name/arguments，只有参数已是完整 JSON 时才输出 `functionCall`；若 finish reason 是 `tool_calls`，再把剩余 tool call flush，空参数输出 `{}`，仍无法解析的参数按 `{}` 兜底。
   - 这个行为对齐 AxonHub Gemini inbound stream：Gemini 客户端期望每个 streamed `functionCall` part 带完整 args object，不支持 OpenAI/Anthropic 那种 partial argument delta。
+  - finish 没有 usage 时暂存 reason，等后续 `choices:[]` usage-only 事件再发唯一 Gemini finish；正常 EOF 没有用量时保留原 reason（如 length -> MAX_TOKENS），不能改成 STOP。等待期间遇到 error 只发错误，不先提交成功终态；完成后重复 terminal/内容不再输出。回归见 `chat_stream_to_gemini_waits_for_usage_only_chunk_before_finish` 和 `chat_stream_to_gemini_without_usage_preserves_eof_reason_or_late_error`。
 - Responses -> Chat：
   - `response.created` -> Chat role delta。
   - `response.output_text.delta` -> Chat content delta。
@@ -335,7 +345,7 @@
   - function_call item/delta -> Anthropic tool_use block + input_json_delta。
   - `response.completed` 有 tool call 时 stop reason 为 `tool_use`，否则 `end_turn`。
 - Gemini -> Anthropic：
-  - Gemini stream chunks 可能发送累计文本，本模块按前缀差值输出 Anthropic `text_delta`。
+  - Gemini stream chunks 可能发送累计文本，仅严格增长且前缀匹配时取差值；相同连续文本必须保留为 delta，避免丢字或破坏占位符。普通文本与 reasoning 共用此约束，回归见 `gemini_stream_preserves_identical_deltas_and_accepts_growing_snapshots`。这是既有累计兼容规则，不能宣称可无歧义识别所有混合流。
   - Gemini `thoughtSignature` 不能转成 Anthropic `signature_delta`。
   - `functionCall` 在 finish 时输出 Anthropic tool_use block；缺 id 时使用 synthetic id。
   - blocked prompt 在 finish 时输出 refusal 文本。
@@ -390,6 +400,8 @@
 
 ## 回归测试规则
 
+- 工具调用回归必须断言完整的调用/结果顺序和配对：每条 Chat assistant 的所有调用只能被后续连续 tool 消息各回答一次，再进入下一普通消息；Gemini 同批结果必须在同一 user content。只检查 result 数量、ID 集合或 JSON shape 会漏掉“所有数据仍在但批次被拆散”的错误。保留同名不同 ID、匿名/混合 ID、逆序结果与媒体、commentary/reasoning 各位置、custom/namespace/tool search、跨轮与 raw 边界，以及 JSON/SSE -> 下一轮请求的矩阵和真实 HTTP 测试。
+- Gemini source SSE 的工具身份使用流级 index，不能重用每个 chunk 的 part 下标。只有同一非空原生 ID 证明是同一调用快照；无 ID、同名或参数相同均不足以去重。`gemini/stream.rs::merge_gemini_function_call_part` 同时服务转换与 runtime forced SSE 聚合，保留同 ID 更新的参数/签名。正常 SSE 只暂存工具快照到 finish/EOF，文本/reasoning 即时转换；源错误终态后不能在 EOF 补发暂存工具。
 - 以后任何协议转换问题，无论来自开发自测、review、真实 provider 验证还是用户反馈，都必须在同一任务内补一个最贴近失败模式的回归测试；没有测试不能宣称修复完成。
 - 外部 provider 返回 shape 导致的问题优先沉淀为 `fixtures/live_provider/` 或更小的脱敏 fixture；转换器逻辑问题优先补精确单元断言；SSE 状态机问题必须补 stream fixture 或逐事件断言。
 - 真实 provider fixture 不得包含 API key、Authorization header、query key 或用户敏感输入；动态 id/timestamp 可以稳定化，但必须保留能触发问题的协议结构、finish/status、usage 和 content/reasoning 字段。
@@ -398,6 +410,7 @@
 ## 最小验证
 
 - 修改 JSON 转换、SSE parser、stream state、统一模型或 transformer 后至少跑 `cd tauri && cargo test transformer --no-default-features`。
+- 修改 Responses 工具历史后还要跑 `cd tauri && cargo test --test coding proxy_gateway --jobs 2`；该黑盒集合同时覆盖公开转换 API 和真实网关 HTTP 收发，包括 previous-response/部分历史补全与日志设置独立性。
 - 修改 route/path/header/auth 编排后额外跑 `cd tauri && cargo test proxy_gateway::runtime::upstream` 和 `cd tauri && cargo test proxy_gateway::runtime::providers`。
 - 大范围协议转换改动交付前按根规则跑 `cd tauri && cargo test`；若同时改前端 provider 表单/i18n，再跑 `pnpm test`、`pnpm exec tsc --noEmit` 和 i18n check。
 

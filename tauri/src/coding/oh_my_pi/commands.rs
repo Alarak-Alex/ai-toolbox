@@ -20,7 +20,10 @@ use crate::db::SqliteDbState;
 use tauri::{Emitter, Runtime};
 
 /// OMP 思考级别白名单(OMP 支持 `auto`,比 Pi 多一个)。
-const OMP_THINKING_LEVEL_KEYS: [&str; 8] = [
+/// OMP 思考级别词表:`off`/`auto` 加 EffortSchema 的 `minimal..max`。
+/// 既用于校验全局 `defaultThinkingLevel`,也用于判定 `modelRoles` 值里的
+/// `:level` 后缀是否真的是思考级别(见 `agents::parse_role_string`)。
+pub(crate) const OMP_THINKING_LEVEL_KEYS: [&str; 8] = [
     "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto",
 ];
 const OMP_MODEL_ROLE_KEY: &str = "default";
@@ -133,7 +136,7 @@ pub async fn get_omp_prompt_path_async(db: &SqliteDbState) -> Result<PathBuf, St
     ))
 }
 
-fn read_yaml_object_or_empty(path: &Path) -> Result<Value, String> {
+pub(crate) fn read_yaml_object_or_empty(path: &Path) -> Result<Value, String> {
     if !path.exists() {
         return Ok(Value::Object(Map::new()));
     }
@@ -153,7 +156,7 @@ fn read_yaml_object_or_empty(path: &Path) -> Result<Value, String> {
     }
 }
 
-fn write_yaml_object(path: &Path, value: &Value) -> Result<(), String> {
+pub(crate) fn write_yaml_object(path: &Path, value: &Value) -> Result<(), String> {
     if !value.is_object() {
         return Err(format!(
             "{} must be written as a YAML mapping",
@@ -171,7 +174,7 @@ fn write_yaml_object(path: &Path, value: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn object_mut(value: &mut Value) -> Result<&mut Map<String, Value>, String> {
+pub(crate) fn object_mut(value: &mut Value) -> Result<&mut Map<String, Value>, String> {
     value
         .as_object_mut()
         .ok_or_else(|| "Expected a mapping object".to_string())
@@ -810,9 +813,9 @@ pub async fn save_omp_other_settings(
 }
 
 #[tauri::command]
-pub async fn save_omp_models_provider(
+pub async fn save_omp_models_provider<R: tauri::Runtime>(
     state: tauri::State<'_, SqliteDbState>,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
     input: OmpModelsProviderInput,
 ) -> Result<OmpRuntimeConfig, String> {
     let provider_key = input.provider_key.trim();
@@ -1253,6 +1256,40 @@ mod tests {
         });
         normalize_omp_provider_for_omptype(&mut provider);
         assert_eq!(provider["models"][0].get("thinking"), None);
+    }
+
+    #[test]
+    fn normalize_omptype_thinking_mode_covers_full_api_vocabulary() {
+        // Mirrors the 9 legal `api` values of omp's models.yml `ApiSchema`;
+        // mode inference must match each wire protocol family or the whole
+        // models.yml validation fails.
+        let cases: [(&str, &str); 9] = [
+            ("openai-completions", "effort"),
+            ("openai-responses", "effort"),
+            ("openai-codex-responses", "effort"),
+            ("azure-openai-responses", "effort"),
+            ("anthropic-messages", "anthropic-adaptive"),
+            ("bedrock-converse-stream", "anthropic-adaptive"),
+            ("google-generative-ai", "google-level"),
+            ("google-gemini-cli", "google-level"),
+            ("google-vertex", "google-level"),
+        ];
+        for (api, expected_mode) in cases {
+            let mut provider = json!({
+                "api": api,
+                "models": [
+                    { "id": "a", "reasoning": true, "thinking": { "efforts": ["low", "high"] } }
+                ]
+            });
+            normalize_omp_provider_for_omptype(&mut provider);
+            assert_eq!(
+                provider["models"][0]["thinking"]["mode"],
+                json!(expected_mode),
+                "api {} should infer thinking mode {}",
+                api,
+                expected_mode
+            );
+        }
     }
 
     #[test]

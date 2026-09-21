@@ -2113,8 +2113,8 @@ pub async fn skills_clear_git_cache(app: tauri::AppHandle) -> Result<usize, Stri
 
 #[tauri::command]
 pub async fn skills_get_git_cache_path(app: tauri::AppHandle) -> Result<String, String> {
-    use tauri::Manager;
-    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    let _ = app;
+    let cache_dir = crate::app_paths::resolved_cache_dir();
     let cache_path = cache_dir.join("skills-git-cache");
     if !cache_path.exists() {
         std::fs::create_dir_all(&cache_path).map_err(|e| e.to_string())?;
@@ -2701,7 +2701,8 @@ async fn preflight_inventory_tool_sync(
         .await
         .map_err(|e| format_error(e))?;
     let target = tool_root.join(&skill.name);
-    let force_copy = tool.eq_ignore_ascii_case("cursor") || runtime_adapter.force_copy;
+    let force_copy =
+        crate::coding::tools::builtin_tool_forces_skill_copy(tool) || runtime_adapter.force_copy;
     validate_skill_sync_target(source_path, &target, force_copy).map_err(format_error)
 }
 

@@ -54,6 +54,7 @@ import {
   reorderGrokProviders,
   type GrokDeviceAuthStartResult,
 } from '@/services/grokApi';
+import { useProviderSharing } from '@/features/coding/shared/providerShare';
 import { grokPromptApi } from '@/services/grokPromptApi';
 import { refreshTrayMenu, hasAllApiHubExtension } from '@/services/appApi';
 import { useKeepAlive } from '@/components/layout/KeepAliveOutlet';
@@ -98,6 +99,7 @@ import {
   getGatewayProviderApiFormatFromMeta,
   getGatewayProviderProfilesVersion,
   openAiApiFormatFromBaseUrl,
+  resolveGatewayReengageMode,
   saveProviderWithGatewayReengage,
   subscribeGatewayProviderProfiles,
 } from '@/features/coding/shared/gateway';
@@ -202,6 +204,7 @@ let rememberedGrokSessionSourceMode: SessionSourceMode = 'all';
 
 const GrokPage: React.FC = () => {
   const { t } = useTranslation();
+  const { shareProvider, shareModal } = useProviderSharing('grok', () => loadConfig());
   const { isActive } = useKeepAlive();
   const {
     sidebarHiddenByPage,
@@ -607,11 +610,13 @@ const GrokPage: React.FC = () => {
     await saveGrokProviderCatalogWithGatewayReengage({
       provider,
       settingsConfig,
-      gatewayMode: gatewayCliStatus?.mode,
+      gatewayMode: resolveGatewayReengageMode(gatewayCliStatus),
       updateProvider: updateGrokProvider,
       restoreDirect: () => restoreProxyGatewayCliDirect('grok'),
       engageSingle: () => engageProxyGatewaySingle('grok', provider.id),
       engageFailover: () => engageProxyGatewayFailover('grok'),
+      // No `engageAggregate`: aggregate mode is Codex-only, so this CLI can
+      // never report it and the re-engage helper would reject the replay.
       onGatewayStatusChange: setGatewayCliStatus,
     });
     await loadConfig(true);
@@ -1539,16 +1544,18 @@ const GrokPage: React.FC = () => {
 
       let savedProviderId = isLocalTemp ? GROK_LOCAL_PROVIDER_ID : '';
       let savedProvider: GrokProvider | null = null;
-      const gatewayModeBeforeSave = gatewayCliStatus?.mode;
+      const gatewayModeBeforeSave = resolveGatewayReengageMode(gatewayCliStatus);
       const shouldReengageGatewayProxy =
         Boolean(editingProvider && !isCopyMode && !isLocalTemp && editingProvider.isApplied) &&
-        (gatewayModeBeforeSave === 'single' || gatewayModeBeforeSave === 'failover');
+        gatewayModeBeforeSave !== null;
 
       await saveProviderWithGatewayReengage({
         gatewayMode: shouldReengageGatewayProxy ? gatewayModeBeforeSave : null,
         restoreDirect: () => restoreProxyGatewayCliDirect('grok'),
         engageSingle: () => engageProxyGatewaySingle('grok', savedProviderId),
         engageFailover: () => engageProxyGatewayFailover('grok'),
+        // No `engageAggregate`: aggregate mode is Codex-only, so this CLI can
+        // never report it and the re-engage helper would reject the replay.
         onGatewayStatusChange: setGatewayCliStatus,
         saveProvider: async () => {
           if (isLocalTemp) {
@@ -1966,6 +1973,7 @@ const GrokPage: React.FC = () => {
                                 onEdit={handleEditProvider}
                                 onDelete={handleDeleteProvider}
                                 onCopy={handleCopyProvider}
+                                onShare={shareProvider}
                                 onTest={handleTestProvider}
                                 onSelect={handleSelectProvider}
                                 onToggleDisabled={handleToggleDisabled}
@@ -2358,6 +2366,8 @@ const GrokPage: React.FC = () => {
           )}
         </Modal>
       </div>
+
+      {shareModal}
     </SectionSidebarLayout>
   );
 };

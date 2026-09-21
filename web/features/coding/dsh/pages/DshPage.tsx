@@ -1,4 +1,5 @@
 import React from 'react';
+import { useProviderSharing } from '@/features/coding/shared/providerShare';
 import AllApiHubIcon from '@/components/common/AllApiHubIcon';
 import {
   Alert,
@@ -382,6 +383,7 @@ const resolveDshFavoriteProviderPayload = (
 
 const DshPage: React.FC = () => {
   const { t } = useTranslation();
+  const { shareProvider, shareModal } = useProviderSharing('dsh', () => loadConfig());
   const { sidebarHiddenByPage, setSidebarHidden } = useSettingsStore();
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
@@ -1724,6 +1726,14 @@ const DshPage: React.FC = () => {
         models={modelDisplayList}
         onEdit={() => openProviderModal(provider)}
         onCopy={() => openProviderModal(provider, { copy: true })}
+        onShare={() => shareProvider({
+          id: provider.providerKey, name: provider.displayName, category: 'custom',
+          settingsConfig: JSON.stringify({ ...providerConfig, api: provider.api ?? providerConfig.api,
+            models: getDshModelRecords(provider).map((entry) => ({ ...entry.model, id: entry.id })) }),
+          credential: provider.apiKey,
+          credentialUnavailable: (provider.credentialExists || Boolean(provider.apiKeyEnv)) && !provider.apiKey,
+          defaultModel: provider.isDefault ? runtimeConfig?.modelSettings.model ?? undefined : undefined,
+        })}
         onDelete={!isBuiltInChannel && (hasCredential || hasProviderConfig)
           ? () => handleDeleteSupplier(provider)
           : undefined}
@@ -2098,12 +2108,16 @@ const DshPage: React.FC = () => {
             data-dsh-sidebar-section="true"
             data-sidebar-title={t('dsh.prompt.title', { defaultValue: '全局提示词' })}
           >
-            {!agentInstructionsEnabled && (
+            {!agentInstructionsEnabled ? (
               <Alert
                 type="warning"
                 showIcon
                 style={{ marginBottom: 12 }}
                 message={t('dsh.agentInstructions.disabledWarning')}
+                // One fact, one key, two render positions: the scope note also
+                // shows below when the toggle is already on, because a user who
+                // enabled it still needs to know the Web surface is not covered.
+                description={t('dsh.agentInstructions.scopeNote')}
                 action={
                   <Button
                     size="small"
@@ -2115,6 +2129,10 @@ const DshPage: React.FC = () => {
                   </Button>
                 }
               />
+            ) : (
+              <div className={styles.agentInstructionsScope}>
+                {t('dsh.agentInstructions.scopeNote')}
+              </div>
             )}
             <GlobalPromptSettings
               translationKeyPrefix="dsh.prompt"
@@ -2448,6 +2466,8 @@ const DshPage: React.FC = () => {
                 defaultValue: 'DSh Web UI 未运行。启动 dsh web 服务后,稍后再次点击"打开 Web UI"。',
               })}
         </Modal>
+
+        {shareModal}
       </SectionSidebarLayout>
     </Spin>
   );

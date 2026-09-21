@@ -30,7 +30,8 @@ import {
   getProxyGatewayProviderStats,
   getProxyGatewayUsageSummary,
   getProxyGatewayUsageTrends,
-  type GatewayCliKey,
+  type GatewayUsageTool,
+  GATEWAY_USAGE_TOOLS,
   type GatewayModelStats,
   type GatewayProviderStats,
   type GatewayUsageSummary,
@@ -45,6 +46,7 @@ import {
   formatInteger,
   formatUsd,
   getGatewayRequestsPerMinute,
+  GATEWAY_USAGE_RANGE_PRESETS,
   resolveGatewayUsageRange,
   type GatewayUsageRangePreset,
   type GatewayUsageRangeSelection,
@@ -55,9 +57,9 @@ import styles from './GatewayStatisticsView.module.less';
 
 const { RangePicker } = DatePicker;
 
-type GatewayCliFilter = 'all' | GatewayCliKey;
+type GatewayCliFilter = 'all' | GatewayUsageTool;
 type StatsTabKey = 'providers' | 'models';
-type TrendSeriesKey = 'input' | 'output' | 'cache' | 'cost';
+type TrendSeriesKey = 'input' | 'output' | 'cache' | 'other' | 'cost';
 
 interface GatewayStatisticsViewProps {
   refreshKey?: number;
@@ -78,14 +80,13 @@ const emptyState: StatisticsState = {
   modelStats: [],
 };
 
-const cliOptions: GatewayCliFilter[] = ['all', 'claude', 'claude_desktop', 'codex', 'grok', 'kimi', 'gemini', 'opencode'];
-const rangeOptions: GatewayUsageRangePreset[] = ['today', '1d', '7d', '14d', '30d', 'custom'];
-const trendSeriesKeys: readonly TrendSeriesKey[] = ['input', 'output', 'cache', 'cost'];
+const cliOptions: GatewayCliFilter[] = ['all', ...GATEWAY_USAGE_TOOLS];
+const trendSeriesKeys: readonly TrendSeriesKey[] = ['input', 'output', 'cache', 'other', 'cost'];
 const trendCurveType = 'monotoneX' as const;
 const dateOnlyBucketPattern = /^(\d{4})-(\d{2})-(\d{2})$/;
 const dateTimeBucketPattern = /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})/;
 
-const toCliKey = (value: GatewayCliFilter): GatewayCliKey | undefined =>
+const toCliKey = (value: GatewayCliFilter): GatewayUsageTool | undefined =>
   value === 'all' ? undefined : value;
 
 const statusColor = (rate: number) => {
@@ -132,6 +133,7 @@ const chartData = (trends: GatewayUsageTrendPoint[]) =>
       label: formatTrendDateLabel(item.date),
       input: item.input_tokens,
       output: item.output_tokens,
+      other: Math.max(0, item.total_tokens - item.input_tokens - item.output_tokens - item.cache_read_tokens - item.cache_creation_tokens),
       cache: item.cache_read_tokens + item.cache_creation_tokens,
       cost: Number.parseFloat(item.total_cost_usd) || 0,
     };
@@ -156,7 +158,7 @@ const providerDisplayName = (
 
 const providerDisplayMeta = (
   t: ReturnType<typeof useTranslation>['t'],
-  cliKey: GatewayCliKey,
+  cliKey: GatewayUsageTool,
   providerId: string,
 ) => {
   const cliLabel = t(`settings.gateway.cli.${cliKey}`);
@@ -320,13 +322,6 @@ const GatewayStatisticsView: React.FC<GatewayStatisticsViewProps> = ({ refreshKe
       render: (value: number | null) => formatCacheHitRate(value),
     },
     {
-      title: t('gateway.page.statistics.columns.cost'),
-      dataIndex: 'total_cost_usd',
-      width: 120,
-      align: 'right',
-      render: (value: string) => formatUsd(value, 6),
-    },
-    {
       title: t('gateway.page.statistics.columns.successRate'),
       dataIndex: 'success_rate',
       width: 110,
@@ -341,6 +336,13 @@ const GatewayStatisticsView: React.FC<GatewayStatisticsViewProps> = ({ refreshKe
       width: 110,
       align: 'right',
       render: (value: number | null) => value == null ? '-' : formatDuration(value),
+    },
+    {
+      title: t('gateway.page.statistics.columns.cost'),
+      dataIndex: 'total_cost_usd',
+      width: 120,
+      align: 'right',
+      render: (value: string) => formatUsd(value, 6),
     },
   ];
 
@@ -372,11 +374,20 @@ const GatewayStatisticsView: React.FC<GatewayStatisticsViewProps> = ({ refreshKe
       render: (value: number) => formatCompactInteger(value),
     },
     {
-      title: t('gateway.page.statistics.columns.cost'),
-      dataIndex: 'total_cost_usd',
+      title: <span title={t('gateway.page.statistics.cacheHitRateHint')}>{t('gateway.page.statistics.columns.cacheHitRate')}</span>,
+      dataIndex: 'cache_hit_rate',
       width: 120,
       align: 'right',
-      render: (value: string) => formatUsd(value, 6),
+      render: (value: number | null) => formatCacheHitRate(value),
+    },
+    {
+      title: t('gateway.page.statistics.columns.successRate'),
+      dataIndex: 'success_rate',
+      width: 110,
+      align: 'right',
+      render: (value: number | null) => value == null ? '-' : (
+        <span style={{ color: statusColor(value) }}>{value.toFixed(1)}%</span>
+      ),
     },
     {
       title: t('gateway.page.statistics.columns.latency'),
@@ -384,6 +395,13 @@ const GatewayStatisticsView: React.FC<GatewayStatisticsViewProps> = ({ refreshKe
       width: 110,
       align: 'right',
       render: (value: number | null) => value == null ? '-' : formatDuration(value),
+    },
+    {
+      title: t('gateway.page.statistics.columns.cost'),
+      dataIndex: 'total_cost_usd',
+      width: 120,
+      align: 'right',
+      render: (value: string) => formatUsd(value, 6),
     },
   ];
 
@@ -423,7 +441,7 @@ const GatewayStatisticsView: React.FC<GatewayStatisticsViewProps> = ({ refreshKe
             className={styles.filterSelect}
             popupMatchSelectWidth={false}
             value={range.preset}
-            options={rangeOptions.map((option) => ({
+            options={GATEWAY_USAGE_RANGE_PRESETS.map((option) => ({
               value: option,
               label: t(`gateway.page.statistics.range.${option}`),
             }))}
@@ -488,6 +506,7 @@ const GatewayStatisticsView: React.FC<GatewayStatisticsViewProps> = ({ refreshKe
       </div>
 
       <GatewayUsageOverview summary={state.summary} requestsPerMinute={requestRate} />
+      <p className={styles.usageNote}>{t('gateway.page.requests.nativeUsage.overviewHint')}</p>
 
       <section className={styles.chartPanel}>
         <div className={styles.panelHeader}>
@@ -585,6 +604,19 @@ const GatewayStatisticsView: React.FC<GatewayStatisticsViewProps> = ({ refreshKe
                   fillOpacity={0.1}
                   strokeWidth={2}
                 />
+                {chartRows.some((row) => row.other > 0) && (
+                  <Area
+                    yAxisId="tokens"
+                    type={trendCurveType}
+                    dataKey="other"
+                    name={t('gateway.page.statistics.chart.other')}
+                    hide={hiddenSeries.has('other')}
+                    stroke="var(--ant-color-primary)"
+                    fill="var(--ant-color-primary)"
+                    fillOpacity={0.1}
+                    strokeWidth={2}
+                  />
+                )}
                 <Area
                   yAxisId="cost"
                   type={trendCurveType}
@@ -644,7 +676,7 @@ const GatewayStatisticsView: React.FC<GatewayStatisticsViewProps> = ({ refreshKe
             dataSource={state.modelStats}
             loading={loading}
             pagination={false}
-            scroll={{ x: 680 }}
+            scroll={{ x: 880 }}
           />
         )}
       </section>

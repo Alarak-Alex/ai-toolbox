@@ -4,6 +4,8 @@ import { CloudDownloadOutlined, ReloadOutlined, SearchOutlined, UndoOutlined } f
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import type { FetchModelsModalProps, FetchedModel, ApiType, FetchModelsResponse } from './types';
+import { createFetchedModelsComparator } from './sort';
+import { buildModelsUrl, getDefaultModelsApiType, resolveModelsUrlApiKey } from './request';
 import styles from './index.module.less';
 
 const { Text } = Typography;
@@ -16,16 +18,16 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
   apiKey,
   headers,
   sdkType,
+  configValueMode,
   existingModelIds,
+  priorityOwnedBy,
   onCancel,
   onSuccess,
 }) => {
   const { t } = useTranslation();
   const [loading, setLoading] = React.useState(false);
   // Default to native if supported, otherwise openai_compat
-  const [apiType, setApiType] = React.useState<ApiType>(() => {
-    return (sdkType === '@ai-sdk/google' || sdkType === '@ai-sdk/anthropic') ? 'native' : 'openai_compat';
-  });
+  const [apiType, setApiType] = React.useState<ApiType>(() => getDefaultModelsApiType(sdkType));
   const [models, setModels] = React.useState<FetchedModel[]>([]);
   const [selectedRowKeys, setSelectedRowKeys] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
@@ -33,47 +35,46 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
   const [customUrl, setCustomUrl] = React.useState('');
   const [searchText, setSearchText] = React.useState('');
   const [removeMissingModels, setRemoveMissingModels] = React.useState(false);
+  const fetchRequestIdRef = React.useRef(0);
 
   // Only show Native option for Google and Anthropic SDKs
   const supportsNative = sdkType === '@ai-sdk/google' || sdkType === '@ai-sdk/anthropic';
 
+  // Sort models grouped by owner so models read vendor-by-vendor instead of
+  // raw API order; consumers can pin specific owners (e.g. Codex pins openai)
+  const sortComparator = React.useMemo(
+    () => createFetchedModelsComparator(priorityOwnedBy),
+    [priorityOwnedBy],
+  );
+
   // Filter models based on search text
   const filteredModels = React.useMemo(() => {
-    if (!searchText) return models;
     const lowerSearch = searchText.toLowerCase();
-    return models.filter(m =>
-      m.id.toLowerCase().includes(lowerSearch) ||
-      (m.name && m.name.toLowerCase().includes(lowerSearch)) ||
-      (m.ownedBy && m.ownedBy.toLowerCase().includes(lowerSearch))
-    );
-  }, [models, searchText]);
+    const list = searchText
+      ? models.filter(m =>
+          m.id.toLowerCase().includes(lowerSearch) ||
+          (m.name && m.name.toLowerCase().includes(lowerSearch)) ||
+          (m.ownedBy && m.ownedBy.toLowerCase().includes(lowerSearch))
+        )
+      : models;
+    return [...list].sort(sortComparator);
+  }, [models, searchText, sortComparator]);
 
   // Calculate the default URL based on baseUrl, apiType, and sdkType
-  const calculatedUrl = React.useMemo(() => {
-    const base = baseUrl.trim().replace(/\/$/, '');
-    if (!base) {
-      return '';
-    }
+  const calculatedUrl = React.useMemo(
+    () => buildModelsUrl(baseUrl, apiType, sdkType, resolveModelsUrlApiKey(apiKey, configValueMode)),
+    [baseUrl, apiType, sdkType, apiKey, configValueMode],
+  );
 
-    if (apiType === 'native' && sdkType === '@ai-sdk/google') {
-      // Google Native: /models with API key in URL
-      const url = `${base}/models`;
-      if (apiKey) {
-        return `${url}?key=${apiKey}`;
-      }
-      return url;
-    }
-
-    return `${base}/models`;
-  }, [baseUrl, apiType, sdkType, apiKey]);
-
-  // Update custom URL when calculated URL changes (only if not manually edited)
+  // The component stays mounted while providers and their SDKs can change.
   React.useEffect(() => {
-    setCustomUrl(calculatedUrl);
-  }, [calculatedUrl]);
+    if (open) setApiType(getDefaultModelsApiType(sdkType));
+  }, [open, providerId, sdkType]);
 
   // Reset state when modal opens
   React.useEffect(() => {
+    fetchRequestIdRef.current += 1;
+    setLoading(false);
     if (open) {
       setModels([]);
       setSelectedRowKeys([]);
@@ -84,10 +85,12 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
       // Reset custom URL to calculated default
       setCustomUrl(calculatedUrl);
     }
-  }, [open, calculatedUrl]);
+    return () => { fetchRequestIdRef.current += 1; };
+  }, [open, providerId, sdkType, apiType, apiKey, calculatedUrl]);
 
   // Fetch models from provider API
   const handleFetch = async () => {
+    const requestId = ++fetchRequestIdRef.current;
     setLoading(true);
     setError(null);
 
@@ -100,9 +103,12 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
           headers,
           apiType,
           sdkType,
+          configValueMode,
           customUrl, // Use custom URL instead of calculated one
         },
       });
+
+      if (requestId !== fetchRequestIdRef.current) return;
 
       setModels(response.models);
       setFetched(true);
@@ -115,22 +121,28 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
         message.info(t('opencode.fetchModels.noModelsFound'));
       }
     } catch (err) {
+      if (requestId !== fetchRequestIdRef.current) return;
       const errorMsg = err instanceof Error ? err.message : String(err);
       setError(errorMsg);
       message.error(t('opencode.fetchModels.fetchFailed'));
     } finally {
-      setLoading(false);
+      if (requestId === fetchRequestIdRef.current) setLoading(false);
     }
   };
 
   // Confirm and add selected models
   const handleConfirm = () => {
-    const selectedModels = models.filter((m) => selectedRowKeys.includes(m.id));
+    // Select from the full sorted list, not the search-filtered view, so rows
+    // hidden by an active search filter are not silently dropped; the sorted
+    // order keeps the applied order in line with what was displayed.
+    const sortedModels = [...models].sort(sortComparator);
+    const selectedModels = sortedModels.filter((m) => selectedRowKeys.includes(m.id));
     const fetchedModelIds = new Set(models.map((model) => model.id));
     const removedModelIds = removeMissingModels
       ? existingModelIds.filter((modelId) => !fetchedModelIds.has(modelId))
       : [];
-    onSuccess({ selectedModels, removedModelIds });
+    const orderedModelIds = sortedModels.map((model) => model.id);
+    onSuccess({ selectedModels, removedModelIds, orderedModelIds });
   };
 
   // Table columns
@@ -163,6 +175,7 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
   ];
 
   const rowSelection = {
+    preserveSelectedRowKeys: true,
     selectedRowKeys,
     onChange: (keys: React.Key[]) => setSelectedRowKeys(keys as string[]),
     getCheckboxProps: (record: FetchedModel) => ({
@@ -178,20 +191,6 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
   }, [existingModelIds, fetched, models]);
 
   const canConfirm = selectedRowKeys.length > 0 || (removeMissingModels && missingModelCount > 0);
-  const summaryItems = [
-    {
-      label: t('opencode.fetchModels.returnedCount'),
-      value: models.length,
-    },
-    {
-      label: t('opencode.fetchModels.selectedCount'),
-      value: selectedRowKeys.length,
-    },
-    {
-      label: t('opencode.fetchModels.removableCount'),
-      value: missingModelCount,
-    },
-  ];
 
   return (
     <Modal
@@ -212,7 +211,7 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
         <Button
           key="confirm"
           type="primary"
-          disabled={!canConfirm}
+          disabled={loading || !canConfirm}
           onClick={handleConfirm}
         >
           {t('opencode.fetchModels.applyChanges', {
@@ -223,43 +222,39 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
       ]}
     >
       <div className={styles.content}>
-        <section className={styles.sectionCard}>
+        <section className={`${styles.sectionCard} ${styles.sourceCard}`}>
           <div className={styles.sectionHeader}>
             <div className={styles.sectionTitle}>{t('opencode.fetchModels.sourceSection')}</div>
             <Text className={styles.sectionHint}>{t('opencode.fetchModels.sourceSectionHint')}</Text>
           </div>
 
-          <div className={`${styles.fieldBlock} ${styles.fieldRow}`}>
+          <div className={styles.fieldRow}>
             <Text strong className={styles.fieldLabel}>
               {t('opencode.fetchModels.apiType')}
             </Text>
-            <div>
-              <div className={styles.apiTypePanel}>
-                <Radio.Group
-                  value={apiType}
-                  onChange={(e) => setApiType(e.target.value)}
-                  className={styles.apiTypeGroup}
-                >
-                  <Radio value="openai_compat">
-                    {t('opencode.fetchModels.openaiCompat')}
-                    <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
-                      (/models)
-                    </Text>
-                  </Radio>
-                  {supportsNative && (
-                    <Radio value="native">
-                      {t('opencode.fetchModels.native')}
-                      <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
-                        ({t('opencode.fetchModels.nativeHint')})
-                      </Text>
-                    </Radio>
-                  )}
-                </Radio.Group>
-              </div>
-            </div>
+            <Radio.Group
+              value={apiType}
+              onChange={(e) => setApiType(e.target.value)}
+              className={styles.apiTypeGroup}
+            >
+              <Radio value="openai_compat">
+                {t('opencode.fetchModels.openaiCompat')}
+                <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+                  (/models)
+                </Text>
+              </Radio>
+              {supportsNative && (
+                <Radio value="native">
+                  {t('opencode.fetchModels.native')}
+                  <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+                    ({t('opencode.fetchModels.nativeHint')})
+                  </Text>
+                </Radio>
+              )}
+            </Radio.Group>
           </div>
 
-          <div className={`${styles.fieldBlock} ${styles.fieldRow}`}>
+          <div className={styles.fieldRow}>
             <Text strong className={styles.fieldLabel}>
               {t('opencode.fetchModels.apiUrl')}
             </Text>
@@ -283,7 +278,7 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
           </div>
         </section>
 
-        <section className={styles.sectionCard}>
+        <section className={`${styles.sectionCard} ${styles.resultCard}`}>
           <div className={styles.sectionHeader}>
             <div className={styles.sectionTitle}>{t('opencode.fetchModels.resultSection')}</div>
             <Text className={styles.sectionHint}>{t('opencode.fetchModels.resultSectionHint')}</Text>
@@ -306,11 +301,35 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
               onChange={(e) => setSearchText(e.target.value)}
               allowClear
             />
+            {fetched && (
+              <Text className={styles.statsText}>
+                {t('opencode.fetchModels.statsLine', {
+                  returned: models.length,
+                  selected: selectedRowKeys.length,
+                })}
+              </Text>
+            )}
           </div>
+
+          {fetched && (
+            <div className={styles.cleanupRow}>
+              {missingModelCount > 0 ? (
+                <Checkbox
+                  checked={removeMissingModels}
+                  onChange={(event) => setRemoveMissingModels(event.target.checked)}
+                >
+                  {t('opencode.fetchModels.removeMissing', { count: missingModelCount })}
+                </Checkbox>
+              ) : (
+                <Text type="secondary" className={styles.statsMuted}>
+                  {t('opencode.fetchModels.removeMissingNone')}
+                </Text>
+              )}
+            </div>
+          )}
 
           {error && (
             <Alert
-              className={styles.errorAlert}
               type="error"
               message={t('opencode.fetchModels.fetchFailed')}
               description={error}
@@ -321,36 +340,6 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
           )}
 
           {fetched && (
-            <div className={styles.summaryGrid}>
-              {summaryItems.map((item) => (
-                <div key={item.label} className={styles.summaryCard}>
-                  <Text className={styles.summaryLabel}>{item.label}</Text>
-                  <Text className={styles.summaryValue}>{item.value}</Text>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {fetched && missingModelCount > 0 && (
-            <div className={styles.cleanupCard}>
-              <Checkbox
-                checked={removeMissingModels}
-                onChange={(event) => setRemoveMissingModels(event.target.checked)}
-              >
-                {t('opencode.fetchModels.removeMissing', { count: missingModelCount })}
-              </Checkbox>
-            </div>
-          )}
-
-          {fetched && missingModelCount === 0 && (
-            <div className={styles.cleanupMuted}>
-              <Text type="secondary">
-                {t('opencode.fetchModels.removeMissingNone')}
-              </Text>
-            </div>
-          )}
-
-          {fetched && (
             <div className={styles.tableWrap}>
               <Table
                 rowKey="id"
@@ -358,7 +347,6 @@ const FetchModelsModal: React.FC<FetchModelsModalProps> = ({
                 dataSource={filteredModels}
                 rowSelection={rowSelection}
                 pagination={false}
-                scroll={{ y: 300 }}
                 size="small"
                 locale={{
                   emptyText: searchText ? t('opencode.fetchModels.noSearchResults') : t('opencode.fetchModels.noModelsFound'),

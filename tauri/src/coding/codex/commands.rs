@@ -26,6 +26,7 @@ use crate::coding::all_api_hub;
 use crate::coding::db_id::db_new_id;
 use crate::coding::open_code::shell_env;
 use crate::coding::prompt_file::{read_prompt_content_file, write_prompt_content_file};
+use crate::coding::proxy_gateway::aggregate_naming::AggregateSlugEntry;
 use crate::coding::proxy_gateway::{
     cli_proxy, paths::ProxyGatewayPaths, provider_protocol, provider_switch, types::GatewayCliKey,
 };
@@ -39,7 +40,7 @@ use crate::db::schema::{DbTable, JsonFieldPath, OrderDirection, OrderField, Orde
 use crate::db::SqliteDbState;
 use crate::http_client;
 use chrono::Local;
-use tauri::{Emitter, Manager, Runtime};
+use tauri::{Emitter, Runtime};
 
 const PROTECTED_TOP_LEVEL_TOML_KEYS: [&str; 2] = ["mcp_servers", "plugins"];
 const PROTECTED_FEATURE_TOML_KEYS: [&str; 1] = ["plugins"];
@@ -392,7 +393,7 @@ fn get_codex_config_dir() -> Result<std::path::PathBuf, String> {
     get_codex_root_dir_without_db()
 }
 
-async fn get_codex_config_dir_from_db_async(
+pub(crate) async fn get_codex_config_dir_from_db_async(
     db: &crate::db::SqliteDbState,
 ) -> Result<std::path::PathBuf, String> {
     get_codex_root_dir_from_db_async(db).await
@@ -490,7 +491,97 @@ async fn read_codex_settings_from_disk(
         None
     };
 
-    Ok(CodexSettings { auth, config })
+    let catalog_preview = read_codex_catalog_preview(&config_path, config.as_deref()).await;
+    let model_catalog_active = if catalog_preview.content.is_some() || catalog_preview.pointer_active
+    {
+        Some(catalog_preview.pointer_active)
+    } else {
+        None
+    };
+
+    Ok(CodexSettings {
+        auth,
+        config,
+        model_catalog: catalog_preview.content,
+        model_catalog_active,
+    })
+}
+
+/// Model catalog state for the read-only config preview.
+struct CodexCatalogPreview {
+    /// Raw catalog file text when a readable file was found.
+    content: Option<String>,
+    /// Whether config.toml's top-level `model_catalog_json` pointer is set
+    /// (i.e. Codex actually reads the catalog). `true` even when the named
+    /// file is missing so the preview can surface the dangling pointer.
+    pointer_active: bool,
+}
+
+/// Read the model catalog for the config preview tab.
+///
+/// With config.toml's `model_catalog_json` pointer set, the pointed file is
+/// read (relative pointers resolve against config.toml's directory, absolute
+/// pointers as-is) — this covers user-owned external catalogs too, so the
+/// preview shows exactly what Codex reads. Without a usable pointer, the
+/// AI Toolbox-managed catalog file is shown as a fallback when it exists: the
+/// pointer is removed whenever mappings are cleared or aggregate mode leaves,
+/// but the file is intentionally kept, and that leftover state is exactly
+/// what needs diagnosing ("why is the model list missing?"). Read errors and
+/// missing files degrade to `content: None` (with a warning) so a catalog
+/// problem never fails the whole preview. File I/O goes through
+/// `coding::file_io` because the Codex root may be a WSL UNC / network path.
+async fn read_codex_catalog_preview(
+    config_path: &Path,
+    config_text: Option<&str>,
+) -> CodexCatalogPreview {
+    let none_preview = CodexCatalogPreview {
+        content: None,
+        pointer_active: false,
+    };
+    let Some(root_dir) = config_path.parent() else {
+        return none_preview;
+    };
+    let pointer = config_text
+        .and_then(|text| parse_toml_document(text, "config.toml catalog preview").ok())
+        .and_then(|document| {
+            document
+                .as_table()
+                .get("model_catalog_json")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+
+    let catalog_path = match pointer.as_deref() {
+        Some(pointer) => {
+            if Path::new(pointer).is_absolute() {
+                PathBuf::from(pointer)
+            } else {
+                root_dir.join(pointer)
+            }
+        }
+        // No usable pointer: fall back to the AI Toolbox catalog file.
+        None => root_dir.join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME),
+    };
+    let content =
+        match crate::coding::file_io::read_optional_text_file_with_timeout(
+            catalog_path,
+            "Codex model catalog",
+        )
+        .await
+        {
+            Ok(content) => content,
+            Err(error) => {
+                log::warn!("Failed to read Codex model catalog for preview: {error}");
+                None
+            }
+        };
+
+    CodexCatalogPreview {
+        content,
+        pointer_active: pointer.is_some(),
+    }
 }
 
 /// Remove a dangling top-level `model_provider` when it points to a
@@ -763,12 +854,9 @@ fn emit_codex_runtime_config_changed<R: Runtime>(app: &tauri::AppHandle<R>) {
     let _ = app.emit("wsl-sync-request-codex", ());
 }
 
-fn codex_gateway_takeover_active<R: Runtime>(app: &tauri::AppHandle<R>) -> bool {
-    app.path()
-        .app_data_dir()
-        .map(ProxyGatewayPaths::new)
-        .map(|paths| cli_proxy::provider_switch_locked_by_manifest(&paths, GatewayCliKey::Codex))
-        .unwrap_or(false)
+fn codex_gateway_takeover_active<R: Runtime>(_app: &tauri::AppHandle<R>) -> bool {
+    let paths = ProxyGatewayPaths::new(crate::app_paths::resolved_data_dir());
+    cli_proxy::provider_switch_locked_by_manifest(&paths, GatewayCliKey::Codex)
 }
 
 fn ensure_codex_provider_native_for_direct(
@@ -1858,20 +1946,81 @@ fn remove_codex_experimental_bearer_token(config_toml: &str) -> Result<String, S
     Ok(document.to_string())
 }
 
+/// Drop `requires_openai_auth` from the active provider's `[model_providers.<id>]`
+/// table.
+///
+/// Codex treats `requires_openai_auth = true` as "this provider needs the OpenAI
+/// auth flow" and resolves the credential from `auth.json` or the `OPENAI_API_KEY`
+/// environment variable. When neither is available it aborts with
+/// "Missing environment variable: OPENAI_API_KEY". Gateway/relay providers
+/// (ccNexus, AxonHub) leave this flag unset and let the upstream manage auth;
+/// we do the same for custom providers that carry no managed key, so users no
+/// longer have to hand-delete the line from `config.toml` after every switch
+/// (see issue #353).
+fn strip_active_provider_requires_openai_auth(config_toml: &str) -> Result<String, String> {
+    if config_toml.trim().is_empty() {
+        return Ok(config_toml.to_string());
+    }
+
+    let mut document = parse_toml_document(config_toml, "config.toml")?;
+    if let Some(provider_id) = active_codex_model_provider_id(&document) {
+        if let Some(provider_table) = document
+            .as_table_mut()
+            .get_mut("model_providers")
+            .and_then(|item| item.as_table_like_mut())
+            .and_then(|providers| providers.get_mut(&provider_id))
+            .and_then(|item| item.as_table_like_mut())
+        {
+            provider_table.remove("requires_openai_auth");
+        }
+    }
+
+    Ok(document.to_string())
+}
+
 fn project_codex_auth_to_runtime_config(
     managed_config_toml: &str,
     managed_auth: &serde_json::Value,
     preserve_official_auth: bool,
+    provider_category: &str,
 ) -> Result<String, String> {
-    if !preserve_official_auth {
-        return Ok(managed_config_toml.to_string());
+    let api_key = extract_codex_managed_api_key(managed_auth);
+
+    // Decide whether Codex should use the OpenAI auth flow for this provider,
+    // i.e. read the credential from `auth.json` (or the `OPENAI_API_KEY` env
+    // var). `requires_openai_auth = true` is only correct when that is the
+    // intended credential source; otherwise Codex either demands a missing
+    // credential ("Missing environment variable: OPENAI_API_KEY") or sends the
+    // wrong one (auth.json creds instead of the provider bearer token → 401).
+    // See issue #353 and the parallel cc-switch#7211 investigation.
+    //
+    // Keep `requires_openai_auth` only when Codex should read auth.json:
+    //   - official providers: ChatGPT OAuth tokens in auth.json need it;
+    //   - custom provider with a managed key written to auth.json
+    //     (preserve=false): mirrors `codex login --with-api-key`.
+    // Drop it otherwise:
+    //   - custom provider authenticating via `experimental_bearer_token`
+    //     (preserve=true): `true` makes Codex send auth.json credentials instead
+    //     of the provider bearer token, causing 401 (cc-switch#7211);
+    //   - custom provider with no key at all: nothing to read, so don't demand.
+    // Gateway/relay providers (ccNexus, AxonHub) likewise leave this unset.
+    let uses_openai_auth =
+        provider_category == "official" || (api_key.is_some() && !preserve_official_auth);
+
+    let mut config_toml = managed_config_toml.to_string();
+    if !uses_openai_auth {
+        config_toml = strip_active_provider_requires_openai_auth(&config_toml)?;
     }
 
-    let Some(api_key) = extract_codex_managed_api_key(managed_auth) else {
-        return Ok(managed_config_toml.to_string());
+    if !preserve_official_auth {
+        return Ok(config_toml);
+    }
+
+    let Some(api_key) = api_key else {
+        return Ok(config_toml);
     };
 
-    set_codex_experimental_bearer_token(managed_config_toml, &api_key)
+    set_codex_experimental_bearer_token(&config_toml, &api_key)
 }
 
 fn should_preserve_codex_official_auth(provider: &CodexProvider, setting_enabled: bool) -> bool {
@@ -2208,7 +2357,12 @@ fn resolve_codex_auto_review_model_override(
     None
 }
 
-fn extract_codex_top_level_model(config_toml: &str) -> Option<String> {
+/// Top-level `model` of a Codex `config.toml`.
+///
+/// `pub(crate)` because the gateway router has to know a site's own default
+/// model for the same reason the catalog publishes it: a bare request for that
+/// model must reach the site that actually serves it.
+pub(crate) fn extract_codex_top_level_model(config_toml: &str) -> Option<String> {
     let document = config_toml.parse::<toml_edit::DocumentMut>().ok()?;
     document
         .get("model")
@@ -2369,6 +2523,128 @@ fn normalize_codex_model_catalog_string_array(value: Option<&serde_json::Value>)
     }
 
     Some(Value::Array(normalized))
+}
+
+/// Modalities Codex's `InputModality` enum can deserialize; anything else is
+/// dropped at generation time so a typo can never make Codex reject the whole
+/// catalog file.
+const CODEX_CATALOG_INPUT_MODALITIES: &[&str] = &["text", "image", "audio"];
+
+/// Keep only the values Codex's `InputModality` enum can deserialize,
+/// lowercased and trimmed; declaration order is preserved.
+fn recognized_codex_catalog_input_modalities(modalities: &[String]) -> Vec<String> {
+    modalities
+        .iter()
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| CODEX_CATALOG_INPUT_MODALITIES.contains(&item.as_str()))
+        .collect()
+}
+
+/// Final `input_modalities` for one generated catalog entry. Values Codex
+/// cannot deserialize (the `video`/`pdf` some bundled presets declare) are
+/// dropped so a single unknown value can never make Codex reject the whole
+/// catalog file; an empty remainder falls back to the same text+image default
+/// Codex applies when the field is omitted.
+fn sanitize_codex_catalog_input_modalities(modalities: &[String]) -> Vec<String> {
+    let recognized = recognized_codex_catalog_input_modalities(modalities);
+
+    if recognized.is_empty() {
+        return vec!["text".to_string(), "image".to_string()];
+    }
+
+    recognized
+}
+
+/// Per-row `input_modalities` override from a mapping row's `modalities.input`
+/// (camelCase `modalities` only — DB is the SSOT). Unknown values are dropped
+/// and lowercased; an empty remainder means the row did not declare anything
+/// usable, so the preset/vendor chain stays in effect.
+fn codex_catalog_input_modalities_override(
+    value: Option<&serde_json::Value>,
+) -> Option<Vec<String>> {
+    let items = value?.as_array()?;
+    let declared: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect();
+    let recognized = recognized_codex_catalog_input_modalities(&declared);
+
+    if recognized.is_empty() {
+        return None;
+    }
+
+    Some(recognized)
+}
+
+/// Effective `input_modalities` for one generated catalog entry, resolved
+/// through a four-step chain (issue #368):
+///
+/// 1. The user's explicit per-row `modalities.input` declaration wins — it is
+///    the only user-facing way to force text-only.
+/// 2. When the bundled preset models declare image input for the id, that
+///    declaration wins, still filtered down to Codex-supported modalities on
+///    the way out (preset-only `video`/`pdf` values never reach the catalog).
+/// 3. Same for a matched official vendor entry: an image declaration wins over
+///    the other source's possibly stale text-only snapshot, because a visible
+///    upstream error beats silently stripping user images.
+/// 4. A known-but-text-only id (presets double as the confirmed-text-only
+///    registry, e.g. `deepseek-chat`) keeps that declaration; a fully unknown
+///    id fails open to text+image, matching Codex's own
+///    `default_input_modalities` (the field omitted defaults to text+image).
+///
+/// Backend preset lookups read the compile-time bundled file only, so BOTH
+/// data sources have the same release-time freshness — no source can claim
+/// authority, which is why "any source declaring image wins" instead of a
+/// linear priority that would let a stale snapshot re-strip user images.
+fn codex_catalog_effective_input_modalities(
+    spec: &CodexCatalogModelSpec,
+    vendor_declared: Option<&serde_json::Value>,
+) -> Vec<String> {
+    // 1. Explicit per-row declaration wins.
+    if let Some(declared) = spec.input_modalities.as_deref() {
+        return sanitize_codex_catalog_input_modalities(declared);
+    }
+
+    let declares_image = |modalities: &[String]| {
+        modalities
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case("image"))
+    };
+
+    let preset_declared =
+        crate::coding::preset_models::input_modalities_for_model_id(&spec.model);
+    let vendor_declared = vendor_declared.and_then(|value| {
+        let items = value.as_array()?;
+        let modalities: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::trim))
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect();
+        (!modalities.is_empty()).then_some(modalities)
+    });
+
+    // 2/3. A source that declares image wins over the other source's
+    // text-only snapshot.
+    if let Some(preset) = preset_declared.as_ref() {
+        if declares_image(preset) {
+            return sanitize_codex_catalog_input_modalities(preset);
+        }
+    }
+    if let Some(vendor) = vendor_declared.as_ref() {
+        if declares_image(vendor) {
+            return sanitize_codex_catalog_input_modalities(vendor);
+        }
+    }
+
+    // 4. Known text-only id keeps its declaration; fully unknown fails open.
+    if let Some(preset) = preset_declared {
+        return sanitize_codex_catalog_input_modalities(&preset);
+    }
+    if let Some(vendor) = vendor_declared {
+        return sanitize_codex_catalog_input_modalities(&vendor);
+    }
+    vec!["text".to_string(), "image".to_string()]
 }
 
 fn strip_protected_top_level_toml_keys(document: &mut toml_edit::DocumentMut) {
@@ -2546,6 +2822,12 @@ struct CodexCatalogModelSpec {
     /// matching cc-switch's safe default); official vendor entries keep the
     /// vendor's declared tiers.
     service_tiers: Option<Vec<String>>,
+    /// Per-row override for the generated catalog's `input_modalities`,
+    /// sourced from the mapping row's `modalities.input`. `Some` values are
+    /// pre-filtered to modalities Codex understands; when omitted the entry
+    /// falls back to the preset/vendor chain, also filtered to Codex-supported
+    /// modalities before the catalog is written.
+    input_modalities: Option<Vec<String>>,
 }
 
 /// Canonical reasoning effort levels Codex understands, in ascending depth
@@ -2776,6 +3058,10 @@ fn codex_catalog_model_specs(
                 })
                 .filter(|tiers| !tiers.is_empty());
 
+            let input_modalities = codex_catalog_input_modalities_override(
+                item.get("modalities").and_then(|modalities| modalities.get("input")),
+            );
+
             specs.push(CodexCatalogModelSpec {
                 model: model.to_string(),
                 display_name,
@@ -2784,6 +3070,7 @@ fn codex_catalog_model_specs(
                 reasoning_levels,
                 default_reasoning_level,
                 service_tiers,
+                input_modalities,
             });
         }
     }
@@ -2804,6 +3091,7 @@ fn codex_catalog_model_specs(
                 reasoning_levels: None,
                 default_reasoning_level: None,
                 service_tiers: None,
+                input_modalities: None,
             });
         }
     }
@@ -2811,17 +3099,30 @@ fn codex_catalog_model_specs(
     specs
 }
 
+/// Display name for one catalog entry: the user's explicit `displayName`, else the
+/// preset-models name registered for that model id, else the raw id.
+///
+/// The middle step matters for models that only exist as an id — a provider's own
+/// default model and mapping rows without a display name — because Codex's UIs
+/// otherwise list `gpt-6-astra` even though a readable name exists.
+fn codex_catalog_display_name(spec: &CodexCatalogModelSpec) -> String {
+    spec.display_name
+        .clone()
+        .or_else(|| crate::coding::preset_models::display_name_for_model_id(&spec.model))
+        .unwrap_or_else(|| spec.model.clone())
+}
+
 fn codex_model_catalog_entry(
     spec: &CodexCatalogModelSpec,
     index: usize,
     default_context_window: u64,
 ) -> Value {
-    let display_name = spec.display_name.as_deref().unwrap_or(&spec.model);
+    let display_name = codex_catalog_display_name(spec);
     let context_window = spec.context_window.unwrap_or(default_context_window);
     let mut entry = serde_json::json!({
         "slug": spec.model.as_str(),
-        "display_name": display_name,
-        "description": display_name,
+        "display_name": display_name.as_str(),
+        "description": display_name.as_str(),
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": [
             { "effort": "low", "description": "Fast responses with lighter reasoning" },
@@ -2869,10 +3170,14 @@ fn codex_model_catalog_entry(
             serde_json::Value::String(auto_review_model_override.clone());
     }
 
-    // Per-model reasoning-level override: when the spec declares levels they
-    // replace the neutral template's default set; otherwise the 6-level
-    // default above survives untouched.
+    // Per-row modality override through the shared four-step chain; absent
+    // per-row/preset declarations keep the neutral template's fail-open
+    // text+image default.
     if let Some(entry_obj) = entry.as_object_mut() {
+        entry_obj.insert(
+            "input_modalities".to_string(),
+            serde_json::json!(codex_catalog_effective_input_modalities(spec, None)),
+        );
         apply_codex_reasoning_level_override(entry_obj, Some("medium"), spec);
         // Per-model service (speed) tiers: when the spec declares tiers they
         // are emitted as full {id,name,description} objects; otherwise the
@@ -2901,6 +3206,491 @@ fn codex_model_catalog_from_specs(
         .collect();
 
     serde_json::json!({ "models": models })
+}
+
+/// One `(site, model)` entry for the aggregate-mode catalog.
+#[derive(Debug)]
+struct AggregateCatalogEntry {
+    /// The configured aggregate slug — what Codex shows and sends back verbatim.
+    slug: String,
+    /// Site that owns this entry; `None` for the hidden bare-name aliases, which
+    /// are addressable but advertise no auto-review override. Used while
+    /// building the catalog to turn the provider-level bare auto-review model id
+    /// into the exact aggregate slug the same site publishes for that model.
+    site_id: Option<String>,
+    /// `<site label> · <model>` for the model picker.
+    display_name: String,
+    /// Hidden entries are addressable but never listed: Codex's spawn_agent
+    /// resolves exact slugs, while `visibility = "hide"` keeps them out of the
+    /// picker and out of the first-5 model hint list.
+    hidden: bool,
+    context_window: Option<u64>,
+    reasoning_levels: Option<Vec<String>>,
+    default_reasoning_level: Option<String>,
+    service_tiers: Option<Vec<String>>,
+    input_modalities: Option<Vec<String>>,
+    auto_review_model_override: Option<String>,
+}
+
+/// Build the aggregate-mode catalog: one entry per `(site, upstream model)`
+/// pair, with the site encoded into the slug so the gateway can route on it.
+///
+/// Reuses `codex_model_catalog_entry` so every non-slug field (reasoning
+/// levels, tool support, truncation policy, modality, …) stays identical to
+/// the single-provider catalog.
+fn aggregate_catalog_from_entries(
+    entries: &[AggregateCatalogEntry],
+    default_context_window: u64,
+) -> Value {
+    // Hidden bare-name aliases sit after the whole visible table so they can
+    // never take one of Codex's five visible `spawn_agent` model hints.
+    const HIDDEN_ALIAS_PRIORITY_BASE: u64 = 9000;
+    let models: Vec<Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let spec = CodexCatalogModelSpec {
+                model: entry.slug.clone(),
+                display_name: Some(entry.display_name.clone()),
+                context_window: entry.context_window,
+                auto_review_model_override: entry.auto_review_model_override.clone(),
+                reasoning_levels: entry.reasoning_levels.clone(),
+                default_reasoning_level: entry.default_reasoning_level.clone(),
+                service_tiers: entry.service_tiers.clone(),
+                input_modalities: entry.input_modalities.clone(),
+            };
+            let mut value = codex_model_catalog_entry(&spec, index, default_context_window);
+            if entry.hidden {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "visibility".to_string(),
+                        serde_json::Value::String("hide".to_string()),
+                    );
+                    object.insert(
+                        "priority".to_string(),
+                        serde_json::json!(HIDDEN_ALIAS_PRIORITY_BASE + index as u64),
+                    );
+                }
+            }
+            value
+        })
+        .collect();
+
+    serde_json::json!({ "models": models })
+}
+
+/// Model specs one aggregate site contributes to the catalog.
+///
+/// Reuses the single-provider spec builder so a site publishes the same models
+/// in aggregate mode as it does when applied alone: its `modelCatalog` mapping
+/// rows, plus the default model its own `config` points at.
+///
+/// The site's own default model is added unconditionally, not only through the
+/// auto-review seeding inside `codex_catalog_model_specs`: single-provider mode
+/// sends that model verbatim, so aggregate mode must not hide it just because the
+/// site declares no auto-review override.
+fn aggregate_site_model_specs(settings_config: &Value) -> Vec<CodexCatalogModelSpec> {
+    let site_config_toml = settings_config
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut specs = codex_catalog_model_specs(settings_config, site_config_toml);
+    if let Some(default_model) = extract_codex_top_level_model(site_config_toml) {
+        if !specs.iter().any(|spec| spec.model == default_model) {
+            specs.push(CodexCatalogModelSpec {
+                model: default_model,
+                display_name: None,
+                context_window: None,
+                auto_review_model_override: None,
+                reasoning_levels: None,
+                default_reasoning_level: None,
+                service_tiers: None,
+                input_modalities: None,
+            });
+        }
+    }
+    specs
+}
+
+/// Collect one aggregate entry per `(site, model)` pair across `sites`.
+///
+/// `sites` is `(site_id, site_label, settings_config)` in the user's display
+/// order; the order of the produced entries follows it, so the Codex model list
+/// mirrors the order the user arranged in the settings panel.
+///
+/// The models of one site are exactly the ones its single-provider catalog would
+/// publish (`aggregate_site_model_specs`): the `modelCatalog` mapping rows plus
+/// the site's own default model. Selecting a site in aggregate mode therefore
+/// never hides a model the user can pick when that provider is applied alone.
+///
+/// Also returns the `(site, upstream model) -> slug` table that was allocated
+/// alongside the catalog. The caller persists it in the manifest so request-time
+/// routing replays this exact table instead of rebuilding one that could
+/// renumber `model_only` `#N` slugs.
+///
+/// Visible rows also carry the site's `auto_review_model_override`, translated
+/// from the provider-level bare id into that same site's published slug; rows
+/// whose site does not publish the configured review model stay `None` rather
+/// than borrowing another site's slug.
+fn codex_aggregate_catalog_entries(
+    sites: &[(String, String, Value)],
+    naming: &crate::coding::proxy_gateway::aggregate_naming::AggregateNamingConfig,
+) -> Result<(Vec<AggregateCatalogEntry>, Vec<AggregateSlugEntry>), String> {
+    use crate::coding::proxy_gateway::aggregate_naming::AggregateSlugAllocator;
+
+    let mut entries = Vec::new();
+    let mut slug_table = Vec::new();
+    let mut allocator = AggregateSlugAllocator::default();
+    // Bare upstream model names in first-appearance order. Aggregate mode
+    // replaces the single-provider catalog, so every bare name that used to
+    // resolve (`gpt-5.6-luna`, `gpt-5.6-terra`, …) must stay addressable —
+    // Codex's `spawn_agent`, `[agents] default_subagent_model`, auto-review and
+    // memory extraction all send bare names. They are published as hidden
+    // entries so they never consume one of the five visible model hints.
+    let mut bare_models: Vec<String> = Vec::new();
+
+    for (site_id, site_label, settings_config) in sites {
+        if site_id.trim().is_empty() {
+            continue;
+        }
+
+        // Reuse the single-provider spec builder so the aggregate list exposes
+        // everything that site can actually serve — the mapping rows plus the
+        // default model its own config points at — instead of only the mapping.
+        for spec in aggregate_site_model_specs(settings_config) {
+            let Some(slug) = naming.allocate(&mut allocator, site_id, &spec.model)? else {
+                continue;
+            };
+            slug_table.push(AggregateSlugEntry {
+                site_id: site_id.clone(),
+                upstream_model: spec.model.clone(),
+                slug: slug.clone(),
+            });
+
+            let model_display_name = codex_catalog_display_name(&spec);
+
+            entries.push(AggregateCatalogEntry {
+                slug,
+                site_id: Some(site_id.clone()),
+                hidden: false,
+                display_name: format!("{site_label} · {model_display_name}"),
+                context_window: spec.context_window,
+                reasoning_levels: spec.reasoning_levels,
+                default_reasoning_level: spec.default_reasoning_level,
+                service_tiers: spec.service_tiers,
+                input_modalities: spec.input_modalities,
+                // Still the provider-level bare upstream id here; rewritten to
+                // this site's exact aggregate slug once every slug is allocated.
+                auto_review_model_override: spec.auto_review_model_override,
+            });
+
+            if !bare_models.iter().any(|existing| existing == &spec.model) {
+                bare_models.push(spec.model.clone());
+            }
+        }
+    }
+
+    // Single-provider catalogs advertise the provider-level
+    // `auto_review_model_override` on every model row, so a request that starts
+    // from any row keeps its review/guardian calls pinned to the configured
+    // model. Aggregate mode used to drop the field entirely, which sent those
+    // background requests back to Codex's built-in review model — a name old
+    // aggregate catalogs did not publish at all, so guardian and session-summary
+    // generation could not start.
+    //
+    // The override is a bare upstream id, but aggregate mode addresses a model
+    // only through the slug its own site publishes, so advertise that exact
+    // slug: `<site>` must stay the site that declared the override. A bare name
+    // that another site's hidden alias happens to serve would silently move the
+    // request to that other site.
+    let slug_by_pair = slug_table
+        .iter()
+        .map(|entry| {
+            (
+                (entry.site_id.as_str(), entry.upstream_model.as_str()),
+                entry.slug.as_str(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for entry in &mut entries {
+        let Some(raw_override) = entry.auto_review_model_override.clone() else {
+            continue;
+        };
+        let Some(site_id) = entry.site_id.as_deref() else {
+            continue;
+        };
+        // No fallback on purpose: if this site does not publish the configured
+        // review model, there is no slug that may serve it. Leave the row empty
+        // so Codex keeps its built-in review model instead of advertising a
+        // model the gateway would 404 or route to a different site.
+        entry.auto_review_model_override = slug_by_pair
+            .get(&(site_id, raw_override.as_str()))
+            .map(|slug| (*slug).to_string());
+    }
+
+    // Hidden bare-name aliases go *after* the whole visible table: the order is
+    // part of the contract (`model_only` numbering, the five visible spawn hints
+    // and the aggregate preview all depend on it).
+    let visible_slugs = slug_table
+        .iter()
+        .map(|entry| (entry.slug.as_str(), entry.upstream_model.as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for model in bare_models {
+        // The exposure set narrows which bare names get a hidden alias at all.
+        // An empty set is the default and keeps publishing every one of them.
+        if !naming.exposes_bare_model(&model) {
+            continue;
+        }
+        match visible_slugs.get(model.as_str()) {
+            // `model_only` (or a user alias) already publishes this exact slug
+            // for the same upstream model, so the bare name is already
+            // addressable and a second catalog entry would be a duplicate.
+            Some(upstream_model) if *upstream_model == model.as_str() => continue,
+            // A generated slug that coincidentally spells a *different* model
+            // name would make the bare name unreachable/ambiguous. Never
+            // silently mis-route: surface an actionable conflict instead.
+            Some(upstream_model) => {
+                return Err(format!(
+                    "Aggregate model name '{model}' collides with the slug generated for upstream model '{upstream_model}'; rename the site alias or change the naming template"
+                ));
+            }
+            None => {}
+        }
+        entries.push(AggregateCatalogEntry {
+            slug: model.clone(),
+            site_id: None,
+            hidden: true,
+            display_name: model,
+            context_window: None,
+            reasoning_levels: None,
+            default_reasoning_level: None,
+            service_tiers: None,
+            input_modalities: None,
+            // Bare-name aliases exist so Codex's bare spawn/subagent/review
+            // names stay addressable; they advertise no override, exactly as
+            // before this change.
+            auto_review_model_override: None,
+        });
+    }
+
+    Ok((entries, slug_table))
+}
+
+/// Slug table the aggregate catalog publishes, without writing the catalog.
+///
+/// Used by the CLI takeover path to persist the table in the manifest *before*
+/// the runtime files are patched, so the manifest and the catalog it points at
+/// always describe the same slugs.
+pub(crate) fn codex_aggregate_slug_table(
+    providers: &[(String, String, Value)],
+    naming: &crate::coding::proxy_gateway::aggregate_naming::AggregateNamingConfig,
+) -> Result<Vec<crate::coding::proxy_gateway::aggregate_naming::AggregateSlugEntry>, String> {
+    Ok(codex_aggregate_catalog_entries(providers, naming)?.1)
+}
+
+/// Read the aggregate routing config (selected sites + separator) from the
+/// Codex gateway manifest.
+///
+/// Returns `None` unless the manifest is enabled and in aggregate mode, so the
+/// single/failover catalog paths stay untouched.
+#[cfg(test)]
+pub(crate) fn read_codex_aggregate_selection(config_dir: &Path) -> Option<(Vec<String>, String)> {
+    use crate::coding::proxy_gateway::cli_proxy::manifest::{
+        AggregateManifestConfig, CliProxyManifest, AGGREGATE_DEFAULT_SEPARATOR,
+    };
+    use crate::coding::proxy_gateway::types::{GatewayCliKey, GatewayProxyMode};
+
+    let manifest_path = crate::coding::proxy_gateway::paths::ProxyGatewayPaths::new(config_dir)
+        .manifest_path(GatewayCliKey::Codex);
+    let content = fs::read_to_string(&manifest_path).ok()?;
+    let manifest: CliProxyManifest = serde_json::from_str(&content).ok()?;
+    if !manifest.enabled || manifest.mode != GatewayProxyMode::Aggregate {
+        return None;
+    }
+    let AggregateManifestConfig {
+        provider_ids,
+        separator,
+        ..
+    } = manifest.aggregate.unwrap_or_default();
+    let separator = if separator.is_empty() {
+        AGGREGATE_DEFAULT_SEPARATOR.to_string()
+    } else {
+        separator
+    };
+    Some((provider_ids, separator))
+}
+
+/// Write the aggregate-mode catalog file for the Codex gateway takeover.
+///
+/// Called by the CLI takeover path (not by the single-provider `apply` path),
+/// because aggregate routing only exists while the gateway is engaged.
+/// `providers` is `(site_id, site_label, settings_config)` in display order.
+///
+/// Returns `Ok(true)` when an aggregate catalog was written.
+pub(crate) fn write_codex_aggregate_catalog(
+    config_dir: &Path,
+    providers: &[(String, String, Value)],
+    naming: &crate::coding::proxy_gateway::aggregate_naming::AggregateNamingConfig,
+    default_context_window: u64,
+) -> Result<bool, String> {
+    let entries = codex_aggregate_catalog_entries(providers, naming)?.0;
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    let catalog = aggregate_catalog_from_entries(&entries, default_context_window);
+    let catalog_path = config_dir.join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
+    write_codex_catalog_file_atomic(&catalog_path, &catalog)?;
+    Ok(true)
+}
+
+/// Default context window used when an aggregate entry declares none.
+pub(crate) const CODEX_AGGREGATE_DEFAULT_CONTEXT_WINDOW: u64 = CODEX_DEFAULT_CONTEXT_WINDOW;
+
+/// Point Codex at the AI Toolbox-managed catalog file.
+///
+/// The aggregate takeover owns the catalog file while it is engaged, so it must
+/// own the pointer too: leaving aggregate removes `model_catalog_json`, and
+/// every provider save while engaged runs a restore-direct → re-engage round
+/// trip (`saveProviderWithGatewayReengage`). Without re-asserting the pointer
+/// here, that round trip would leave Codex reading no catalog at all and the
+/// aggregated model list would silently disappear.
+pub(crate) fn ensure_codex_model_catalog_pointer(config_dir: &Path) -> Result<(), String> {
+    let config_path = config_dir.join("config.toml");
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let config_toml = fs::read_to_string(&config_path)
+        .map_err(|error| format!("Failed to read config.toml: {error}"))?;
+    let updated = set_codex_model_catalog_json_field(&config_toml, true)?;
+    if updated != config_toml {
+        fs::write(&config_path, updated)
+            .map_err(|error| format!("Failed to write config.toml: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Retire the aggregate catalog when leaving aggregate mode.
+///
+/// The file is shared with the single-provider path, so only the
+/// `model_catalog_json` pointer decides whether Codex reads it. Leaving
+/// aggregate mode therefore only needs to remove the stale pointer; the file
+/// itself is rewritten by the next single-provider `apply`.
+pub(crate) fn remove_codex_aggregate_catalog(config_dir: &Path) -> Result<(), String> {
+    let config_path = config_dir.join("config.toml");
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let config_toml = fs::read_to_string(&config_path)
+        .map_err(|error| format!("Failed to read config.toml: {error}"))?;
+    let updated = set_codex_model_catalog_json_field(&config_toml, false)?;
+    if updated != config_toml {
+        fs::write(&config_path, updated)
+            .map_err(|error| format!("Failed to write config.toml: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Capture the Codex catalog state an aggregate takeover is about to overwrite.
+///
+/// Aggregate mode rewrites both config.toml's `model_catalog_json` pointer and
+/// the AI Toolbox-managed catalog file that pointer names. The manifest stores
+/// this snapshot so every path that leaves aggregate mode can replay it instead
+/// of merely dropping our own pointer; without it a user's single-site
+/// mappings or self-owned external pointer would silently disappear.
+pub(crate) fn capture_codex_pre_aggregate_catalog(
+    config_dir: &Path,
+) -> Result<crate::coding::proxy_gateway::cli_proxy::manifest::PreAggregateCodexCatalog, String> {
+    let pointer = read_codex_model_catalog_pointer(config_dir)?;
+    let catalog_path = config_dir.join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
+    let file_content = if catalog_path.exists() {
+        Some(fs::read_to_string(&catalog_path).map_err(|error| {
+            format!(
+                "Failed to read Codex model catalog before aggregate takeover {}: {}",
+                catalog_path.display(),
+                error
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok(
+        crate::coding::proxy_gateway::cli_proxy::manifest::PreAggregateCodexCatalog {
+            pointer,
+            file_content,
+        },
+    )
+}
+
+fn read_codex_model_catalog_pointer(config_dir: &Path) -> Result<Option<String>, String> {
+    let config_path = config_dir.join("config.toml");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let config_toml = fs::read_to_string(&config_path)
+        .map_err(|error| format!("Failed to read config.toml: {error}"))?;
+    let document = parse_toml_document(&config_toml, "managed config")?;
+    Ok(document
+        .get("model_catalog_json")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
+}
+
+/// Restore the pointer and catalog file captured by
+/// `capture_codex_pre_aggregate_catalog`.
+///
+/// A snapshot without a pointer removes only our own pointer (the legacy
+/// behavior); a snapshot without file content removes the file aggregate mode
+/// created. Both `None` cases restore the exact pre-takeover state.
+pub(crate) fn restore_codex_pre_aggregate_catalog(
+    config_dir: &Path,
+    snapshot: &crate::coding::proxy_gateway::cli_proxy::manifest::PreAggregateCodexCatalog,
+) -> Result<(), String> {
+    match snapshot.pointer.as_deref() {
+        Some(pointer) => write_codex_model_catalog_pointer(config_dir, pointer)?,
+        None => remove_codex_aggregate_catalog(config_dir)?,
+    }
+
+    let catalog_path = config_dir.join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
+    match snapshot.file_content.as_deref() {
+        Some(content) => fs::write(&catalog_path, content).map_err(|error| {
+            format!(
+                "Failed to restore Codex model catalog {}: {}",
+                catalog_path.display(),
+                error
+            )
+        })?,
+        None => {
+            if catalog_path.exists() {
+                fs::remove_file(&catalog_path).map_err(|error| {
+                    format!(
+                        "Failed to remove aggregate Codex model catalog {}: {}",
+                        catalog_path.display(),
+                        error
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_codex_model_catalog_pointer(config_dir: &Path, pointer: &str) -> Result<(), String> {
+    let config_path = config_dir.join("config.toml");
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let config_toml = fs::read_to_string(&config_path)
+        .map_err(|error| format!("Failed to read config.toml: {error}"))?;
+    let mut document = parse_toml_document(&config_toml, "managed config")?;
+    document["model_catalog_json"] = toml_edit::value(pointer);
+    let updated = document.to_string();
+    if updated != config_toml {
+        fs::write(&config_path, updated)
+            .map_err(|error| format!("Failed to write config.toml: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Hosts whose native `/responses` gateway publishes an OFFICIAL Codex model
@@ -3013,6 +3803,12 @@ fn codex_vendor_catalog_model_entry(
     }
     if matched.is_none() {
         entry_obj.insert("priority".to_string(), serde_json::json!(1000 + priority));
+        // Unknown model: the flagship's `input_modalities` are NOT inherited —
+        // `codex_catalog_effective_input_modalities` receives no vendor
+        // declaration for unmatched ids, so presets and the fail-open default
+        // decide instead (a vision-capable id the vendor catalog doesn't know
+        // yet, e.g. a renamed flagship, must not be declared text-only merely
+        // because the stale flagship entry is).
     }
 
     // Explicit user overrides win over the official entry; absent values keep
@@ -3031,6 +3827,20 @@ fn codex_vendor_catalog_model_entry(
             serde_json::json!(context_window),
         );
     }
+    // Input modalities resolve through the shared four-step chain: explicit
+    // per-row declaration > image-capable source > known text-only source >
+    // fail-open default. Unmatched ids pass no vendor declaration so a stale
+    // flagship entry cannot drag them to text-only.
+    let vendor_input_modalities = matched
+        .and_then(|entry| entry.get("input_modalities"))
+        .cloned();
+    entry_obj.insert(
+        "input_modalities".to_string(),
+        serde_json::json!(codex_catalog_effective_input_modalities(
+            spec,
+            vendor_input_modalities.as_ref(),
+        )),
+    );
     if let Some(auto_review_model_override) = spec.auto_review_model_override.as_deref() {
         entry_obj.insert(
             "auto_review_model_override".to_string(),
@@ -3146,12 +3956,34 @@ fn prepare_codex_config_with_model_catalog(
         .map(|vendor_models| codex_vendor_catalog_from_specs(&specs, &vendor_models))
         .unwrap_or_else(|| codex_model_catalog_from_specs(&specs, default_context_window));
     let catalog_path = config_dir.join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
-    let catalog_content = serde_json::to_string_pretty(&catalog)
-        .map_err(|e| format!("Failed to serialize Codex model catalog: {}", e))?;
-    fs::write(&catalog_path, catalog_content)
-        .map_err(|e| format!("Failed to write Codex model catalog: {}", e))?;
+    write_codex_catalog_file_atomic(&catalog_path, &catalog)?;
 
     set_codex_model_catalog_json_field(config_toml, true)
+}
+
+/// Write a Codex model catalog atomically.
+///
+/// The catalog is a single JSON file that Codex reads on startup, and both the
+/// single-provider and aggregate paths rewrite it in place. A plain `fs::write`
+/// truncates first, so a crash or a full disk mid-write leaves Codex parsing a
+/// half-written file. Write to a sibling temp file, re-parse it to prove the
+/// payload is intact, then replace the target in one step.
+fn write_codex_catalog_file_atomic(catalog_path: &Path, catalog: &Value) -> Result<(), String> {
+    let catalog_content = serde_json::to_string_pretty(catalog)
+        .map_err(|e| format!("Failed to serialize Codex model catalog: {}", e))?;
+    // Parse-back guard: serialization already produced this string, so a
+    // failure here means the value itself is not valid JSON (NaN, etc.).
+    serde_json::from_str::<Value>(&catalog_content)
+        .map_err(|e| format!("Refusing to write an invalid Codex model catalog: {}", e))?;
+
+    let temp_path = catalog_path.with_extension("json.tmp");
+    fs::write(&temp_path, catalog_content)
+        .map_err(|e| format!("Failed to write Codex model catalog: {}", e))?;
+    fs::rename(&temp_path, catalog_path).map_err(|e| {
+        // Leave no temp file behind when the replacement itself failed.
+        let _ = fs::remove_file(&temp_path);
+        format!("Failed to replace Codex model catalog: {}", e)
+    })
 }
 
 async fn get_managed_codex_config_for_provider(
@@ -3173,7 +4005,19 @@ async fn get_managed_codex_config_for_provider_cleanup(
         .unwrap_or_else(|| serde_json::json!({}));
     let managed_config =
         get_managed_codex_config_for_provider(db, &provider.settings_config).await?;
-    let projected_config = project_codex_auth_to_runtime_config(&managed_config, &auth, true)?;
+    // Mirror the apply path's projection: the cleanup diff removes exactly the
+    // fields that were written to disk, so previous_managed must be projected
+    // with the same preserve flag (and the same requires_openai_auth rule) as
+    // the apply that wrote it. Using a hardcoded `true` here left stale
+    // `requires_openai_auth` (and bearer-token) fields on disk after switching.
+    let preserve_official_auth =
+        should_preserve_codex_official_auth(provider, load_codex_auth_preservation_enabled(db)?);
+    let projected_config = project_codex_auth_to_runtime_config(
+        &managed_config,
+        &auth,
+        preserve_official_auth,
+        &provider.category,
+    )?;
     if provider.category == "official" && load_codex_unified_session_history_enabled(db)? {
         unified_history::inject_unified_session_history_config(&projected_config)
     } else {
@@ -3193,7 +4037,14 @@ async fn get_managed_codex_config_for_provider_cleanup_with_unified_history(
         .unwrap_or_else(|| serde_json::json!({}));
     let managed_config =
         get_managed_codex_config_for_provider(db, &provider.settings_config).await?;
-    let projected_config = project_codex_auth_to_runtime_config(&managed_config, &auth, true)?;
+    let preserve_official_auth =
+        should_preserve_codex_official_auth(provider, load_codex_auth_preservation_enabled(db)?);
+    let projected_config = project_codex_auth_to_runtime_config(
+        &managed_config,
+        &auth,
+        preserve_official_auth,
+        &provider.category,
+    )?;
     if provider.category == "official" && unified_history_enabled {
         unified_history::inject_unified_session_history_config(&projected_config)
     } else {
@@ -3237,9 +4088,9 @@ pub async fn create_codex_provider(
 
 /// Pure async core of `create_codex_provider`, callable in-process (e.g. from
 /// the deep-link import path) without a `tauri::State` wrapper.
-pub async fn create_codex_provider_inner(
+pub async fn create_codex_provider_inner<R: tauri::Runtime>(
     state: &SqliteDbState,
-    app: &tauri::AppHandle,
+    app: &tauri::AppHandle<R>,
     provider: CodexProviderInput,
 ) -> Result<CodexProvider, String> {
     let db = state.db();
@@ -3535,8 +4386,12 @@ async fn apply_config_to_file_with_previous_managed_config(
         should_preserve_codex_official_auth(&provider, auth_preservation_enabled);
     let managed_config =
         build_managed_codex_config(&provider.settings_config, common_toml.as_deref())?;
-    let mut final_config =
-        project_codex_auth_to_runtime_config(&managed_config, &auth, preserve_official_auth)?;
+    let mut final_config = project_codex_auth_to_runtime_config(
+        &managed_config,
+        &auth,
+        preserve_official_auth,
+        &provider.category,
+    )?;
     if provider.category == "official" && load_codex_unified_session_history_enabled(db)? {
         final_config = unified_history::inject_unified_session_history_config(&final_config)?;
     }
@@ -4196,19 +5051,29 @@ pub async fn read_codex_settings(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_toml_configs, build_written_codex_config_toml, codex_catalog_model_specs,
+        aggregate_catalog_from_entries, aggregate_site_model_specs, append_toml_configs,
+        build_written_codex_config_toml, capture_codex_pre_aggregate_catalog,
+        codex_aggregate_catalog_entries, codex_aggregate_slug_table, codex_catalog_display_name,
+        codex_catalog_effective_input_modalities, codex_catalog_model_specs,
+        ensure_codex_model_catalog_pointer,
         extract_codex_common_config_from_settings_toml, extract_provider_settings_for_storage,
         fill_template_fields_from_static, heal_dangling_codex_model_provider,
         infer_codex_provider_category_from_settings, merge_codex_auth_json,
         merge_remote_codex_official_models, normalize_codex_model_tier,
         prepare_codex_config_with_model_catalog, project_codex_auth_to_runtime_config,
-        resolve_local_provider_meta, static_codex_official_models,
-        strip_codex_common_config_from_toml, CodexHistoryRuntimeSource,
-        CodexHistorySourceCandidate, CodexHistorySourceMode, RemoteCodexModel,
-        AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME, CODEX_BUILTIN_IMAGE_MODEL_ID,
+        read_codex_aggregate_selection, read_codex_catalog_preview, remove_codex_aggregate_catalog,
+        resolve_local_provider_meta, restore_codex_pre_aggregate_catalog,
+        sanitize_codex_catalog_input_modalities, static_codex_official_models,
+        strip_codex_common_config_from_toml,
+        write_codex_aggregate_catalog, AggregateCatalogEntry, CodexCatalogModelSpec,
+        CodexHistoryRuntimeSource, CodexHistorySourceCandidate, CodexHistorySourceMode,
+        RemoteCodexModel, AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME, CODEX_BUILTIN_IMAGE_MODEL_ID,
     };
     use crate::coding::codex::types::CodexProviderInput;
     use crate::coding::codex::unified_history;
+    use crate::coding::proxy_gateway::aggregate_naming::{
+        AggregateNamingConfig, AggregateNamingMode,
+    };
     use serde_json::{json, Value};
     use std::path::PathBuf;
     use toml_edit::DocumentMut;
@@ -4746,6 +5611,68 @@ approval_policy = "never"
     }
 
     #[test]
+    fn catalog_display_name_falls_back_to_preset_models_then_raw_id() {
+        let spec = |model: &str, display_name: Option<&str>| CodexCatalogModelSpec {
+            model: model.to_string(),
+            display_name: display_name.map(str::to_string),
+            context_window: None,
+            auto_review_model_override: None,
+            reasoning_levels: None,
+            default_reasoning_level: None,
+            service_tiers: None,
+            input_modalities: None,
+        };
+
+        // An explicit user value always wins over the preset name.
+        assert_eq!(
+            codex_catalog_display_name(&spec("gpt-6-astra", Some("6 Astra"))),
+            "6 Astra"
+        );
+        // A bare id picks up the preset-models name ...
+        assert_eq!(
+            codex_catalog_display_name(&spec("gpt-6-astra", None)),
+            "GPT-6 Astra"
+        );
+        // ... and an id the bundled presets do not know keeps the raw id.
+        assert_eq!(
+            codex_catalog_display_name(&spec("my-relay-model", None)),
+            "my-relay-model"
+        );
+    }
+
+    #[test]
+    fn single_provider_catalog_uses_preset_display_name_for_a_bare_model_id() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = json!({
+            "modelCatalog": { "models": [{ "model": "gpt-6-astra" }] }
+        });
+
+        prepare_codex_config_with_model_catalog(
+            temp_dir.path(),
+            Some(&settings),
+            "model = \"gpt-6-astra\"\n",
+        )
+        .expect("catalog generation should not error");
+        let catalog_text = std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&catalog_text).unwrap();
+
+        assert_eq!(
+            catalog["models"][0]["display_name"].as_str(),
+            Some("GPT-6 Astra")
+        );
+        assert_eq!(
+            catalog["models"][0]["description"].as_str(),
+            Some("GPT-6 Astra")
+        );
+        assert_eq!(catalog["models"][0]["slug"].as_str(), Some("gpt-6-astra"));
+    }
+
+    #[test]
     fn codex_model_catalog_seeds_default_model_when_only_auto_review_override_is_set() {
         let settings = json!({
             "autoReviewModelOverride": "gpt-5.5"
@@ -4834,6 +5761,969 @@ approval_policy = "never"
         assert_eq!(specs[1].model, "mapped-b");
     }
 
+    /// Build a `(site_id, label, settings_config)` triple for aggregate tests.
+    fn aggregate_site(id: &str, label: &str, models: serde_json::Value) -> (String, String, Value) {
+        (
+            id.to_string(),
+            label.to_string(),
+            json!({ "modelCatalog": { "models": models } }),
+        )
+    }
+
+    fn aggregate_naming(separator: &str) -> AggregateNamingConfig {
+        AggregateNamingConfig {
+            separator: separator.to_string(),
+            ..AggregateNamingConfig::default()
+        }
+    }
+
+    /// Entries Codex actually lists in its model picker. Hidden bare-name
+    /// aliases are addressable but must never appear here.
+    fn visible_entries(entries: &[AggregateCatalogEntry]) -> Vec<&AggregateCatalogEntry> {
+        entries.iter().filter(|entry| !entry.hidden).collect()
+    }
+
+    #[test]
+    fn aggregate_catalog_names_models_with_site_prefix() {
+        let sites = vec![
+            aggregate_site(
+                "unsee",
+                "sub.unsee.you",
+                json!([{ "model": "deepseek-v4-flash", "displayName": "DS Flash" }]),
+            ),
+            aggregate_site(
+                "nexfaro",
+                "ai.nexfaro.com",
+                json!([{ "model": "gpt-5.6-sol", "contextWindow": 400000 }]),
+            ),
+        ];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        let slugs: Vec<&str> = visible_entries(&entries)
+            .iter()
+            .map(|e| e.slug.as_str())
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["unsee.deepseek-v4-flash", "nexfaro.gpt-5.6-sol"]
+        );
+        assert_eq!(entries[0].display_name, "sub.unsee.you · DS Flash");
+        assert_eq!(entries[1].context_window, Some(400000));
+    }
+
+    #[test]
+    fn aggregate_catalog_keeps_same_model_on_different_sites() {
+        let sites = vec![
+            aggregate_site("site1", "Site 1", json!([{ "model": "gpt-5.6-sol" }])),
+            aggregate_site("site2", "Site 2", json!([{ "model": "gpt-5.6-sol" }])),
+        ];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        // Both sites keep their own entry so the user can pick either one.
+        assert_eq!(visible_entries(&entries).len(), 2);
+        assert_eq!(entries[0].slug, "site1.gpt-5.6-sol");
+        assert_eq!(entries[1].slug, "site2.gpt-5.6-sol");
+    }
+
+    #[test]
+    fn aggregate_catalog_supports_custom_separator() {
+        let sites = vec![aggregate_site(
+            "site1",
+            "Site 1",
+            json!([{ "model": "m1" }]),
+        )];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming("/")).unwrap();
+
+        assert_eq!(entries[0].slug, "site1/m1");
+    }
+
+    #[test]
+    fn aggregate_catalog_skips_sites_without_models() {
+        let sites = vec![
+            aggregate_site("empty", "Empty", json!([])),
+            ("nodecl".to_string(), "No Catalog".to_string(), json!({})),
+            aggregate_site("ok", "OK", json!([{ "model": "m1" }])),
+        ];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        assert_eq!(visible_entries(&entries).len(), 1);
+        assert_eq!(entries[0].slug, "ok.m1");
+    }
+
+    #[test]
+    fn aggregate_catalog_dedupes_repeated_slug() {
+        let sites = vec![aggregate_site(
+            "site1",
+            "Site 1",
+            json!([{ "model": "m1" }, { "model": "m1" }]),
+        )];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        assert_eq!(visible_entries(&entries).len(), 1);
+    }
+
+    #[test]
+    fn aggregate_catalog_includes_each_sites_own_default_model() {
+        let sites = vec![
+            (
+                "site-a".to_string(),
+                "AxonHub-6 Astra".to_string(),
+                json!({
+                    "config": "model = \"gpt-6-astra\"\nmodel_provider = \"custom\"\n",
+                    "modelCatalog": {
+                        "models": [
+                            { "model": "deepseek-v4.1-flash", "displayName": "DeepSeek V4.1 Flash" }
+                        ]
+                    },
+                    "autoReviewModelOverride": "deepseek-v4.1-flash"
+                }),
+            ),
+            (
+                "site-b".to_string(),
+                "AxonHub-5.6 Sol".to_string(),
+                json!({
+                    "config": "model = \"gpt-5.6-sol\"\n",
+                    "modelCatalog": {
+                        "models": [{ "model": "kimi-k3", "displayName": "Kimi K3" }]
+                    }
+                }),
+            ),
+        ];
+
+        let (entries, slug_table) =
+            codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        let visible = visible_entries(&entries);
+        let slugs: Vec<&str> = visible.iter().map(|entry| entry.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            vec![
+                "site-a.deepseek-v4.1-flash",
+                "site-a.gpt-6-astra",
+                "site-b.kimi-k3",
+                "site-b.gpt-5.6-sol",
+            ]
+        );
+        // The site's own model keeps its raw id as display name, like the
+        // single-provider catalog does for the seeded default model.
+        assert_eq!(visible[1].display_name, "AxonHub-6 Astra · GPT-6 Astra");
+        // Site b declares no auto-review override; its own model is still listed.
+        assert_eq!(visible[3].display_name, "AxonHub-5.6 Sol · GPT-5.6 Sol");
+        // Every listed model also keeps its bare upstream name addressable: Codex
+        // sends bare names for `spawn_agent`, `[agents]` defaults, auto-review and
+        // memory extraction, so those entries are published as hidden aliases
+        // after the whole visible table.
+        let hidden: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.hidden)
+            .map(|entry| entry.slug.as_str())
+            .collect();
+        assert_eq!(
+            hidden,
+            vec![
+                "deepseek-v4.1-flash",
+                "gpt-6-astra",
+                "kimi-k3",
+                "gpt-5.6-sol"
+            ]
+        );
+        // Catalog and slug table come from the same allocation pass.
+        assert_eq!(slug_table.len(), visible.len());
+        assert_eq!(slug_table[1].site_id, "site-a");
+        assert_eq!(slug_table[1].upstream_model, "gpt-6-astra");
+    }
+
+    #[test]
+    fn aggregate_catalog_models_match_the_single_provider_catalog() {
+        // Parity invariant: picking a provider on its own and picking it as an
+        // aggregate site must offer the same upstream models. `gpt-6-astra` is
+        // the provider's own default (`config.model`), which single-provider mode
+        // seeds into its catalog and aggregate mode now mirrors.
+        let config_toml = "model = \"gpt-6-astra\"\nmodel_provider = \"custom\"\n";
+        let settings = json!({
+            "config": config_toml,
+            "modelCatalog": {
+                "models": [
+                    { "model": "deepseek-v4.1-flash", "displayName": "DeepSeek V4.1 Flash" }
+                ]
+            },
+            "autoReviewModelOverride": "deepseek-v4.1-flash"
+        });
+        let sites = vec![(
+            "site-a".to_string(),
+            "AxonHub-6 Astra".to_string(),
+            settings.clone(),
+        )];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+        let aggregate_models: Vec<&str> = visible_entries(&entries)
+            .iter()
+            .map(|entry| entry.slug.trim_start_matches("site-a."))
+            .collect();
+        let single_specs = codex_catalog_model_specs(&settings, config_toml);
+        let single_models: Vec<&str> = single_specs
+            .iter()
+            .map(|spec| spec.model.as_str())
+            .collect();
+
+        assert_eq!(aggregate_models, single_models);
+        assert!(single_models.contains(&"gpt-6-astra"));
+    }
+
+    #[test]
+    fn aggregate_catalog_does_not_duplicate_default_model_without_display_name() {
+        // Same as above but the mapping row carries no display name: the row's
+        // entry (raw model id as display name) must still be the only one.
+        let sites = vec![(
+            "site-a".to_string(),
+            "Site A".to_string(),
+            json!({
+                "config": "model = \"gpt-6-astra\"\n",
+                "modelCatalog": { "models": [{ "model": "gpt-6-astra" }] }
+            }),
+        )];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        // The mapping row is the only *visible* entry: the default model is
+        // already declared there, so nothing is appended.
+        let visible = visible_entries(&entries);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].slug, "site-a.gpt-6-astra");
+        assert_eq!(visible[0].display_name, "Site A · GPT-6 Astra");
+    }
+
+    #[test]
+    fn aggregate_catalog_lists_default_model_without_any_mapping() {
+        let sites = vec![(
+            "site-a".to_string(),
+            "Site A".to_string(),
+            json!({ "config": "model = \"gpt-6-astra\"\n" }),
+        )];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        let visible = visible_entries(&entries);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].slug, "site-a.gpt-6-astra");
+    }
+
+    #[test]
+    fn aggregate_catalog_keeps_mapping_row_metadata_for_the_default_model() {
+        // When the mapping already declares the default model, the mapping row
+        // (display name and context window) wins and no duplicate is appended.
+        let sites = vec![(
+            "site-a".to_string(),
+            "Site A".to_string(),
+            json!({
+                "config": "model = \"gpt-6-astra\"\n",
+                "modelCatalog": {
+                    "models": [
+                        { "model": "gpt-6-astra", "displayName": "6 Astra", "contextWindow": 300000 }
+                    ]
+                }
+            }),
+        )];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        let visible = visible_entries(&entries);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].display_name, "Site A · 6 Astra");
+        assert_eq!(visible[0].context_window, Some(300_000));
+    }
+
+    #[test]
+    fn aggregate_catalog_entry_reuses_neutral_template_fields() {
+        let sites = vec![aggregate_site(
+            "site1",
+            "Site 1",
+            json!([{
+                "model": "m1",
+                "reasoningLevels": ["high", "max"],
+                "defaultReasoningLevel": "high"
+            }]),
+        )];
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+
+        let catalog = aggregate_catalog_from_entries(&entries, 200000);
+        let model = &catalog["models"][0];
+
+        assert_eq!(model["slug"], "site1.m1");
+        assert_eq!(model["context_window"], 200000);
+        let levels: Vec<&str> = model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|level| level["effort"].as_str())
+            .collect();
+        assert_eq!(levels, vec!["high", "max"]);
+        assert_eq!(model["default_reasoning_level"], "high");
+        // Same neutral template fields the single-provider catalog emits.
+        assert_eq!(model["visibility"], "list");
+        assert_eq!(model["shell_type"], "unified_exec");
+    }
+
+    #[test]
+    fn write_aggregate_catalog_skips_empty_selection() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+
+        let written =
+            write_codex_aggregate_catalog(&temp_dir.path(), &[], &aggregate_naming("."), 200000)
+                .unwrap();
+
+        assert!(!written);
+        assert!(!temp_dir
+            .path()
+            .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME)
+            .exists());
+    }
+
+    #[test]
+    fn write_aggregate_catalog_writes_file_and_returns_true() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let sites = vec![aggregate_site(
+            "site1",
+            "Site 1",
+            json!([{ "model": "m1" }]),
+        )];
+
+        let written =
+            write_codex_aggregate_catalog(&temp_dir.path(), &sites, &aggregate_naming("."), 200000)
+                .unwrap();
+
+        assert!(written);
+        let catalog_path = temp_dir
+            .path()
+            .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
+        let catalog: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "site1.m1");
+    }
+
+    #[test]
+    fn aggregate_catalog_applies_alias_and_naming_template() {
+        let sites = vec![aggregate_site(
+            "76a6ef74",
+            "Unsee Relay",
+            json!([{ "model": "deepseek-v4-flash" }]),
+        )];
+        let mut aliases = std::collections::BTreeMap::new();
+        aliases.insert("76a6ef74".to_string(), "unsee".to_string());
+        let naming = AggregateNamingConfig {
+            separator: "@".to_string(),
+            aliases,
+            naming: AggregateNamingMode::ModelAtSite,
+            ..AggregateNamingConfig::default()
+        };
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &naming).unwrap();
+
+        assert_eq!(entries[0].slug, "deepseek-v4-flash@unsee");
+        assert_eq!(entries[0].display_name, "Unsee Relay · DeepSeek V4 Flash");
+    }
+
+    #[test]
+    fn aggregate_catalog_publishes_hidden_bare_name_aliases() {
+        let sites = vec![
+            aggregate_site(
+                "site1",
+                "Site 1",
+                json!([{ "model": "gpt-5.6-luna" }, { "model": "gpt-5.6-terra" }]),
+            ),
+            aggregate_site("site2", "Site 2", json!([{ "model": "gpt-5.6-luna" }])),
+        ];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+        let catalog = aggregate_catalog_from_entries(&entries, 200000);
+        let models = catalog["models"].as_array().unwrap();
+
+        // Visible table first, in site/model order.
+        let visible: Vec<&str> = models
+            .iter()
+            .filter(|model| model["visibility"] == "list")
+            .filter_map(|model| model["slug"].as_str())
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                "site1.gpt-5.6-luna",
+                "site1.gpt-5.6-terra",
+                "site2.gpt-5.6-luna"
+            ]
+        );
+
+        // Hidden bare-name aliases follow the visible table, deduplicated, and
+        // are addressable by exact name (Codex resolves spawn_agent by slug).
+        let hidden: Vec<&str> = models
+            .iter()
+            .filter(|model| model["visibility"] == "hide")
+            .filter_map(|model| model["slug"].as_str())
+            .collect();
+        assert_eq!(hidden, vec!["gpt-5.6-luna", "gpt-5.6-terra"]);
+
+        for alias in &hidden {
+            let entry = models
+                .iter()
+                .find(|model| model["slug"].as_str() == Some(alias))
+                .expect("hidden alias entry");
+            // `supported_in_api` must stay true: Codex filters entries with
+            // `supported_in_api = false` out of API-key mode entirely.
+            assert_eq!(entry["supported_in_api"], true);
+            // Hidden entries must never occupy a visible picker/hint slot.
+            assert!(entry["priority"].as_u64().unwrap() >= 9000);
+        }
+    }
+
+    #[test]
+    fn aggregate_catalog_preserves_auto_review_as_an_exact_same_site_slug() {
+        let sites = vec![
+            (
+                "site-a".to_string(),
+                "Site A".to_string(),
+                json!({
+                    "autoReviewModelOverride": "codex-auto-review",
+                    "modelCatalog": {
+                        "models": [
+                            { "model": "gpt-5.6-luna" },
+                            { "model": "codex-auto-review" }
+                        ]
+                    }
+                }),
+            ),
+            aggregate_site(
+                "site-b",
+                "Site B",
+                json!([
+                    { "model": "gpt-5.6-luna" },
+                    { "model": "codex-auto-review" }
+                ]),
+            ),
+        ];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+        let catalog = aggregate_catalog_from_entries(&entries, 200000);
+        let models = catalog["models"].as_array().unwrap();
+
+        // Every visible row of the declaring site points at that site's own
+        // published slug for the review model.
+        let site_a_main = models
+            .iter()
+            .find(|model| model["slug"] == "site-a.gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(
+            site_a_main["auto_review_model_override"].as_str(),
+            Some("site-a.codex-auto-review")
+        );
+        let site_a_review = models
+            .iter()
+            .find(|model| model["slug"] == "site-a.codex-auto-review")
+            .unwrap();
+        assert_eq!(
+            site_a_review["auto_review_model_override"].as_str(),
+            Some("site-a.codex-auto-review")
+        );
+
+        // Site B declares the same review model but configures no override, so it
+        // must not inherit site A's — neither as site A's slug nor as a bare name.
+        let site_b_main = models
+            .iter()
+            .find(|model| model["slug"] == "site-b.gpt-5.6-luna")
+            .unwrap();
+        assert!(site_b_main.get("auto_review_model_override").is_none());
+
+        // Hidden bare-name aliases keep advertising no override: they exist for
+        // spawning, not for review routing.
+        for slug in ["gpt-5.6-luna", "codex-auto-review"] {
+            let bare = models.iter().find(|model| model["slug"] == slug).unwrap();
+            assert_eq!(bare["visibility"], "hide");
+            assert!(bare.get("auto_review_model_override").is_none());
+        }
+    }
+
+    #[test]
+    fn aggregate_catalog_never_borrows_another_sites_auto_review_slug() {
+        // Site B is the only site that publishes `codex-auto-review`, but site A
+        // is the site whose config asks for it. Site A has no slug that serves
+        // that model, so its rows must stay empty instead of drifting to B.
+        let sites = vec![
+            (
+                "site-a".to_string(),
+                "Site A".to_string(),
+                json!({
+                    "config": "model = \"gpt-5.6-luna\"",
+                    "autoReviewModelOverride": "codex-auto-review",
+                    "modelCatalog": { "models": [{ "model": "gpt-5.6-luna" }] }
+                }),
+            ),
+            aggregate_site(
+                "site-b",
+                "Site B",
+                json!([{ "model": "gpt-5.6-luna" }, { "model": "codex-auto-review" }]),
+            ),
+        ];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+        let catalog = aggregate_catalog_from_entries(&entries, 200000);
+        let models = catalog["models"].as_array().unwrap();
+
+        let site_a_main = models
+            .iter()
+            .find(|model| model["slug"] == "site-a.gpt-5.6-luna")
+            .unwrap();
+        assert!(site_a_main.get("auto_review_model_override").is_none());
+
+        // Site B's own rows are untouched: it configures no override.
+        let site_b_review = models
+            .iter()
+            .find(|model| model["slug"] == "site-b.codex-auto-review")
+            .unwrap();
+        assert!(site_b_review.get("auto_review_model_override").is_none());
+    }
+
+    #[test]
+    fn aggregate_catalog_omits_an_auto_review_model_no_site_declares() {
+        let sites = vec![(
+            "site-a".to_string(),
+            "Site A".to_string(),
+            json!({
+                "config": "model = \"gpt-5.6-luna\"",
+                "autoReviewModelOverride": "missing-review-model",
+                "modelCatalog": {
+                    "models": [{ "model": "gpt-5.6-luna" }]
+                }
+            }),
+        )];
+
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap();
+        let catalog = aggregate_catalog_from_entries(&entries, 200000);
+        let models = catalog["models"].as_array().unwrap();
+
+        assert!(models
+            .iter()
+            .all(|model| model.get("auto_review_model_override").is_none()));
+    }
+
+    #[test]
+    fn aggregate_catalog_normalises_cjk_site_names_into_usable_prefixes() {
+        let sites = vec![aggregate_site(
+            "76a6ef74af6c4151812787cc519b534b",
+            "思源888 pro",
+            json!([{ "model": "gpt-5.6-luna" }]),
+        )];
+        let mut aliases = std::collections::BTreeMap::new();
+        aliases.insert(
+            "76a6ef74af6c4151812787cc519b534b".to_string(),
+            "思源888-pro".to_string(),
+        );
+        let naming = AggregateNamingConfig {
+            separator: ".".to_string(),
+            aliases,
+            naming: AggregateNamingMode::SiteModel,
+            ..AggregateNamingConfig::default()
+        };
+
+        let (entries, table) = codex_aggregate_catalog_entries(&sites, &naming).unwrap();
+
+        assert_eq!(entries[0].slug, "思源888-pro.gpt-5.6-luna");
+        // The mapping row declares no displayName, so the catalog names the
+        // model the same way the single-provider catalog does: the bundled
+        // preset-models name for that id, not the raw id.
+        assert_eq!(entries[0].display_name, "思源888 pro · GPT-5.6 Luna");
+        // The published slug must round-trip back to (site, model) so the
+        // router can address it: the multi-byte prefix is cut on a char
+        // boundary, not in the middle of a character.
+        assert_eq!(
+            crate::coding::proxy_gateway::aggregate_naming::split_site_model_slug(
+                &table[0].slug,
+                ".",
+                [("76a6ef74af6c4151812787cc519b534b", "思源888-pro")],
+            ),
+            Some((
+                "76a6ef74af6c4151812787cc519b534b".to_string(),
+                "gpt-5.6-luna".to_string()
+            ))
+        );
+    }
+
+    fn aggregate_naming_with_exposed(models: &[&str]) -> AggregateNamingConfig {
+        AggregateNamingConfig {
+            subagent_exposed_models: models.iter().map(|model| (*model).to_string()).collect(),
+            ..AggregateNamingConfig::default()
+        }
+    }
+
+    #[test]
+    fn aggregate_catalog_default_exposure_set_publishes_every_bare_model() {
+        let sites = vec![
+            aggregate_site(
+                "site1",
+                "Site 1",
+                json!([{ "model": "gpt-5.6-luna" }, { "model": "gpt-5.6-terra" }]),
+            ),
+            aggregate_site("site2", "Site 2", json!([{ "model": "glm-5" }])),
+        ];
+
+        // An empty exposure set is the default and must behave exactly as before
+        // this feature existed: every declared bare name stays callable.
+        let naming = aggregate_naming(".");
+        assert!(naming.exposes_every_bare_model());
+        let (entries, _) = codex_aggregate_catalog_entries(&sites, &naming).unwrap();
+        let hidden = entries
+            .iter()
+            .filter(|entry| entry.hidden)
+            .map(|entry| entry.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(hidden, vec!["gpt-5.6-luna", "gpt-5.6-terra", "glm-5"]);
+    }
+
+    #[test]
+    fn aggregate_catalog_narrowed_exposure_set_publishes_only_the_selected_bare_names() {
+        let sites = vec![
+            aggregate_site(
+                "site1",
+                "Site 1",
+                json!([{ "model": "gpt-5.6-luna" }, { "model": "gpt-5.6-terra" }]),
+            ),
+            aggregate_site("site2", "Site 2", json!([{ "model": "glm-5" }])),
+        ];
+
+        let (entries, _) =
+            codex_aggregate_catalog_entries(&sites, &aggregate_naming_with_exposed(&["glm-5"]))
+                .unwrap();
+        let hidden = entries
+            .iter()
+            .filter(|entry| entry.hidden)
+            .map(|entry| entry.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(hidden, vec!["glm-5"]);
+        // The visible `<site><sep><model>` table is untouched by the exposure
+        // set: only the extra bare-name aliases are filtered.
+        let visible = entries
+            .iter()
+            .filter(|entry| !entry.hidden)
+            .map(|entry| entry.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible,
+            vec!["site1.gpt-5.6-luna", "site1.gpt-5.6-terra", "site2.glm-5"]
+        );
+    }
+
+    #[test]
+    fn aggregate_catalog_keeps_narrowed_out_names_addressable_by_slug() {
+        use crate::coding::proxy_gateway::aggregate_naming::build_aggregate_bare_model_universe;
+
+        let sites = vec![
+            aggregate_site(
+                "site1",
+                "Site 1",
+                json!([{ "model": "gpt-5.6-luna" }, { "model": "gpt-5.6-terra" }]),
+            ),
+            aggregate_site("site2", "Site 2", json!([{ "model": "gpt-5.6-luna" }])),
+        ];
+
+        // Debt #2: narrowing the exposure set removes the *hidden alias*, but the
+        // drawer's universe (the site-declared models, first site wins) must keep
+        // reporting the dropped name so it can be ticked back on later.
+        let declared = sites
+            .iter()
+            .map(|(site_id, _, settings_config)| {
+                let models = aggregate_site_model_specs(settings_config)
+                    .into_iter()
+                    .map(|spec| spec.model)
+                    .collect::<Vec<_>>();
+                (site_id.clone(), models)
+            })
+            .collect::<Vec<_>>();
+        let universe = build_aggregate_bare_model_universe(&declared);
+        assert_eq!(
+            universe
+                .iter()
+                .map(|entry| (entry.site_id.as_str(), entry.model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("site1", "gpt-5.6-luna"), ("site1", "gpt-5.6-terra"),]
+        );
+
+        // Only the ticked name is published as a hidden alias; the other keeps
+        // working through its `<site><sep><model>` slug.
+        let (entries, _) = codex_aggregate_catalog_entries(
+            &sites,
+            &aggregate_naming_with_exposed(&["gpt-5.6-terra"]),
+        )
+        .unwrap();
+        let hidden = entries
+            .iter()
+            .filter(|entry| entry.hidden)
+            .map(|entry| entry.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(hidden, vec!["gpt-5.6-terra"]);
+        let visible = entries
+            .iter()
+            .filter(|entry| !entry.hidden)
+            .map(|entry| entry.slug.as_str())
+            .collect::<Vec<_>>();
+        assert!(visible.contains(&"site1.gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn aggregate_catalog_model_only_numbering_ignores_hidden_aliases() {
+        let sites = vec![
+            aggregate_site("site-a", "Site A", json!([{ "model": "gpt-5.6-luna" }])),
+            aggregate_site("site-b", "Site B", json!([{ "model": "gpt-5.6-luna" }])),
+        ];
+        let naming = AggregateNamingConfig {
+            separator: ".".to_string(),
+            aliases: std::collections::BTreeMap::new(),
+            naming: AggregateNamingMode::ModelOnly,
+            ..AggregateNamingConfig::default()
+        };
+
+        let (entries, table) = codex_aggregate_catalog_entries(&sites, &naming).unwrap();
+
+        // `model_only` already publishes the bare names, so no hidden entries
+        // are added and the `#N` table stays exactly as before this change.
+        let slugs: Vec<&str> = table.iter().map(|entry| entry.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["gpt-5.6-luna", "gpt-5.6-luna#2"]);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| !entry.hidden));
+    }
+
+    #[test]
+    fn aggregate_catalog_reports_a_bare_name_that_collides_with_a_generated_slug() {
+        // Site `a` publishes `a.luna`; site `b` declares a model literally named
+        // `a.luna`. The bare name is already taken by site a's generated slug,
+        // so silently publishing it would mis-route. Expect a clear error.
+        let sites = vec![
+            aggregate_site("a", "A", json!([{ "model": "luna" }])),
+            aggregate_site("b", "B", json!([{ "model": "a.luna" }])),
+        ];
+
+        let error = codex_aggregate_catalog_entries(&sites, &aggregate_naming(".")).unwrap_err();
+
+        assert!(error.contains("a.luna"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn aggregate_slug_table_pairs_every_catalog_slug_with_its_site_and_model() {
+        let sites = vec![
+            aggregate_site("site-a", "Site A", json!([{ "model": "m1" }])),
+            aggregate_site("site-b", "Site B", json!([{ "model": "m1" }])),
+        ];
+
+        let table = codex_aggregate_slug_table(&sites, &aggregate_naming(".")).unwrap();
+
+        // The persisted table must address the same pairs the catalog publishes,
+        // in the same order, so routing never diverges from the model list.
+        let pairs: Vec<(&str, &str, &str)> = table
+            .iter()
+            .map(|entry| {
+                (
+                    entry.site_id.as_str(),
+                    entry.upstream_model.as_str(),
+                    entry.slug.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("site-a", "m1", "site-a.m1"), ("site-b", "m1", "site-b.m1")]
+        );
+    }
+
+    #[test]
+    fn remove_aggregate_catalog_clears_pointer_only_when_it_is_ours() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Our pointer: removed.
+        std::fs::write(
+            &config_path,
+            format!("model_provider = \"custom\"\nmodel_catalog_json = \"{AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME}\"\n"),
+        )
+        .unwrap();
+        remove_codex_aggregate_catalog(temp_dir.path()).unwrap();
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!after.contains("model_catalog_json"));
+        assert!(after.contains("model_provider"));
+
+        // Someone else's pointer: left untouched.
+        std::fs::write(
+            &config_path,
+            "model_catalog_json = \"other-catalog.json\"\n",
+        )
+        .unwrap();
+        remove_codex_aggregate_catalog(temp_dir.path()).unwrap();
+        let untouched = std::fs::read_to_string(&config_path).unwrap();
+        assert!(untouched.contains("other-catalog.json"));
+    }
+
+    #[test]
+    fn remove_aggregate_catalog_is_noop_without_config_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(remove_codex_aggregate_catalog(temp_dir.path()).is_ok());
+    }
+
+    #[test]
+    fn pre_aggregate_catalog_snapshot_restores_pointer_and_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+        let catalog_path = temp_dir
+            .path()
+            .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
+        std::fs::write(
+            &config_path,
+            format!(
+                "model_provider = \"custom\"\nmodel_catalog_json = \"{AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(&catalog_path, "{\"models\":[{\"slug\":\"single-site\"}]}").unwrap();
+
+        let snapshot = capture_codex_pre_aggregate_catalog(temp_dir.path()).unwrap();
+        assert_eq!(
+            snapshot.pointer.as_deref(),
+            Some(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME)
+        );
+        assert!(snapshot
+            .file_content
+            .as_deref()
+            .unwrap()
+            .contains("single-site"));
+
+        // Aggregate engage overwrites the pointer and the shared catalog file.
+        std::fs::write(&catalog_path, "{\"models\":[{\"slug\":\"site-a.m1\"}]}").unwrap();
+        ensure_codex_model_catalog_pointer(temp_dir.path()).unwrap();
+
+        restore_codex_pre_aggregate_catalog(temp_dir.path(), &snapshot).unwrap();
+
+        let restored_config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(restored_config.contains(&format!(
+            "model_catalog_json = \"{AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME}\""
+        )));
+        let restored_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        assert!(restored_catalog.contains("single-site"));
+        assert!(!restored_catalog.contains("site-a.m1"));
+    }
+
+    #[test]
+    fn pre_aggregate_catalog_snapshot_restores_an_external_pointer() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, "model_catalog_json = \"external.json\"\n").unwrap();
+
+        let snapshot = capture_codex_pre_aggregate_catalog(temp_dir.path()).unwrap();
+        assert_eq!(snapshot.pointer.as_deref(), Some("external.json"));
+        assert!(snapshot.file_content.is_none());
+
+        // Aggregate engage claims the pointer and creates the shared file.
+        ensure_codex_model_catalog_pointer(temp_dir.path()).unwrap();
+        let catalog_path = temp_dir
+            .path()
+            .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
+        std::fs::write(&catalog_path, "{\"models\":[]}").unwrap();
+
+        restore_codex_pre_aggregate_catalog(temp_dir.path(), &snapshot).unwrap();
+
+        let restored_config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(restored_config.contains("external.json"));
+        assert!(!restored_config.contains(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME));
+        // The shared file did not exist before the takeover, so it is removed.
+        assert!(!catalog_path.exists());
+    }
+
+    #[test]
+    fn pre_aggregate_catalog_snapshot_without_pointer_keeps_a_leftover_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+        let catalog_path = temp_dir
+            .path()
+            .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
+        std::fs::write(&config_path, "model_provider = \"custom\"\n").unwrap();
+        std::fs::write(&catalog_path, "{\"models\":[{\"slug\":\"leftover\"}]}").unwrap();
+
+        let snapshot = capture_codex_pre_aggregate_catalog(temp_dir.path()).unwrap();
+        assert!(snapshot.pointer.is_none());
+        assert!(snapshot
+            .file_content
+            .as_deref()
+            .unwrap()
+            .contains("leftover"));
+
+        ensure_codex_model_catalog_pointer(temp_dir.path()).unwrap();
+        std::fs::write(&catalog_path, "{\"models\":[{\"slug\":\"site-a.m1\"}]}").unwrap();
+
+        restore_codex_pre_aggregate_catalog(temp_dir.path(), &snapshot).unwrap();
+
+        let restored_config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!restored_config.contains("model_catalog_json"));
+        let restored_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        assert!(restored_catalog.contains("leftover"));
+        assert!(!restored_catalog.contains("site-a.m1"));
+    }
+
+    #[test]
+    fn pre_aggregate_catalog_snapshot_of_a_bare_config_removes_the_created_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, "model_provider = \"custom\"\n").unwrap();
+
+        let snapshot = capture_codex_pre_aggregate_catalog(temp_dir.path()).unwrap();
+        assert!(snapshot.pointer.is_none());
+        assert!(snapshot.file_content.is_none());
+
+        let catalog_path = temp_dir
+            .path()
+            .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME);
+        std::fs::write(&catalog_path, "{\"models\":[]}").unwrap();
+        ensure_codex_model_catalog_pointer(temp_dir.path()).unwrap();
+
+        restore_codex_pre_aggregate_catalog(temp_dir.path(), &snapshot).unwrap();
+
+        assert!(!std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("model_catalog_json"));
+        assert!(!catalog_path.exists());
+    }
+
+    #[test]
+    fn ensure_catalog_pointer_sets_and_restores_the_managed_pointer() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Absent pointer: the takeover asserts it, so a re-engage round trip
+        // (which drops it first) still ends with Codex reading the catalog.
+        std::fs::write(&config_path, "model_provider = \"custom\"\n").unwrap();
+        ensure_codex_model_catalog_pointer(temp_dir.path()).unwrap();
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(after.contains(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME));
+        assert!(after.contains("model_provider"));
+
+        // Round trip: retire then re-assert, exactly like restore-direct ->
+        // re-engage, and the pointer must come back.
+        remove_codex_aggregate_catalog(temp_dir.path()).unwrap();
+        assert!(!std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("model_catalog_json"));
+        ensure_codex_model_catalog_pointer(temp_dir.path()).unwrap();
+        assert!(std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME));
+    }
+
+    #[test]
+    fn read_aggregate_selection_returns_none_without_manifest() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(read_codex_aggregate_selection(temp_dir.path()).is_none());
+    }
+
     #[test]
     fn prepare_codex_config_with_model_catalog_writes_relative_pointer() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -4918,11 +6808,15 @@ wire_api = "responses"
         // verbatim instead of the stripped neutral template — the harness
         // tells the model to use apply_patch, so stripping the tool while
         // keeping the harness would be self-inconsistent.
+        //
+        // `deepseek-flash` is the official v1.3.0 slug (renamed from
+        // `deepseek-v4-flash`) and the official entry declares
+        // text+image input — the matched vendor declaration must survive.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let settings = json!({
             "modelCatalog": {
                 "models": [
-                    { "model": "deepseek-v4-flash", "displayName": "DeepSeek V4 Flash" },
+                    { "model": "deepseek-flash", "displayName": "DeepSeek Flash" },
                     { "model": "deepseek-v4-pro", "contextWindow": 500_000 }
                 ]
             }
@@ -4943,7 +6837,7 @@ wire_api = "responses"
         let flash = &catalog["models"][0];
         assert_eq!(
             flash.get("slug").and_then(|v| v.as_str()),
-            Some("deepseek-v4-flash")
+            Some("deepseek-flash")
         );
         assert_eq!(
             flash.get("apply_patch_tool_type").and_then(|v| v.as_str()),
@@ -4964,7 +6858,13 @@ wire_api = "responses"
             .filter_map(|level| level.get("effort").and_then(|v| v.as_str()))
             .collect();
         assert_eq!(efforts, vec!["low", "high", "max"]);
-        assert_eq!(flash.get("input_modalities"), Some(&json!(["text"])));
+        // The official deepseek-flash entry declares text+image (the renamed
+        // flagship supports image input); the matched vendor declaration must
+        // reach the generated catalog verbatim.
+        assert_eq!(
+            flash.get("input_modalities"),
+            Some(&json!(["text", "image"]))
+        );
         assert!(
             flash.get("model_messages").is_some(),
             "official entries are mirrored verbatim, incl. model_messages"
@@ -4978,7 +6878,7 @@ wire_api = "responses"
         // Explicit user display name still wins over the official one.
         assert_eq!(
             flash.get("display_name").and_then(|v| v.as_str()),
-            Some("DeepSeek V4 Flash")
+            Some("DeepSeek Flash")
         );
 
         let pro = &catalog["models"][1];
@@ -4992,6 +6892,9 @@ wire_api = "responses"
             pro.get("display_name").and_then(|v| v.as_str()),
             Some("DeepSeek-V4-Pro")
         );
+        // The official pro entry is text-only (confirmed by the preset registry
+        // too), and must stay text-only.
+        assert_eq!(pro.get("input_modalities"), Some(&json!(["text"])));
         // Explicit user context window override wins over the official 1m.
         assert_eq!(
             pro.get("context_window").and_then(|v| v.as_u64()),
@@ -5004,11 +6907,17 @@ wire_api = "responses"
     }
 
     #[test]
-    fn deepseek_unknown_model_clones_flagship_capabilities_without_impersonation() {
+    fn deepseek_unknown_model_clones_flagship_tools_but_not_its_modalities() {
         // A user model that does not match any official slug (e.g.
-        // `deepseek-reasoner`) clones the flagship entry for its capability
-        // profile but must NOT keep the flagship's display name / description —
+        // `deepseek-reasoner`) clones the flagship entry for its tool profile
+        // but must NOT keep the flagship's display name / description —
         // it would show the wrong model name in the Codex model selector.
+        //
+        // The flagship's `input_modalities` are NOT inherited either:
+        // `deepseek-reasoner` is a known text-only preset model, so the
+        // preset registry decides (issue #368: an unmatched id must not be
+        // dragged to text-only by a stale flagship entry — and a
+        // known-text-only id must not fail open either).
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let settings = json!({
             "modelCatalog": {
@@ -5046,12 +6955,244 @@ wire_api = "responses"
             entry.get("description").and_then(|v| v.as_str()),
             Some("deepseek-reasoner")
         );
-        // Capability profile still inherited from the flagship.
+        // Tool profile still inherited from the flagship.
         assert_eq!(
             entry.get("apply_patch_tool_type").and_then(|v| v.as_str()),
             Some("freeform")
         );
+        // Known text-only preset model: text-only, not the flagship's profile
+        // and not a fail-open image grant.
         assert_eq!(entry.get("input_modalities"), Some(&json!(["text"])));
+    }
+
+    #[test]
+    fn deepseek_unknown_model_with_preset_image_support_advertises_image() {
+        // Issue #368 regression: the official catalog renamed
+        // `deepseek-v4-flash` to `deepseek-flash`, and `deepseek-v4.1-flash`
+        // is the stale preset-side spelling of the same model — neither
+        // matches an official slug in the bundled vendor snapshot. The
+        // bundled presets declare text+image for that id, and an image
+        // declaration from EITHER source must win — the id must not be
+        // declared text-only merely because the vendor snapshot predates the
+        // rename.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "deepseek-v4.1-flash" }
+                ]
+            }
+        });
+
+        let _rendered = prepare_codex_config_with_model_catalog(
+            temp_dir.path(),
+            Some(&settings),
+            DEEPSEEK_NATIVE_CONFIG,
+        )
+        .expect("vendor catalog generation should not error");
+        let catalog_text = std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&catalog_text).unwrap();
+
+        let entry = &catalog["models"][0];
+        assert_eq!(
+            entry.get("input_modalities"),
+            Some(&json!(["text", "image"])),
+            "preset image declaration must win over the missing vendor slug"
+        );
+    }
+
+    #[test]
+    fn deepseek_fully_unknown_model_fails_open_to_text_and_image() {
+        // An id neither the vendor catalog nor the bundled presets know fails
+        // open to text+image, matching Codex's own `default_input_modalities`
+        // (the field omitted defaults to text+image): a visible upstream error
+        // beats silently stripping user images.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "my-custom-vision-model" }
+                ]
+            }
+        });
+
+        let _rendered = prepare_codex_config_with_model_catalog(
+            temp_dir.path(),
+            Some(&settings),
+            DEEPSEEK_NATIVE_CONFIG,
+        )
+        .expect("vendor catalog generation should not error");
+        let catalog_text = std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&catalog_text).unwrap();
+
+        let entry = &catalog["models"][0];
+        assert_eq!(
+            entry.get("input_modalities"),
+            Some(&json!(["text", "image"]))
+        );
+    }
+
+    #[test]
+    fn deepseek_user_row_modalities_override_wins_over_everything() {
+        // The per-row `modalities.input` declaration is the only user-facing
+        // way to force a modality set: it beats the vendor's image grant
+        // (forcing text-only) and beats the preset text-only registry (forcing
+        // image on).
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "deepseek-flash",
+                        "modalities": { "input": ["text"] }
+                    },
+                    {
+                        "model": "deepseek-v4-pro",
+                        "modalities": { "input": ["text", "image"] }
+                    }
+                ]
+            }
+        });
+
+        let _rendered = prepare_codex_config_with_model_catalog(
+            temp_dir.path(),
+            Some(&settings),
+            DEEPSEEK_NATIVE_CONFIG,
+        )
+        .expect("vendor catalog generation should not error");
+        let catalog_text = std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&catalog_text).unwrap();
+
+        let flash = &catalog["models"][0];
+        assert_eq!(
+            flash.get("input_modalities"),
+            Some(&json!(["text"])),
+            "explicit text-only row declaration must beat the vendor image grant"
+        );
+        let pro = &catalog["models"][1];
+        assert_eq!(
+            pro.get("input_modalities"),
+            Some(&json!(["text", "image"])),
+            "explicit image row declaration must beat the vendor text-only declaration"
+        );
+    }
+
+    #[test]
+    fn codex_catalog_drops_modalities_codex_cannot_deserialize() {
+        // Preset and vendor data can declare values the Codex `InputModality`
+        // enum does not know (models.dev ships video/pdf); shipping them makes
+        // Codex reject the whole catalog file when it loads the config.
+        assert_eq!(
+            sanitize_codex_catalog_input_modalities(&[
+                "text".to_string(),
+                "image".to_string(),
+                "video".to_string(),
+                "pdf".to_string(),
+            ]),
+            vec!["text", "image"]
+        );
+        // Audio is a real Codex modality and survives.
+        assert_eq!(
+            sanitize_codex_catalog_input_modalities(&[
+                "text".to_string(),
+                "image".to_string(),
+                "audio".to_string(),
+                "video".to_string(),
+            ]),
+            vec!["text", "image", "audio"]
+        );
+        // Case and whitespace are normalized; a fully unusable declaration
+        // falls back to Codex's own text+image default instead of an empty
+        // array.
+        assert_eq!(
+            sanitize_codex_catalog_input_modalities(&[
+                " TEXT ".to_string(),
+                "Image".to_string(),
+                "VIDEO".to_string(),
+            ]),
+            vec!["text", "image"]
+        );
+        assert_eq!(
+            sanitize_codex_catalog_input_modalities(&["video".to_string(), "pdf".to_string()]),
+            vec!["text", "image"]
+        );
+
+        // The vendor branch goes through the same filter: an unknown id with a
+        // matched vendor entry keeps its image grant but loses video.
+        let spec = CodexCatalogModelSpec {
+            model: "my-relay-model".to_string(),
+            display_name: None,
+            context_window: None,
+            auto_review_model_override: None,
+            reasoning_levels: None,
+            default_reasoning_level: None,
+            service_tiers: None,
+            input_modalities: None,
+        };
+        assert_eq!(
+            codex_catalog_effective_input_modalities(
+                &spec,
+                Some(&json!(["text", "image", "video"]))
+            ),
+            vec!["text", "image"]
+        );
+    }
+
+    #[test]
+    fn preset_video_modalities_are_dropped_from_the_generated_catalog() {
+        // End-to-end through the user path: a mapping row whose model id the
+        // bundled presets know used to emit the preset's full modality list,
+        // including video/pdf (issue #218 comment: Codex failed to load).
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "gemini-2.5-flash" },
+                    { "model": "kimi-k2.5" }
+                ]
+            }
+        });
+
+        prepare_codex_config_with_model_catalog(
+            temp_dir.path(),
+            Some(&settings),
+            "model = \"gemini-2.5-flash\"\n",
+        )
+        .expect("catalog generation should not error");
+        let catalog_text = std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&catalog_text).unwrap();
+
+        // gemini-2.5-flash declares text/image/audio/video/pdf: video and pdf
+        // are dropped, audio (a real Codex modality) is kept.
+        assert_eq!(
+            catalog["models"][0].get("input_modalities"),
+            Some(&json!(["text", "image", "audio"]))
+        );
+        // kimi-k2.5 declares text/image/video: video is dropped.
+        assert_eq!(
+            catalog["models"][1].get("input_modalities"),
+            Some(&json!(["text", "image"]))
+        );
     }
 
     #[test]
@@ -5114,11 +7255,17 @@ wire_api = "responses"
         // official freeform apply_patch / image-free catalog: wrongly granting
         // freeform apply_patch to an aggregator that does not honor it would
         // reintroduce the custom-tool rejection bug.
+        //
+        // Modality-wise the neutral path still resolves through the shared
+        // chain: a preset-known text-only id (deepseek-v4-flash) stays
+        // text-only even here, while an id nothing knows fails open to
+        // text+image.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let settings = json!({
             "modelCatalog": {
                 "models": [
-                    { "model": "deepseek-v4-flash", "displayName": "DeepSeek Flash" }
+                    { "model": "deepseek-v4-flash", "displayName": "DeepSeek Flash" },
+                    { "model": "my-relay-model" }
                 ]
             }
         });
@@ -5150,17 +7297,21 @@ wire_api = "responses"
             entry.get("slug").and_then(|v| v.as_str()),
             Some("deepseek-v4-flash")
         );
-        // Neutral template: image-friendly input modalities, search tool on.
+        // Preset-known text-only id: the neutral template's fail-open default
+        // does NOT override the preset's confirmed declaration.
+        assert_eq!(entry.get("input_modalities"), Some(&json!(["text"])));
+        // Fully unknown id: fail open, image-friendly.
+        let relay = &catalog["models"][1];
         assert_eq!(
-            entry.get("input_modalities"),
+            relay.get("input_modalities"),
             Some(&json!(["text", "image"]))
         );
         assert_eq!(
-            entry.get("web_search_tool_type").and_then(|v| v.as_str()),
+            relay.get("web_search_tool_type").and_then(|v| v.as_str()),
             Some("text_and_image")
         );
         assert_eq!(
-            entry.get("context_window").and_then(|v| v.as_u64()),
+            relay.get("context_window").and_then(|v| v.as_u64()),
             Some(272_000)
         );
 
@@ -5184,10 +7335,7 @@ wire_api = "chat"
         .unwrap();
         let catalog: serde_json::Value = serde_json::from_str(&catalog_text).unwrap();
         let entry = &catalog["models"][0];
-        assert_eq!(
-            entry.get("input_modalities"),
-            Some(&json!(["text", "image"]))
-        );
+        assert_eq!(entry.get("input_modalities"), Some(&json!(["text"])));
 
         // Host that merely CONTAINS "deepseek.com" as a substring is not the
         // official gateway — must stay neutral to avoid granting the official
@@ -5211,14 +7359,9 @@ wire_api = "responses"
         .unwrap();
         let catalog: serde_json::Value = serde_json::from_str(&catalog_text).unwrap();
         let entry = &catalog["models"][0];
-        // Substring host must NOT trigger the official DeepSeek mirror: keep
-        // the neutral image-friendly template and the neutral 272k default,
-        // not the official text-only modality / 1m window.
-        assert_eq!(
-            entry.get("input_modalities"),
-            Some(&json!(["text", "image"])),
-            "substring host must not trigger the official DeepSeek mirror"
-        );
+        // Substring host must NOT trigger the official DeepSeek mirror: the
+        // modality stays the preset's text-only and the neutral 272k window.
+        assert_eq!(entry.get("input_modalities"), Some(&json!(["text"])));
         assert_eq!(
             entry.get("context_window").and_then(|v| v.as_u64()),
             Some(272_000),
@@ -5255,6 +7398,120 @@ wire_api = "responses"
             doc["model_catalog_json"].as_str(),
             Some("external-catalog.json")
         );
+    }
+
+    #[test]
+    fn catalog_preview_follows_pointer_and_returns_file_text() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+        let config_text =
+            format!("model_provider = \"custom\"\nmodel_catalog_json = \"{AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME}\"\n");
+        std::fs::write(&config_path, &config_text).unwrap();
+        std::fs::write(
+            temp_dir.path().join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME),
+            "{\"models\":[]}",
+        )
+        .unwrap();
+
+        let preview = tauri::async_runtime::block_on(read_codex_catalog_preview(
+            &config_path,
+            Some(&config_text),
+        ));
+
+        assert_eq!(preview.content.as_deref(), Some("{\"models\":[]}"));
+        assert!(preview.pointer_active);
+    }
+
+    #[test]
+    fn catalog_preview_resolves_subdirectory_and_absolute_pointers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path();
+        std::fs::create_dir(root.join("catalogs")).unwrap();
+        std::fs::write(root.join("catalogs").join("sub.json"), "{}").unwrap();
+        let outside_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside_dir.path().join("outside.json"), "[]").unwrap();
+        let config_path = root.join("config.toml");
+
+        let relative_config = "model_catalog_json = \"catalogs/sub.json\"\n";
+        let sub_preview = tauri::async_runtime::block_on(read_codex_catalog_preview(
+            &config_path,
+            Some(relative_config),
+        ));
+        assert_eq!(sub_preview.content.as_deref(), Some("{}"));
+        assert!(sub_preview.pointer_active);
+
+        let absolute_pointer = outside_dir.path().join("outside.json");
+        // Single-quoted TOML literal string: Windows absolute paths contain
+        // backslashes that a basic string would treat as escapes.
+        let absolute_config = format!("model_catalog_json = '{}'", absolute_pointer.display());
+        let absolute_preview = tauri::async_runtime::block_on(read_codex_catalog_preview(
+            &config_path,
+            Some(&absolute_config),
+        ));
+        assert_eq!(absolute_preview.content.as_deref(), Some("[]"));
+        assert!(absolute_preview.pointer_active);
+    }
+
+    #[test]
+    fn catalog_preview_falls_back_to_ai_toolbox_catalog_without_pointer() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(
+            temp_dir.path().join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME),
+            "{\"models\":[{\"slug\":\"leftover\"}]}",
+        )
+        .unwrap();
+
+        // A provider applied without model mappings removes the pointer but
+        // keeps the file; the preview must still surface that leftover.
+        let preview = tauri::async_runtime::block_on(read_codex_catalog_preview(
+            &config_path,
+            Some("model_provider = \"custom\"\n"),
+        ));
+
+        assert_eq!(
+            preview.content.as_deref(),
+            Some("{\"models\":[{\"slug\":\"leftover\"}]}")
+        );
+        assert!(!preview.pointer_active);
+    }
+
+    #[test]
+    fn catalog_preview_degrades_without_pointer_or_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        // No pointer and no leftover AI Toolbox file: nothing to show.
+        let no_pointer = tauri::async_runtime::block_on(read_codex_catalog_preview(
+            &config_path,
+            Some("model_provider = \"custom\"\n"),
+        ));
+        assert_eq!(no_pointer.content, None);
+        assert!(!no_pointer.pointer_active);
+
+        // Empty or non-string pointer values are not usable file names; they
+        // fall into the same no-pointer fallback (still nothing on disk here).
+        for config_text in [
+            "model_catalog_json = \"\"\n",
+            "model_catalog_json = [\"a.json\"]\n",
+            "model_catalog_json = [\"unterminated",
+        ] {
+            let preview = tauri::async_runtime::block_on(read_codex_catalog_preview(
+                &config_path,
+                Some(config_text),
+            ));
+            assert_eq!(preview.content, None, "config: {config_text}");
+            assert!(!preview.pointer_active, "config: {config_text}");
+        }
+
+        // Dangling pointer: the pointer counts as active so the preview can
+        // surface the missing file, but there is no content to show.
+        let dangling_preview = tauri::async_runtime::block_on(read_codex_catalog_preview(
+            &config_path,
+            Some("model_catalog_json = \"missing-catalog.json\"\n"),
+        ));
+        assert_eq!(dangling_preview.content, None);
+        assert!(dangling_preview.pointer_active);
     }
 
     #[test]
@@ -5447,7 +7704,8 @@ base_url = "https://api.example.com/v1"
         });
 
         let projected =
-            project_codex_auth_to_runtime_config(managed_config, &managed_auth, true).unwrap();
+            project_codex_auth_to_runtime_config(managed_config, &managed_auth, true, "custom")
+                .unwrap();
         let doc: DocumentMut = projected.parse().unwrap();
 
         assert_eq!(
@@ -5467,12 +7725,136 @@ model = "gpt-5.4"
         });
 
         let error =
-            project_codex_auth_to_runtime_config(managed_config, &managed_auth, true).unwrap_err();
+            project_codex_auth_to_runtime_config(managed_config, &managed_auth, true, "custom")
+                .unwrap_err();
 
         assert!(
             error.contains("config.toml has no active model_provider"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn project_codex_auth_strips_requires_openai_auth_for_keyless_custom_provider() {
+        // issue #353: a custom provider with no managed API key must not keep
+        // `requires_openai_auth = true`, otherwise Codex aborts with
+        // "Missing environment variable: OPENAI_API_KEY" when auth.json and the
+        // env var are both empty. Gateway/relay providers (ccNexus, AxonHub)
+        // leave this flag unset and let the upstream manage auth; we do the same.
+        let managed_config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+        let managed_auth = json!({});
+
+        let projected =
+            project_codex_auth_to_runtime_config(managed_config, &managed_auth, false, "custom")
+                .unwrap();
+        let doc: DocumentMut = projected.parse().unwrap();
+
+        assert_eq!(doc["model_provider"].as_str(), Some("custom"));
+        assert!(doc["model_providers"]["custom"]
+            .as_table_like()
+            .expect("custom provider table")
+            .get("requires_openai_auth")
+            .is_none());
+    }
+
+    #[test]
+    fn project_codex_auth_keeps_requires_openai_auth_for_custom_provider_with_key() {
+        // A custom provider WITH a managed API key keeps requires_openai_auth so
+        // Codex reads the credential from auth.json (mirrors `codex login
+        // --with-api-key`). preserve=false leaves the key in auth.json, not in
+        // config.toml, so no experimental_bearer_token is written.
+        let managed_config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+        let managed_auth = json!({ "OPENAI_API_KEY": "sk-third-party" });
+
+        let projected =
+            project_codex_auth_to_runtime_config(managed_config, &managed_auth, false, "custom")
+                .unwrap();
+        let doc: DocumentMut = projected.parse().unwrap();
+
+        assert_eq!(
+            doc["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
+            Some(true)
+        );
+        assert!(doc["model_providers"]["custom"]
+            .as_table_like()
+            .expect("custom provider table")
+            .get("experimental_bearer_token")
+            .is_none());
+    }
+
+    #[test]
+    fn project_codex_auth_keeps_requires_openai_auth_for_official_provider_without_key() {
+        // Official providers may rely on ChatGPT OAuth tokens in auth.json, so
+        // requires_openai_auth must survive even when no managed API key is set.
+        let managed_config = r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "OpenAI"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+        let managed_auth = json!({});
+
+        let projected =
+            project_codex_auth_to_runtime_config(managed_config, &managed_auth, false, "official")
+                .unwrap();
+        let doc: DocumentMut = projected.parse().unwrap();
+
+        assert_eq!(
+            doc["model_providers"]["openai"]["requires_openai_auth"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn project_codex_auth_strips_requires_openai_auth_when_projecting_bearer_token() {
+        // cc-switch#7211: for a third-party provider authenticating via
+        // experimental_bearer_token (preserve=true), keeping
+        // requires_openai_auth = true makes Codex send auth.json credentials
+        // instead of the provider bearer token, causing 401. The bearer token
+        // is the intended credential, so drop requires_openai_auth.
+        let managed_config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+        let managed_auth = json!({ "OPENAI_API_KEY": "sk-third-party" });
+
+        let projected =
+            project_codex_auth_to_runtime_config(managed_config, &managed_auth, true, "custom")
+                .unwrap();
+        let doc: DocumentMut = projected.parse().unwrap();
+
+        assert_eq!(
+            doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+            Some("sk-third-party")
+        );
+        assert!(doc["model_providers"]["custom"]
+            .as_table_like()
+            .expect("custom provider table")
+            .get("requires_openai_auth")
+            .is_none());
     }
 
     #[test]
@@ -5505,6 +7887,44 @@ model = "gpt-5.4"
         assert_eq!(doc["model"].as_str(), Some("gpt-5.4"));
         assert!(doc.get("model_provider").is_none());
         assert!(doc.get("model_providers").is_none());
+    }
+
+    #[test]
+    fn build_written_codex_config_toml_drops_stale_requires_openai_auth_on_switch() {
+        // issue #353 regression: switching from a custom provider that kept
+        // requires_openai_auth=true (key in auth.json, preserve=false) to a
+        // keyless custom provider (requires_openai_auth stripped) must remove
+        // the stale flag from disk via the previous_managed diff — otherwise
+        // Codex keeps demanding OPENAI_API_KEY after the switch.
+        let previous_managed = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+        let next_managed = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+"#;
+
+        let rendered =
+            build_written_codex_config_toml(previous_managed, Some(previous_managed), next_managed)
+                .unwrap();
+        let doc: DocumentMut = rendered.parse().unwrap();
+
+        assert_eq!(doc["model_provider"].as_str(), Some("custom"));
+        assert!(doc["model_providers"]["custom"]
+            .as_table_like()
+            .expect("custom provider table")
+            .get("requires_openai_auth")
+            .is_none());
     }
 
     #[test]
@@ -5992,9 +8412,13 @@ name = "Provider A"
 base_url = "https://api.provider-a.com/v1"
 "#;
         let provider_a_auth = json!({"OPENAI_API_KEY": "sk-provider-a"});
-        let projected_a =
-            project_codex_auth_to_runtime_config(provider_a_config, &provider_a_auth, true)
-                .unwrap();
+        let projected_a = project_codex_auth_to_runtime_config(
+            provider_a_config,
+            &provider_a_auth,
+            true,
+            "custom",
+        )
+        .unwrap();
         let doc_a: DocumentMut = projected_a.parse().unwrap();
         assert_eq!(
             doc_a["model_providers"]["provider-a"]["experimental_bearer_token"].as_str(),
@@ -6010,9 +8434,13 @@ name = "Provider B"
 base_url = "https://api.provider-b.com/v1"
 "#;
         let provider_b_auth = json!({"OPENAI_API_KEY": "sk-provider-b"});
-        let projected_b =
-            project_codex_auth_to_runtime_config(provider_b_config, &provider_b_auth, true)
-                .unwrap();
+        let projected_b = project_codex_auth_to_runtime_config(
+            provider_b_config,
+            &provider_b_auth,
+            true,
+            "custom",
+        )
+        .unwrap();
 
         // Simulate diff cleanup: previous_managed has provider-a token, next_managed has provider-b
         let cleaned_b = build_written_codex_config_toml(
@@ -6043,6 +8471,7 @@ model = "claude-sonnet-4-6"
             official_config,
             &official_auth,
             false, // preserve=false for official
+            "official",
         )
         .unwrap();
 
@@ -6060,9 +8489,13 @@ model = "claude-sonnet-4-6"
         assert!(doc_official.get("experimental_bearer_token").is_none());
 
         // Switch back to Provider A with preserve=false (switch disabled)
-        let projected_a_no_preserve =
-            project_codex_auth_to_runtime_config(provider_a_config, &provider_a_auth, false)
-                .unwrap();
+        let projected_a_no_preserve = project_codex_auth_to_runtime_config(
+            provider_a_config,
+            &provider_a_auth,
+            false,
+            "custom",
+        )
+        .unwrap();
         let doc_a_no_preserve: DocumentMut = projected_a_no_preserve.parse().unwrap();
         // Should not have experimental_bearer_token when preserve=false
         assert!(doc_a_no_preserve["model_providers"]["provider-a"]

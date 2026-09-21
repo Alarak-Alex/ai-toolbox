@@ -1,4 +1,4 @@
-import type { GatewayCliKey, ProxyGatewaySettings, ProxyGatewayStatus } from '@/services';
+import type { GatewayCliKey, GatewayRequestLogFilters, GatewayUsageTool, ProxyGatewaySettings, ProxyGatewayStatus } from '@/services';
 
 export const joinClassNames = (...classNames: Array<string | false | null | undefined>) =>
   classNames.filter(Boolean).join(' ');
@@ -88,7 +88,7 @@ export const calculateCacheHitRate = (inputTokens: number, cacheReadTokens: numb
 
 export const getGatewayRequestsPerMinute = (
   status: Pick<ProxyGatewayStatus, 'requests_per_minute' | 'requests_per_minute_by_cli'> | null | undefined,
-  cliKey?: GatewayCliKey,
+  cliKey?: GatewayUsageTool,
 ): number | null => {
   if (!status) {
     return null;
@@ -96,9 +96,12 @@ export const getGatewayRequestsPerMinute = (
   if (!cliKey) {
     return status.requests_per_minute;
   }
+  if (['pi', 'oh_my_pi', 'dsh', 'hermes', 'openclaw', 'kimi_cli'].includes(cliKey)) {
+    return null;
+  }
   return status.requests_per_minute_by_cli == null
     ? null
-    : status.requests_per_minute_by_cli[cliKey] ?? 0;
+    : status.requests_per_minute_by_cli[cliKey as GatewayCliKey] ?? 0;
 };
 
 export const formatDateTime = (value: string | null | undefined) => {
@@ -146,6 +149,9 @@ export type GatewayRequestDisplayKind =
   | 'unknown';
 
 export interface GatewayRequestDisplayInput {
+  transport?: 'http' | 'websocket';
+  request_kind?: 'request' | 'websocket_handshake' | 'websocket_warmup';
+  total_tokens?: number | null;
   data_source?: string | null;
   method?: string | null;
   path?: string | null;
@@ -244,6 +250,10 @@ export const gatewayRequestDisplayKind = (
   const method = compactMethod(value.method);
   const normalizedPath = splitRequestPath(value.path);
 
+  if (value.request_kind === 'websocket_handshake') {
+    return 'connectionProbe';
+  }
+
   if (method === 'POST' && isContextCompactPath(normalizedPath)) {
     return 'contextCompact';
   }
@@ -287,11 +297,35 @@ export const requestDisplayTitleKey = (kind: GatewayRequestDisplayKind) => {
 export const isGatewayRequestUsageApplicable = (
   value: GatewayRequestDisplayInput | GatewayRequestDisplayKind,
 ) => {
+  if (typeof value !== 'string' && value.request_kind === 'websocket_handshake') {
+    return false;
+  }
+  if (typeof value !== 'string' && value.request_kind === 'websocket_warmup') {
+    return (value.total_tokens ?? 0) > 0;
+  }
   if (typeof value !== 'string' && value.data_source === 'session') {
     return true;
   }
   const kind = typeof value === 'string' ? value : gatewayRequestDisplayKind(value);
   return kind === 'model' || kind === 'contextCompact';
+};
+
+export const gatewayWebSocketStatusKey = (record: {
+  transport?: string;
+  request_kind?: string;
+  stream_outcome?: string | null;
+  status_code?: number | null;
+  success: boolean;
+}): string | null => {
+  if (record.transport !== 'websocket') return null;
+  if (record.request_kind === 'websocket_handshake') {
+    return record.status_code === 426 ? 'gateway.page.requests.websocket.fallback' : null;
+  }
+  const outcome = record.stream_outcome;
+  if (outcome && ['completed', 'failed', 'incomplete', 'canceled'].includes(outcome)) {
+    return `gateway.page.requests.websocket.${outcome}`;
+  }
+  return record.success ? 'gateway.page.requests.websocket.completed' : 'gateway.page.requests.websocket.failed';
 };
 
 export const deriveGatewayRequestDisplay = (
@@ -391,7 +425,9 @@ export const stringifyDetailValue = (value: unknown) => {
   return JSON.stringify(value, null, 2);
 };
 
-export type GatewayUsageRangePreset = 'today' | '1d' | '7d' | '14d' | '30d' | 'custom';
+export const GATEWAY_USAGE_RANGE_PRESETS = ['today', '1d', '7d', '14d', '30d', 'custom'] as const;
+
+export type GatewayUsageRangePreset = typeof GATEWAY_USAGE_RANGE_PRESETS[number];
 
 interface GatewayDateLike {
   toDate: () => Date;
@@ -400,6 +436,10 @@ interface GatewayDateLike {
 export interface GatewayUsageRangeSelection {
   preset: GatewayUsageRangePreset;
   customRange?: [GatewayDateLike | null, GatewayDateLike | null] | null;
+}
+
+export interface GatewayRequestRangeSelection extends Omit<GatewayUsageRangeSelection, 'preset'> {
+  preset: GatewayUsageRangePreset | 'all';
 }
 
 export interface ResolvedGatewayUsageRange {
@@ -444,4 +484,22 @@ export const resolveGatewayUsageRange = (
     startDate: Math.floor(startOfLocalDay(nowMs - (dayCount - 1) * DAY_MS) / 1000),
     endDate,
   };
+};
+
+export const resolveGatewayRequestRange = (
+  selection: GatewayRequestRangeSelection,
+  nowMs = Date.now(),
+): Pick<GatewayRequestLogFilters, 'start_date' | 'end_date'> => {
+  if (selection.preset === 'all') {
+    return { start_date: null, end_date: null };
+  }
+  if (selection.preset === 'custom') {
+    const [start, end] = selection.customRange ?? [];
+    return {
+      start_date: start ? Math.floor(start.toDate().getTime() / 1000) : null,
+      end_date: end ? Math.floor(end.toDate().getTime() / 1000) : null,
+    };
+  }
+  const range = resolveGatewayUsageRange({ preset: selection.preset }, nowMs);
+  return { start_date: range.startDate, end_date: range.endDate };
 };

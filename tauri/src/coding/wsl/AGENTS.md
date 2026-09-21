@@ -37,12 +37,14 @@ sequenceDiagram
 ## 易错点与历史坑（Gotchas）
 
 - 不要把 WSL 自动同步理解成“保存数据库就自动发生”。真正触发点是事件监听器。
+- 同步设置保存只 patch 用户字段，`last_sync_warnings` 只能由 Skills 链路替换；配置、普通状态和警告写入都在同一次 SQLite 连接锁内完成，避免旧表单或其它链路清掉诊断。全量同步必须把 Skills 阶段警告合入返回结果与完成事件，失败时也保留已经收集的警告；WSL 孤立中央目录清理失败同样属于非致命警告。
 - 恢复期间不能同时依赖启动同步、业务事件同步和恢复收尾同步。三条链路并发会让旧文件、半完成配置和新配置互相覆盖；恢复专用入口应抑制中间事件，启动同步应识别 restore flag，最终只保留恢复收尾的一次串行同步。
 - `moduleStatuses.is_wsl_direct=true` 的模块，在 WSL 设置页里应视为“已直接运行在 WSL”，手动 WSL 同步要跳过这些模块，而不是继续把 Windows 本地映射强塞过去。
 - full sync 必须从后端当前 `runtime_location` 读取 Direct 跳过集合，不能信任传入 `config.module_statuses` 的 UI 快照；首次启用同步尤其可能携带目录切换前的旧状态。MCP 使用相同集合过滤映射，不再维护逐工具的布尔参数列表。
 - dsh/Hermes 的自定义目录也允许 UNC；两者必须出现在 `module_statuses` 中，并在保存/清除目录后刷新缓存和通知设置页。issue #331 的失败链路是“UNC 文件存在 → 漏掉 Direct 跳过 → 转成 //wsl.localhost/... → Linux cp cannot stat”，不是文件缺失或发行版特例。
 - WSL Direct 判断不要从页面上的 `source=custom` 反推。`custom`、`env`、`shell`、`default` 与是否 WSL Direct 是两个独立维度。
 - 对 Skills，WSL 自动同步的源目录仍然是中央仓库 `central_repo_path`，不是工具当前运行时 skills 目录。当前运行时目录只决定目标写到哪里。
+- Skills 工具目标由 `skills::remote_target` 统一维护链接/复制/清理。Cursor、Antigravity CLI 在 WSL 中同样强制复制；受管副本须带匹配中央源路径的 `.ai-toolbox-skill-source` 标记，不能把无标记真实目录当成可覆盖副本。旧受管链接可转成副本；先复制成功再替换，取消同步与孤立清理同样识别副本。
 - 对内置工具，如果当前运行时路径是 Windows 本机路径而不是 WSL UNC，WSL 侧目标仍应回退到各自默认 Linux 目录；不要误判成“没有 WSL 目标”。
 - Claude Code 本机自定义根目录不会把普通 WSL 同步目标改成远端自定义目录。Windows 本机源可以来自自定义根，也可以来自 `CLAUDE_CODE_PLUGIN_CACHE_DIR` 覆盖的 plugin cache，但 WSL 目标仍应是默认 `~/.claude/*`、`~/.claude/plugins`、`~/.claude/skills` 和 `~/.claude.json`；只有 Claude 当前运行时本身是 WSL Direct 自定义根目录时，目标才跟随该 Linux 根目录。
 - 对 Claude `claude-plugins` 目录，同步不只是拷贝目录内容。同步后还要把 `known_marketplaces.json` / `installed_plugins.json` 里的 `installLocation` / `installPath` 从 Windows plugins 根目录映射到目标 WSL plugins 根目录，否则远端插件元数据仍会指向 `C:\...`。
@@ -50,13 +52,14 @@ sequenceDiagram
 - Claude 插件元数据补写属于 best-effort 后处理。即使 `known_marketplaces.json` / `installed_plugins.json` 读取、改写或写回失败，也不能把已经成功完成的主文件同步整体标成失败；最多记录 warning/error 供排查。
 - 写入到 `known_marketplaces.json` / `installed_plugins.json` 的 `installLocation` / `installPath` **必须是真实绝对 Linux 路径**，不能保留 `~/.claude/...`。Claude CLI 2.1.126+ 在 WSL 里校验 marketplace 时不会展开 JSON 字段值里的 `~`，留 `~` 会被判定 corrupted。读写文件路径仍可保留 `~`(`read_wsl_file` / `write_wsl_file` 通过 bash `$HOME` 展开)；只有当字符串作为字段**值**落到 JSON 里时，才必须先用 `sync::get_wsl_user_home(distro)` 解析真实 home，再传给重写逻辑。这条规则同样适用于以后任何"路径作为字段值落到工具配置里"的同步链路。
 - 删除类业务操作不能只依赖后续 `wsl-sync-request-*`。普通文件同步遇到本机源文件不存在会跳过，不会删除 WSL 目标；如果业务语义是“清除当前运行时文件”，必须在本地状态落库前显式删除对应 WSL 目标，或让同步链路明确支持该删除语义。
-- Skills WSL 同步对工具目录链接的删除/覆盖必须先做**归属校验**：`sync::inspect_wsl_path_kind` 判断路径是 missing / 受管 symlink（readlink 目标位于 `~/.ai-toolbox/skills` 下）/ 真实目录或外部 symlink；只有受管 symlink 才允许删除（`remove_wsl_managed_symlink`）或重建，真实目录与外部 symlink 一律保留并 warn，检查失败 fail-safe 到 Foreign。不要在 skills_sync 里对工具目录直接 `rm -rf`，否则用户手工放在工具 skills 目录里的真实内容会被误删（P0）。中央仓库目录（`~/.ai-toolbox/skills/<name>`）本身是 app 私有，可按原语义删除。
+- Skills WSL 同步对工具目标的删除/覆盖必须先做**归属校验**：共享 `remote_target` 区分 missing / 受管链接 / 带源标记的受管副本 / 用户目录或外部链接；只有受管目标可删除或替换，其余保留并 warn，检查失败不执行修改。不能直接删除用户工具目录。中央仓库目录（`~/.ai-toolbox/skills/<name>`）本身是 app 私有，可按原语义删除。
+- Skills 同步的用户可见警告有独立链路：归属校验保留、链接维护失败、源目录缺失跳过、同步哈希写入失败会 emit `wsl-sync-warning` 事件（手动同步弹窗实时展示），同时经 `commands::update_sync_warnings` 累积持久化到 `wsl_sync_config` 记录的 `last_sync_warnings`（随 status 命令返回，设置页常驻展示）。`update_sync_warnings` 只能由 skills 链路调用；文件/MCP 链路不得写该字段，否则会清除或混入其它子链路的警告。后端警告文案是稳定中文格式，前端经 `syncMessageTranslator` 的 `skills*` 正则模式翻译。同步哈希（`.synced_hash`）写入失败属于非致命警告：内容已同步成功，只记录警告并让本轮继续，下次运行会重传，不能用 `?` 中止整个 skills 同步（否则会丢掉已累积的警告持久化）。
 - WSL Skills 目标解析直接查询 `runtime_location::get_tool_skills_path_async`，未提供运行时 Skills 路径时回退工具默认目录；Direct 跳过集合只转换 `claude`/`geminicli` 两个工具别名，不再维护另一份模块白名单。Hermes 必须覆盖 `<root>/skills`；dsh 没有独立 Skills 目录，不为它新增目标。新增可配置运行时根的工具时必须同时核对目标路径与跳过规则。
 - Gateway 代理接管后的 WSL 地址改写只能发生在同步到 WSL 的目标副本上，不能反向写回 Windows runtime 文件；也不能对文件内容全局替换 `127.0.0.1` / `localhost`。判断必须同时依赖 Gateway manifest、目标文件 kind、managed fields 和字段内 sentinel，只允许改写 Claude `env.ANTHROPIC_BASE_URL`、Codex gateway provider `base_url`、Gemini `.env` 的 `GOOGLE_GEMINI_BASE_URL` 这类 AI Toolbox Gateway 托管字段，避免误伤用户自己配置的本地服务地址。
 - Codex prompt 映射不要硬编码 active 文件名。同步 `codex-prompt` 时要镜像 `AGENTS.md` 与 `AGENTS.override.md` 两个已知文件：本机存在就同步到 WSL 同名目标，本机不存在就清理 WSL 同名目标，避免远端保留 stale override。
 - Codex `config.toml` 可能通过顶层 `model_catalog_json = "ai-toolbox-codex-model-catalog.json"` 引用 AI Toolbox 生成的模型映射文件。同步 `codex-config` 时必须连带镜像这个同目录 companion JSON；但只处理 AI Toolbox 自有文件名，不要接管用户自定义的外部 catalog 路径。
 - Grok 默认映射覆盖 `auth.json`、`config.toml`、`AGENTS.md` 和 `plugins/`，不默认同步 `sessions/`；Grok 的 MCP 配置承载在 `grok-config`，命令字段不做 Codex 的 `cmd /c` 包装。
-- Kimi 默认映射覆盖 `config.toml`、`AGENTS.md`、`credentials/` 和 `plugins/`，不默认同步 `sessions/`；kimi 配置不走 MCP 专用同步（MCP 主数据在中央 MCP 模块）。`kimi-config` 映射 id 与 Gateway `wsl_synced_gateway_target_for_mapping` 的 `"kimi-config"` 对齐，接管期间 WSL 目标副本由 `cli_proxy` 按 manifest + sentinel 只改网关托管字段。新增映射走 `wsl_defaults_version` v16 backfill，只补本版本新加的 id。
+- Kimi 默认映射覆盖 `config.toml`、`mcp.json`（`kimi-mcp`）、`AGENTS.md`、`credentials/` 和 `plugins/`，不默认同步 `sessions/`；Kimi CLI 只从 `mcp.json` 读 MCP server 声明，`kimi-mcp` 参与 MCP 专用同步并按 `mcpServers` JSON 剥 `cmd /c`。`kimi-config` 映射 id 与 Gateway `wsl_synced_gateway_target_for_mapping` 的 `"kimi-config"` 对齐，接管期间 WSL 目标副本由 `cli_proxy` 按 manifest + sentinel 只改网关托管字段。新增映射走 `wsl_defaults_version` 对应版本的 backfill，只补本版本新加的 id。
 - 新增通过文件映射承载 MCP 配置的工具时，不能只加默认 file mapping。还要同步更新 `mcp_sync.rs` 的 MCP 配置 mapping 白名单、WSL Direct 跳过判断、进度/错误文案，以及 `cmd /c` 后处理识别。MCP 专用同步只能包含实际承载 MCP 配置的文件，不能把同模块的 env、prompt、OAuth 等普通映射一起纳入。
 - bump `wsl_defaults_version` 新增默认映射时，只能 backfill 本版本新加的 mapping id。不要把所有缺失的默认 mapping 重新插回去，否则会恢复用户之前主动删除的旧默认映射；新安装空列表仍应一次性创建完整默认集合。
 - OpenCode Markdown Agent 的规范目录是复数 `~/.config/opencode/agents`（单数 `agent` 仅为旧版别名，不再作为默认映射同步）。把它作为一个独立目录映射即可；不能把整个 OpenCode 配置目录作为 Agent 同步源，否则会接管主配置、插件和其他用户文件。
@@ -79,6 +82,7 @@ sequenceDiagram
 
 ## 最小验证
 
+- 同步警告回归：`cargo test --lib saving_sync_preferences_preserves_latest_skills_warnings` 和 `cargo test --lib concurrent_sync_status_and_warnings_preserve_both_snapshots` 覆盖旧表单保存、文件状态更新、Skills 清空警告及并发写入；警告必须在真实 SQLite 写入后读回验证。
 - `cargo test --test coding wsl_direct_status` 验证保存配置目录后的前端状态 payload 与后端跳过集合一致；`cargo test --lib coding::wsl::mcp_sync::tests` 验证 Direct 模块跳过、本机模块保留以及 MCP 文件边界。
 - 至少验证：启用 WSL sync 后首次全量同步会执行。
 - 至少验证：某个工具保存后发出 `wsl-sync-request-*` 时，在开启自动同步和关闭自动同步两种状态下行为不同。

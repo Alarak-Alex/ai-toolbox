@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { AlertTriangle, CheckCircle2, Loader2, Network, RotateCcw, ShieldCheck, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
+  DEFAULT_AGGREGATE_SEPARATOR,
   disengageProxyGatewayFailover,
   engageProxyGatewayFailover,
   getProxyGatewayCliStatus,
@@ -11,8 +12,15 @@ import {
   type GatewayCliTakeoverStatus,
 } from '@/services';
 import { refreshTrayMenu } from '@/services/appApi';
-import { restoreDirectUnavailableHintKey, type GatewayProxyReason } from './providerProtocol';
+import {
+  isGatewayAggregateMode,
+  isGatewayProxyMode,
+  restoreDirectUnavailableHintKey,
+  type GatewayProxyReason,
+} from './providerProtocol';
+import { buildGatewayAggregateSitePreviewSlug } from './gatewayAggregateConfig';
 import styles from './GatewayFailoverButton.module.less';
+import chipStyles from './gatewayStatusChip.module.less';
 
 type SupportedGatewayCliKey = Extract<GatewayCliKey, 'claude' | 'codex' | 'grok' | 'kimi' | 'gemini' | 'claude_desktop'>;
 type ActionKind = 'load' | 'enableFailover' | 'disableFailover' | 'restore';
@@ -38,7 +46,25 @@ const formatGatewayError = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
 const isGatewayProxyActive = (status: GatewayCliTakeoverStatus | null) =>
-  status?.mode === 'single' || status?.mode === 'failover';
+  isGatewayProxyMode(status?.mode);
+
+// Every status read carries both a request sequence and the revision that was
+// current when it started.  A newer read supersedes older reads by request
+// number; an authoritative command result or external status update supersedes
+// all in-flight reads by revision.
+const createGatewayStatusRevisionGuard = () => {
+  let request = 0;
+  let revision = 0;
+
+  return {
+    beginRequest: () => ({ request: ++request, revision }),
+    invalidate: () => {
+      revision += 1;
+    },
+    isCurrent: (token: { request: number; revision: number }) =>
+      token.request === request && token.revision === revision,
+  };
+};
 
 const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
   cliKey,
@@ -52,15 +78,23 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
   const [busyAction, setBusyAction] = React.useState<ActionKind | null>('load');
   const [open, setOpen] = React.useState(false);
   const [notice, setNotice] = React.useState<NoticeState | null>(null);
+  const statusGuardRef = React.useRef(createGatewayStatusRevisionGuard());
+  const actionRequestRef = React.useRef(0);
 
   React.useEffect(() => {
+    statusGuardRef.current.invalidate();
     setStatus(externalStatus ?? null);
+    setBusyAction((current) => (current === 'load' ? null : current));
   }, [externalStatus]);
 
   const refreshStatus = React.useCallback(async () => {
+    const token = statusGuardRef.current.beginRequest();
     const nextStatus = await getProxyGatewayCliStatus(cliKey);
-    setStatus(nextStatus);
-    onStatusChange?.(nextStatus);
+    if (statusGuardRef.current.isCurrent(token)) {
+      statusGuardRef.current.invalidate();
+      setStatus(nextStatus);
+      onStatusChange?.(nextStatus);
+    }
     return nextStatus;
   }, [cliKey, onStatusChange]);
 
@@ -72,25 +106,30 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
 
   React.useEffect(() => {
     let disposed = false;
+    const token = statusGuardRef.current.beginRequest();
 
     const loadStatus = async () => {
-      setBusyAction('load');
+      if (!disposed && statusGuardRef.current.isCurrent(token)) {
+        setBusyAction('load');
+      }
       try {
         const nextStatus = await getProxyGatewayCliStatus(cliKey);
-        if (disposed) {
+        if (disposed || !statusGuardRef.current.isCurrent(token)) {
           return;
         }
+        statusGuardRef.current.invalidate();
         setStatus(nextStatus);
         onStatusChange?.(nextStatus);
+        setBusyAction(null);
       } catch (error) {
-        if (!disposed) {
+        if (!disposed && statusGuardRef.current.isCurrent(token)) {
           setNotice({
             kind: 'error',
             text: t('gateway.takeover.notice.loadFailed', { error: formatGatewayError(error) }),
           });
         }
       } finally {
-        if (!disposed) {
+        if (!disposed && statusGuardRef.current.isCurrent(token)) {
           setBusyAction(null);
         }
       }
@@ -100,6 +139,7 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
 
     return () => {
       disposed = true;
+      statusGuardRef.current.invalidate();
     };
   }, [cliKey, onStatusChange, t]);
 
@@ -113,22 +153,40 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
 
     return () => {
       disposed = true;
+      statusGuardRef.current.invalidate();
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, [refreshStatus]);
 
+  React.useEffect(() => () => {
+    statusGuardRef.current.invalidate();
+    actionRequestRef.current += 1;
+  }, [cliKey]);
+
   const visible = isGatewayProxyActive(status);
   const failoverActive = status?.mode === 'failover';
+  // Aggregate has its own takeover state but no failover toggle: the site list
+  // lives in the gateway settings aggregate block, so only "restore direct"
+  // stays actionable here.
+  const aggregateActive = isGatewayAggregateMode(status?.mode);
   const canRestoreDirect = Boolean(status?.can_restore_direct);
   const restoreDirectUnavailableTitle = t(
     restoreDirectUnavailableHintKey(primaryProviderNeedsProxyReason),
     { cli: t(`settings.gateway.cli.${cliKey}`) },
   );
-  const dot = failoverActive ? (status?.dot ?? 'gray') : 'gray';
+  const dot = failoverActive || aggregateActive ? (status?.dot ?? 'gray') : 'gray';
   const statusMessage = status?.message ?? t('gateway.takeover.buttonTooltip');
   const actionLabel = failoverActive
     ? t('gateway.failover.disengageButton')
-    : t('gateway.failover.button');
+    : aggregateActive
+      ? t('gateway.takeover.statusButton')
+      : t('gateway.failover.button');
+  // Aggregate sites are addressed by model prefix; the label the model list
+  // shows for each (site, model) pair is the concrete thing to display.
+  const aggregateSeparator = status?.aggregate?.separator ?? DEFAULT_AGGREGATE_SEPARATOR;
+  const aggregateAliases = status?.aggregate?.aliases ?? {};
+  const aggregateNaming = status?.aggregate?.naming ?? 'site_model';
+  const aggregateSiteIds = status?.aggregate?.provider_ids ?? [];
 
   const handleOpen = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -147,12 +205,18 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
     event.preventDefault();
     event.stopPropagation();
     const nextBusyAction: ActionKind = failoverActive ? 'disableFailover' : 'enableFailover';
+    const actionRequest = ++actionRequestRef.current;
+    statusGuardRef.current.invalidate();
     setBusyAction(nextBusyAction);
     setNotice(null);
     try {
       const nextStatus = failoverActive
         ? await disengageProxyGatewayFailover(cliKey)
         : await engageProxyGatewayFailover(cliKey);
+      if (actionRequest !== actionRequestRef.current) {
+        return;
+      }
+      statusGuardRef.current.invalidate();
       setStatus(nextStatus);
       onStatusChange?.(nextStatus);
       refreshTrayAfterGatewayChange();
@@ -164,6 +228,9 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
       });
       setOpen(false);
     } catch (error) {
+      if (actionRequest !== actionRequestRef.current) {
+        return;
+      }
       setNotice({
         kind: 'error',
         text: failoverActive
@@ -172,7 +239,9 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
       });
       await refreshStatus().catch(() => undefined);
     } finally {
-      setBusyAction(null);
+      if (actionRequest === actionRequestRef.current) {
+        setBusyAction(null);
+      }
     }
   };
 
@@ -186,10 +255,16 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
       });
       return;
     }
+    const actionRequest = ++actionRequestRef.current;
+    statusGuardRef.current.invalidate();
     setBusyAction('restore');
     setNotice(null);
     try {
       const nextStatus = await restoreProxyGatewayCliDirect(cliKey);
+      if (actionRequest !== actionRequestRef.current) {
+        return;
+      }
+      statusGuardRef.current.invalidate();
       setStatus(nextStatus);
       onStatusChange?.(nextStatus);
       refreshTrayAfterGatewayChange();
@@ -199,13 +274,18 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
       });
       setOpen(false);
     } catch (error) {
+      if (actionRequest !== actionRequestRef.current) {
+        return;
+      }
       setNotice({
         kind: 'error',
         text: t('gateway.proxy.notice.restoreFailed', { error: formatGatewayError(error) }),
       });
       await refreshStatus().catch(() => undefined);
     } finally {
-      setBusyAction(null);
+      if (actionRequest === actionRequestRef.current) {
+        setBusyAction(null);
+      }
     }
   };
 
@@ -214,14 +294,14 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
   }
 
   return (
-    <span className={styles.shell} onClick={(event) => event.stopPropagation()}>
+    <span className={chipStyles.shell} onClick={(event) => event.stopPropagation()}>
       <button
         type="button"
-        className={joinClassNames(styles.button, failoverActive && styles.buttonActive)}
+        className={joinClassNames(chipStyles.chip, failoverActive && chipStyles.chipActive)}
         title={statusMessage}
         onClick={handleOpen}
       >
-        <span className={joinClassNames(styles.dot, styles[`dot_${dot}`])} aria-hidden="true" />
+        <span className={joinClassNames(chipStyles.dot, chipStyles[`dot_${dot}`])} aria-hidden="true" />
         <span>{actionLabel}</span>
       </button>
 
@@ -259,9 +339,9 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
             </div>
 
             <div className={styles.dialogBody}>
-              {failoverActive && (
+              {(failoverActive || aggregateActive) && (
                 <div className={styles.stateRow}>
-                  <span className={joinClassNames(styles.dot, styles[`dot_${dot}`])} aria-hidden="true" />
+                  <span className={joinClassNames(chipStyles.dot, chipStyles[`dot_${dot}`])} aria-hidden="true" />
                   <span>{t(`gateway.takeover.state.${status?.state ?? 'direct'}`)}</span>
                   {status?.mode ? (
                     <span className={styles.modeLabel}>
@@ -272,23 +352,62 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
               )}
 
               <div className={styles.effectList}>
-                <div>
-                  <CheckCircle2 size={14} aria-hidden="true" />
-                  <span>{t('gateway.failover.effects.singleProxy')}</span>
-                </div>
-                <div>
-                  <ShieldCheck size={14} aria-hidden="true" />
-                  <span>{t('gateway.failover.effects.p0Pinned')}</span>
-                </div>
-                <div>
-                  <CheckCircle2 size={14} aria-hidden="true" />
-                  <span>{t('gateway.failover.effects.providerOrder')}</span>
-                </div>
-                <div>
-                  <AlertTriangle size={14} aria-hidden="true" />
-                  <span>{t('gateway.failover.effects.applyDisabled')}</span>
-                </div>
+                {aggregateActive ? (
+                  <>
+                    <div>
+                      <CheckCircle2 size={14} aria-hidden="true" />
+                      <span>{t('gateway.aggregate.effects.crossSiteList')}</span>
+                    </div>
+                    <div>
+                      <ShieldCheck size={14} aria-hidden="true" />
+                      <span>{t('gateway.aggregate.effects.settingsManaged')}</span>
+                    </div>
+                    <div>
+                      <AlertTriangle size={14} aria-hidden="true" />
+                      <span>{t('gateway.aggregate.effects.applyDisabled')}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div>
+                      <CheckCircle2 size={14} aria-hidden="true" />
+                      <span>{t('gateway.failover.effects.singleProxy')}</span>
+                    </div>
+                    <div>
+                      <ShieldCheck size={14} aria-hidden="true" />
+                      <span>{t('gateway.failover.effects.p0Pinned')}</span>
+                    </div>
+                    <div>
+                      <CheckCircle2 size={14} aria-hidden="true" />
+                      <span>{t('gateway.failover.effects.providerOrder')}</span>
+                    </div>
+                    <div>
+                      <AlertTriangle size={14} aria-hidden="true" />
+                      <span>{t('gateway.failover.effects.applyDisabled')}</span>
+                    </div>
+                  </>
+                )}
               </div>
+
+              {aggregateActive && aggregateSiteIds.length ? (
+                <div className={styles.priorityList}>
+                  <span className={styles.targetTitle}>
+                    {t('gateway.aggregate.sites', { count: aggregateSiteIds.length })}
+                  </span>
+                  <div>
+                    {aggregateSiteIds.map((siteId) => (
+                      <code key={siteId}>
+                        {buildGatewayAggregateSitePreviewSlug(
+                          siteId,
+                          aggregateSeparator,
+                          aggregateNaming,
+                          aggregateAliases,
+                        )}
+                      </code>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
 
               {failoverActive && status?.provider_priorities.length ? (
                 <div className={styles.priorityList}>
@@ -345,19 +464,26 @@ const GatewayFailoverButton: React.FC<GatewayFailoverButtonProps> = ({
                   <span>{t('gateway.proxy.restoreDirectButton')}</span>
                 </button>
               ) : null}
-              <button
-                type="button"
-                className={styles.primaryButton}
-                disabled={busyAction !== null}
-                onClick={handleToggleFailover}
-              >
-                {busyAction === 'enableFailover' || busyAction === 'disableFailover' ? (
-                  <Loader2 size={14} className={styles.spin} aria-hidden="true" />
-                ) : (
-                  <Network size={14} aria-hidden="true" />
-                )}
-                <span>{actionLabel}</span>
-              </button>
+              {/*
+                Aggregate mode is engaged and edited from the gateway settings
+                aggregate block; a failover toggle here would either be a no-op
+                or silently switch modes, so keep only "restore direct".
+              */}
+              {!aggregateActive ? (
+                <button
+                  type="button"
+                  className={styles.primaryButton}
+                  disabled={busyAction !== null}
+                  onClick={handleToggleFailover}
+                >
+                  {busyAction === 'enableFailover' || busyAction === 'disableFailover' ? (
+                    <Loader2 size={14} className={styles.spin} aria-hidden="true" />
+                  ) : (
+                    <Network size={14} aria-hidden="true" />
+                  )}
+                  <span>{actionLabel}</span>
+                </button>
+              ) : null}
             </div>
           </div>
         </div>

@@ -1,5 +1,6 @@
 import React from 'react';
-import { Typography, Button, Select, Space, message, Modal, Table, Switch, Input, Row, Col, Card, Divider, Checkbox } from 'antd';
+import { App, Typography, Button, Select, Space, message, Modal, Table, Switch, Input, Row, Col, Card, Divider, Checkbox } from 'antd';
+import { FolderOpen } from 'lucide-react';
 import {
   EditOutlined,
   CloudUploadOutlined,
@@ -37,7 +38,7 @@ import { useAppStore, useSettingsStore } from '@/stores';
 import { useThemeStore, type ThemeMode } from '@/stores/themeStore';
 import { languages, type Language } from '@/i18n';
 import i18n from '@/i18n';
-import { BackupSettingsModal, WebDAVRestoreModal } from '../components';
+import { BackupSettingsModal, RemoteBackupRestoreModal, type RemoteBackupSelection } from '../components';
 import UpdateProgressModal from '@/components/common/UpdateProgressModal';
 import { platform } from '@tauri-apps/plugin-os';
 import {
@@ -46,8 +47,16 @@ import {
   selectBackupFile,
   backupToWebDAV,
   restoreFromWebDAV,
+  backupToRepository,
+  listRepositoryBackups,
+  restoreFromRepository,
+  deleteRepositoryBackup,
+  listWebDAVBackups,
+  deleteWebDAVBackup,
+  getBackupRepositorySettings,
   type ProxyMode,
   type RestoreResult,
+  type BackupRepositoryConfigFE,
   openAppDataDir,
   getAppVersion,
   checkForUpdates,
@@ -56,10 +65,14 @@ import {
   installUpdate,
   testProxyConnection,
   type UpdateInfo,
+  type AppDataDirInfo,
+  getAppDataDirInfo,
+  setAppDataDirOverride,
   GITHUB_REPO,
 } from '@/services';
 import { restartApp } from '@/services/settingsApi';
 import { listen } from '@tauri-apps/api/event';
+import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
 import styles from './GeneralSettingsPage.module.less';
 
 const { Text } = Typography;
@@ -168,6 +181,7 @@ const SortableCodingChip: React.FC<SortableCodingChipProps> = ({ id, label, chec
 
 const GeneralSettingsPage: React.FC = () => {
   const { t } = useTranslation();
+  const { modal } = App.useApp();
   const { language, setLanguage } = useAppStore();
   const { mode: themeMode, setMode: setThemeMode } = useThemeStore();
   const {
@@ -213,9 +227,31 @@ const GeneralSettingsPage: React.FC = () => {
   };
 
   const [backupModalOpen, setBackupModalOpen] = React.useState(false);
-  const [webdavRestoreModalOpen, setWebdavRestoreModalOpen] = React.useState(false);
+  /** Which remote channel's backup list is open (null = closed). */
+  const [remoteRestoreChannel, setRemoteRestoreChannel] = React.useState<
+    'webdav' | 'repository' | null
+  >(null);
   const [backupLoading, setBackupLoading] = React.useState(false);
   const [restoreLoading, setRestoreLoading] = React.useState(false);
+  /** Stored repository connection (token never leaves the backend). */
+  const [repositoryConfig, setRepositoryConfig] = React.useState<BackupRepositoryConfigFE>({
+    platform: 'github',
+    owner: '',
+    repository: '',
+    branch: 'main',
+    directory: 'ai-toolbox',
+  });
+
+  const refreshRepositoryConfig = React.useCallback(() => {
+    // Best-effort load for the settings summary; failure keeps current values.
+    getBackupRepositorySettings()
+      .then((view) => setRepositoryConfig(view.config))
+      .catch((error) => console.error('Failed to load backup repository settings:', error));
+  }, []);
+
+  React.useEffect(() => {
+    refreshRepositoryConfig();
+  }, [refreshRepositoryConfig]);
 
   // Proxy settings states
   const [proxyInput, setProxyInput] = React.useState(proxyUrl);
@@ -232,10 +268,33 @@ const GeneralSettingsPage: React.FC = () => {
   const [updateTotal, setUpdateTotal] = React.useState<number>(0);
   const [updateModalOpen, setUpdateModalOpen] = React.useState(false);
 
+  // Data directory (custom path override, issue #345)
+  const [dataDirInfo, setDataDirInfo] = React.useState<AppDataDirInfo | null>(null);
+  const [dataDirBusy, setDataDirBusy] = React.useState(false);
+  const [dataDirError, setDataDirError] = React.useState<string | null>(null);
+  const dataDirOperation = React.useRef(false);
+
   // Load app version on mount
   React.useEffect(() => {
     getAppVersion().then(setAppVersion).catch(console.error);
   }, []);
+
+  // Load data directory info on mount
+  React.useEffect(() => {
+    let disposed = false;
+    getAppDataDirInfo()
+      .then((info) => {
+        if (!disposed) {
+          setDataDirInfo(info);
+          setDataDirError(null);
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to load data dir info:', error);
+        if (!disposed) setDataDirError(t('settings.dataDir.loadFailed'));
+      });
+    return () => { disposed = true; };
+  }, [t]);
 
   // Auto check for updates on mount
   React.useEffect(() => {
@@ -412,6 +471,17 @@ const GeneralSettingsPage: React.FC = () => {
         await setLastBackupTime(now);
         message.success(t('settings.backupSettings.backupSuccess'));
         console.log('Backup uploaded to:', uploadUrl);
+      } else if (backupType === 'repository') {
+        // GitHub/Gitee repository backup
+        if (!repositoryConfig.owner || !repositoryConfig.repository) {
+          message.warning(t('settings.backupSettings.noRepositoryConfigured'));
+          return;
+        }
+        const uploadedFilename = await backupToRepository();
+        const now = new Date().toISOString();
+        await setLastBackupTime(now);
+        message.success(t('settings.backupSettings.backupSuccess'));
+        console.log('Backup uploaded as:', uploadedFilename);
       } else {
         // Local backup
         if (!localBackupPath) {
@@ -444,6 +514,104 @@ const GeneralSettingsPage: React.FC = () => {
     }
   };
 
+  const parseRestoreError = (error: unknown): { type?: string; message: string } => {
+    const fallback = t('settings.backupSettings.restoreFailed');
+    try {
+      const errorObj = JSON.parse(String(error));
+      const messageText = errorObj.suggestion
+        ? `${fallback}: ${t(errorObj.suggestion)}`
+        : `${fallback}: ${String(error)}`;
+      return { type: errorObj.type, message: messageText };
+    } catch {
+      return { message: `${fallback}: ${String(error)}` };
+    }
+  };
+
+  const isPasswordError = (type?: string) =>
+    type === 'passwordRequired' || type === 'passwordWrong';
+
+  /**
+   * Ask for the one-shot decryption password and retry the same restore selection.
+   * Cancel keeps the dialog closed and guarantees zero restore writes.
+   */
+  const promptRestorePassword = (
+    onSubmit: (password: string) => void,
+    wrongAttempt: boolean,
+  ) => {
+    let passwordValue = '';
+    Modal.confirm({
+      title: t('settings.backupSettings.encryption.passwordPromptTitle'),
+      content: (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {wrongAttempt && (
+            <Typography.Text type="danger" style={{ fontSize: 12 }}>
+              {t('settings.backupSettings.encryption.errors.passwordWrong')}
+            </Typography.Text>
+          )}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {t('settings.backupSettings.encryption.passwordPromptDesc')}
+          </Typography.Text>
+          <Input.Password
+            autoFocus
+            onChange={(event) => {
+              passwordValue = event.target.value;
+            }}
+          />
+        </div>
+      ),
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
+      onOk: () => {
+        if (!passwordValue) {
+          message.warning(t('settings.backupSettings.encryption.passwordRequiredPrompt'));
+          return Promise.reject();
+        }
+        onSubmit(passwordValue);
+      },
+    });
+  };
+
+  const executeRestore = async (
+    restoreFn: (restorePassword?: string) => Promise<RestoreResult>,
+    description: string,
+    skipCliCustomRootsHolder: { value: boolean },
+    restorePassword?: string,
+  ) => {
+    setRestoreLoading(true);
+    try {
+      const restoreResult = await restoreFn(restorePassword);
+      // 恢复成功后弹出重启对话框
+      Modal.info({
+        title: t('settings.backupSettings.restoreSuccess'),
+        content: buildRestoreSuccessContent(restoreResult, t),
+        okText: t('common.restart'),
+        closable: false,
+        maskClosable: false,
+        keyboard: false,
+        onOk: () => {
+          restartApp();
+        },
+      });
+      showRestoreWarnings(restoreResult);
+    } catch (error) {
+      const parsed = parseRestoreError(error);
+      if (isPasswordError(parsed.type)) {
+        // Nothing has been written yet: ask for the password and retry the same file.
+        promptRestorePassword(
+          (password) => {
+            void executeRestore(restoreFn, description, skipCliCustomRootsHolder, password);
+          },
+          parsed.type === 'passwordWrong',
+        );
+        return;
+      }
+      console.error('Restore failed:', error);
+      message.error(parsed.message);
+    } finally {
+      setRestoreLoading(false);
+    }
+  };
+
   const handleRestore = async () => {
     if (backupType === 'webdav') {
       // Show WebDAV file selection modal
@@ -451,57 +619,56 @@ const GeneralSettingsPage: React.FC = () => {
         message.warning(t('settings.backupSettings.noWebDAVConfigured'));
         return;
       }
-      setWebdavRestoreModalOpen(true);
-    } else {
-      // Local file selection
-      setRestoreLoading(true);
-      try {
-        const zipFilePath = await selectBackupFile();
-        if (!zipFilePath) {
-          setRestoreLoading(false);
-          return;
-        }
+      setRemoteRestoreChannel('webdav');
+      return;
+    }
 
-        const skipCliCustomRootsHolder = createSkipCliCustomRootsHolder();
-        Modal.confirm({
-          title: t('settings.backupSettings.confirmRestore'),
-          content: buildRestoreConfirmContent(
+    if (backupType === 'repository') {
+      // Show repository file selection modal
+      if (!repositoryConfig.owner || !repositoryConfig.repository) {
+        message.warning(t('settings.backupSettings.noRepositoryConfigured'));
+        return;
+      }
+      setRemoteRestoreChannel('repository');
+      return;
+    }
+
+    // Local file selection
+    setRestoreLoading(true);
+    try {
+      const zipFilePath = await selectBackupFile();
+      if (!zipFilePath) {
+        setRestoreLoading(false);
+        return;
+      }
+
+      const skipCliCustomRootsHolder = createSkipCliCustomRootsHolder();
+      Modal.confirm({
+        title: t('settings.backupSettings.confirmRestore'),
+        content: buildRestoreConfirmContent(
+          t('settings.backupSettings.confirmRestoreDesc'),
+          skipCliCustomRootsHolder,
+          t
+        ),
+        okText: t('common.confirm'),
+        cancelText: t('common.cancel'),
+        onOk: () => {
+          void executeRestore(
+            (restorePassword) =>
+              restoreDatabase(zipFilePath, {
+                skipCliCustomRoots: skipCliCustomRootsHolder.value,
+                restorePassword,
+              }),
             t('settings.backupSettings.confirmRestoreDesc'),
             skipCliCustomRootsHolder,
-            t
-          ),
-          okText: t('common.confirm'),
-          cancelText: t('common.cancel'),
-          onOk: async () => {
-            try {
-              const restoreResult = await restoreDatabase(zipFilePath, {
-                skipCliCustomRoots: skipCliCustomRootsHolder.value,
-              });
-              // 恢复成功后弹出重启对话框
-              Modal.info({
-                title: t('settings.backupSettings.restoreSuccess'),
-                content: buildRestoreSuccessContent(restoreResult, t),
-                okText: t('common.restart'),
-                closable: false,
-                maskClosable: false,
-                keyboard: false,
-                onOk: () => {
-                  restartApp();
-                },
-              });
-              showRestoreWarnings(restoreResult);
-            } catch (error) {
-              console.error('Restore failed:', error);
-              message.error(t('settings.backupSettings.restoreFailed'));
-            }
-          },
-        });
-      } catch (error) {
-        console.error('Restore failed:', error);
-        message.error(t('settings.backupSettings.restoreFailed'));
-      } finally {
-        setRestoreLoading(false);
-      }
+          );
+        },
+      });
+    } catch (error) {
+      console.error('Restore failed:', error);
+      message.error(t('settings.backupSettings.restoreFailed'));
+    } finally {
+      setRestoreLoading(false);
     }
   };
 
@@ -529,21 +696,35 @@ const GeneralSettingsPage: React.FC = () => {
     });
   };
 
-  const handleWebDAVRestoreSelect = async (selection: {
-    filename: string;
-    hostLabel: string | null;
-    matchType: 'current' | 'other' | 'unlabeled';
-  }) => {
+  const handleListWebDAVBackups = () =>
+    listWebDAVBackups(webdav.url, webdav.username, webdav.password, webdav.remotePath);
+
+  const handleDeleteWebDAVBackup = (file: { filename: string }) =>
+    deleteWebDAVBackup(webdav.url, webdav.username, webdav.password, webdav.remotePath, file.filename);
+
+  const handleListRepositoryBackups = () => listRepositoryBackups();
+
+  const handleDeleteRepositoryBackup = (file: { filename: string; sha?: string }) =>
+    deleteRepositoryBackup(file.filename, file.sha ?? '');
+
+  const handleRemoteRestoreSelect = (selection: RemoteBackupSelection) => {
+    const channel = remoteRestoreChannel;
+    if (!channel) {
+      return;
+    }
+    const file = selection.file;
     const restoreDescription =
-      selection.matchType === 'current'
-        ? t('settings.backupSettings.confirmRestoreCurrentHost', {
-            hostLabel: selection.hostLabel || webdav.hostLabel,
-          })
-        : selection.matchType === 'other'
-          ? t('settings.backupSettings.confirmRestoreOtherHost', {
-              hostLabel: selection.hostLabel || t('settings.backupSettings.unknownHostLabel'),
+      channel === 'webdav'
+        ? file.matchType === 'current'
+          ? t('settings.backupSettings.confirmRestoreCurrentHost', {
+              hostLabel: file.hostLabel || webdav.hostLabel,
             })
-          : t('settings.backupSettings.confirmRestoreDesc');
+          : file.matchType === 'other'
+            ? t('settings.backupSettings.confirmRestoreOtherHost', {
+                hostLabel: file.hostLabel || t('settings.backupSettings.unknownHostLabel'),
+              })
+            : t('settings.backupSettings.confirmRestoreDesc')
+        : t('settings.backupSettings.confirmRestoreDesc');
 
     const skipCliCustomRootsHolder = createSkipCliCustomRootsHolder();
     Modal.confirm({
@@ -551,48 +732,27 @@ const GeneralSettingsPage: React.FC = () => {
       content: buildRestoreConfirmContent(restoreDescription, skipCliCustomRootsHolder, t),
       okText: t('common.confirm'),
       cancelText: t('common.cancel'),
-      onOk: async () => {
-        setRestoreLoading(true);
-        try {
-          const restoreResult = await restoreFromWebDAV(
-            webdav.url,
-            webdav.username,
-            webdav.password,
-            webdav.remotePath,
-            selection.filename,
-            { skipCliCustomRoots: skipCliCustomRootsHolder.value }
-          );
-          // 恢复成功后弹出重启对话框
-          Modal.info({
-            title: t('settings.backupSettings.restoreSuccess'),
-            content: buildRestoreSuccessContent(restoreResult, t),
-            okText: t('common.restart'),
-            closable: false,
-            maskClosable: false,
-            keyboard: false,
-            onOk: () => {
-              restartApp();
-            },
-          });
-          showRestoreWarnings(restoreResult);
-        } catch (error) {
-          console.error('Restore failed:', error);
-
-          // Parse error if it's JSON
-          let errorMessage = t('settings.backupSettings.restoreFailed');
-          try {
-            const errorObj = JSON.parse(String(error));
-            if (errorObj.suggestion) {
-              errorMessage = `${t('settings.backupSettings.restoreFailed')}: ${t(errorObj.suggestion)}`;
+      onOk: () => {
+        void executeRestore(
+          (restorePassword) => {
+            if (channel === 'webdav') {
+              return restoreFromWebDAV(
+                webdav.url,
+                webdav.username,
+                webdav.password,
+                webdav.remotePath,
+                file.filename,
+                { skipCliCustomRoots: skipCliCustomRootsHolder.value, restorePassword }
+              );
             }
-          } catch {
-            errorMessage = `${t('settings.backupSettings.restoreFailed')}: ${String(error)}`;
-          }
-
-          message.error(errorMessage);
-        } finally {
-          setRestoreLoading(false);
-        }
+            return restoreFromRepository(file.filename, file.sha ?? '', {
+              skipCliCustomRoots: skipCliCustomRootsHolder.value,
+              restorePassword,
+            });
+          },
+          restoreDescription,
+          skipCliCustomRootsHolder,
+        );
       },
     });
   };
@@ -603,6 +763,54 @@ const GeneralSettingsPage: React.FC = () => {
     } catch (error) {
       console.error('Failed to open data directory:', error);
       message.error(t('settings.openDataDirFailed'));
+    }
+  };
+
+  const promptRestart = () => {
+    const restartDialog = modal.confirm({
+      title: t('common.restart'),
+      content: t('settings.dataDir.restartPrompt'),
+      okText: t('common.restart'),
+      cancelText: t('settings.dataDir.restartLater'),
+      onOk: async () => {
+        try {
+          await restartApp();
+        } catch (error) {
+          const errorMessage = t('settings.dataDir.restartFailed', { error: String(error) });
+          setDataDirError(errorMessage);
+          restartDialog.update({ content: errorMessage });
+          throw error;
+        }
+      },
+    });
+  };
+
+  const handleDataDirChange = async (action: 'select' | 'reset' | 'cancel' = 'select') => {
+    if (dataDirOperation.current) return;
+    dataDirOperation.current = true;
+    setDataDirBusy(true);
+    setDataDirError(null);
+    try {
+      let selected = action === 'cancel' && dataDirInfo?.is_custom ? dataDirInfo.effective : null;
+      if (action === 'select') {
+        const result = await openFolderDialog({
+          title: t('settings.dataDir.selectFolder'),
+          defaultPath: dataDirInfo?.next_start,
+          multiple: false,
+          directory: true,
+        });
+        if (typeof result !== 'string') return;
+        selected = result;
+      }
+      const info = await setAppDataDirOverride(selected);
+      setDataDirInfo(info);
+      if (info.restart_required) promptRestart();
+    } catch (error) {
+      console.error('Failed to set data directory:', error);
+      setDataDirError(t('settings.dataDir.saveFailed', { error: String(error) }));
+    } finally {
+      dataDirOperation.current = false;
+      setDataDirBusy(false);
     }
   };
 
@@ -650,16 +858,31 @@ const GeneralSettingsPage: React.FC = () => {
   // Backup settings table data
   const backupColumns = [
     { title: t('settings.backupSettings.storageType'), dataIndex: 'storageType', key: 'storageType' },
-    { title: backupType === 'local' ? t('settings.backupSettings.localPath') : t('settings.webdav.url'), dataIndex: 'path', key: 'path' },
+    { title: t('settings.backupSettings.backupTarget'), dataIndex: 'path', key: 'path' },
     ...(backupType === 'webdav' ? [{ title: t('settings.webdav.username'), dataIndex: 'username', key: 'username' }] : []),
     { title: t('settings.lastBackup'), dataIndex: 'lastBackup', key: 'lastBackup' },
   ];
 
+  const storageTypeLabel =
+    backupType === 'local'
+      ? t('settings.backupSettings.local')
+      : backupType === 'webdav'
+        ? t('settings.backupSettings.webdav')
+        : t('settings.backupSettings.repositoryChannel');
+  const storageTarget =
+    backupType === 'local'
+      ? localBackupPath || t('common.notSet')
+      : backupType === 'webdav'
+        ? webdav.url || t('common.notSet')
+        : repositoryConfig.owner && repositoryConfig.repository
+          ? `${repositoryConfig.owner}/${repositoryConfig.repository} (${repositoryConfig.platform})`
+          : t('common.notSet');
+
   const backupData = [
     {
       key: '1',
-      storageType: backupType === 'local' ? t('settings.backupSettings.local') : t('settings.backupSettings.webdav'),
-      path: backupType === 'local' ? (localBackupPath || t('common.notSet')) : (webdav.url || t('common.notSet')),
+      storageType: storageTypeLabel,
+      path: storageTarget,
       username: webdav.username || t('common.notSet'),
       lastBackup: formatBackupTime(lastBackupTime),
     },
@@ -683,7 +906,10 @@ const GeneralSettingsPage: React.FC = () => {
   );
 
   const CODING_TABS = ['opencode', 'claudecode', 'claudedesktop', 'codex', 'grok', 'geminicli', 'kimi', 'openclaw', 'pi', 'oh_my_pi', 'hermes', 'dsh'] as const;
-  const OTHER_TABS = ['gateway', 'image', 'ssh', ...(isWindows ? ['wsl'] : [])] as string[];
+  // Order here drives the chip order in the "right side" row; keep it in the same
+  // order as the header toolbar. The browser entry is opt-in and absent from the
+  // backend default `visible_tabs`, so a fresh install shows no browser tab.
+  const OTHER_TABS = ['miniBrowser', 'gateway', 'image', 'ssh', ...(isWindows ? ['wsl'] : [])] as string[];
 
   const [reorderMode, setReorderMode] = React.useState(false);
 
@@ -1005,10 +1231,69 @@ const GeneralSettingsPage: React.FC = () => {
 
             <Divider />
 
+            {/* Data Directory (custom path override, issue #345) */}
+            <SectionTitle
+              icon={<FolderOpen size={16} aria-hidden="true" className={styles.dataDirIcon} />}
+              title={t('settings.dataDir.title')}
+              extra={
+                <Space size={4} wrap>
+                  <Button
+                    type="link"
+                    loading={dataDirBusy}
+                    disabled={!dataDirInfo || dataDirBusy || restoreLoading}
+                    onClick={() => void handleDataDirChange()}
+                  >
+                    {t('settings.dataDir.change')}
+                  </Button>
+                  <Button
+                    type="link"
+                    disabled={!dataDirInfo?.override || dataDirBusy || restoreLoading}
+                    onClick={() => void handleDataDirChange('reset')}
+                  >
+                    {t('settings.dataDir.reset')}
+                  </Button>
+                </Space>
+              }
+            />
+            <div className={styles.dataDirSection} aria-busy={dataDirBusy || (!dataDirInfo && !dataDirError)}>
+              <div className={styles.dataDirRow}>
+                <Text type="secondary">{t('settings.dataDir.current')}</Text>
+                <div className={styles.dataDirValue}>
+                  <span>{dataDirInfo?.effective || (dataDirError ? '—' : t('common.loading'))}</span>
+                  {dataDirInfo && (
+                    <Text type="secondary">
+                      ({dataDirInfo.is_custom ? t('settings.dataDir.custom') : t('settings.dataDir.defaultTag')})
+                    </Text>
+                  )}
+                </div>
+              </div>
+              {dataDirInfo?.restart_required && (
+                <div className={styles.dataDirRow} role="status">
+                  <Text type="secondary">{t('settings.dataDir.nextStart')}</Text>
+                  <div className={styles.dataDirValue}>
+                    <span>{dataDirInfo.next_start}</span>
+                    <Text type="warning">{t('settings.dataDir.pending')}</Text>
+                    <Button type="link" size="small" onClick={promptRestart} disabled={dataDirBusy || restoreLoading}>
+                      {t('common.restart')}
+                    </Button>
+                    <Button type="link" size="small" onClick={() => void handleDataDirChange('cancel')} disabled={dataDirBusy || restoreLoading}>
+                      {t('settings.dataDir.cancelChange')}
+                    </Button>
+                  </div>
+                </div>
+              )}
+              <Text type="secondary" className={styles.dataDirHint}>
+                {t('settings.dataDir.hint')}
+              </Text>
+              {dataDirError && <Text type="danger" role="alert" className={styles.dataDirHint}>{dataDirError}</Text>}
+            </div>
+
+            <Divider />
+
             {/* Backup Settings */}
-            <SectionTitle 
-              icon={<CloudSyncOutlined style={{ color: '#52c41a' }} />} 
-              title={t('settings.cards.backup')} 
+            <SectionTitle
+              icon={<CloudSyncOutlined style={{ color: '#52c41a' }} />}
+              title={t('settings.cards.backup')}
               extra={
                 <Button
                   type="text"
@@ -1051,22 +1336,28 @@ const GeneralSettingsPage: React.FC = () => {
                 </Text>
               </div>
             )}
+            <Divider />
           </Card>
           </div>
         </Col>
       </Row>
 
       {/* Modals */}
-      <BackupSettingsModal open={backupModalOpen} onClose={() => setBackupModalOpen(false)} />
-      <WebDAVRestoreModal
-        open={webdavRestoreModalOpen}
-        onClose={() => setWebdavRestoreModalOpen(false)}
-        onSelect={handleWebDAVRestoreSelect}
-        url={webdav.url}
-        username={webdav.username}
-        password={webdav.password}
-        remotePath={webdav.remotePath}
-        currentHostLabel={webdav.hostLabel}
+      <BackupSettingsModal
+        open={backupModalOpen}
+        onClose={() => {
+          setBackupModalOpen(false);
+          // The save path may have changed the repository connection; refresh the summary.
+          refreshRepositoryConfig();
+        }}
+      />
+      <RemoteBackupRestoreModal
+        open={remoteRestoreChannel !== null}
+        onClose={() => setRemoteRestoreChannel(null)}
+        onSelect={handleRemoteRestoreSelect}
+        loadFiles={remoteRestoreChannel === 'repository' ? handleListRepositoryBackups : handleListWebDAVBackups}
+        deleteFile={remoteRestoreChannel === 'repository' ? handleDeleteRepositoryBackup : handleDeleteWebDAVBackup}
+        currentHostLabel={remoteRestoreChannel === 'webdav' ? webdav.hostLabel : ''}
       />
 
       {/* Update Progress Modal */}

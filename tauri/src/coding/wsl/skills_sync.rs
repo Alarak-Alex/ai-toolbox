@@ -1,6 +1,6 @@
 //! Skills sync to WSL
 //!
-//! Full sync of managed skills to WSL's central repo with symlinks to tool directories.
+//! Full sync of managed skills to WSL's central repo with owned copies or symlinks in tool directories.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -11,14 +11,14 @@ use tokio::sync::Mutex;
 
 use super::adapter;
 use super::sync::{
-    check_wsl_symlink_exists, create_wsl_symlink, inspect_wsl_path_kind, list_wsl_dir,
-    read_wsl_file_raw, remove_wsl_managed_symlink, remove_wsl_path, sync_directory, write_wsl_file,
-    WslPathKind,
+    list_wsl_dir, manage_wsl_skill_target, read_wsl_file_raw, remove_wsl_path, sync_directory,
+    write_wsl_file,
 };
 use super::types::{SyncProgress, WSLSyncConfig};
 use crate::coding::runtime_location;
 use crate::coding::skills::central_repo::{resolve_central_repo_path, resolve_skill_central_path};
 use crate::coding::skills::content_hash::hash_dir;
+use crate::coding::skills::remote_target::RemoteSkillTargetAction;
 use crate::coding::skills::skill_store;
 use crate::coding::tools::builtin::BUILTIN_TOOLS;
 use crate::db::helpers::db_get;
@@ -27,6 +27,77 @@ use crate::SqliteDbState;
 
 const WSL_CENTRAL_DIR: &str = "~/.ai-toolbox/skills";
 static SKILLS_WSL_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Record a user-facing non-fatal notice: append to the run's warning list and
+/// emit `wsl-sync-warning` so the manual-sync modal shows it live.
+fn record_warning(warnings: &mut Vec<String>, app: &AppHandle, message: String) {
+    warnings.push(message.clone());
+    let _ = app.emit("wsl-sync-warning", message);
+}
+
+/// Prefer the built-in display name in user-facing warnings.
+fn tool_display_name(tool_key: &str) -> String {
+    BUILTIN_TOOLS
+        .iter()
+        .find(|t| t.key == tool_key)
+        .map(|t| t.display_name.to_string())
+        .unwrap_or_else(|| tool_key.to_string())
+}
+
+/// Warn that creating/refreshing/removing a tool symlink failed.
+fn warn_link_maintenance_failed(
+    warnings: &mut Vec<String>,
+    app: &AppHandle,
+    skill: &str,
+    tool_key: &str,
+    detail: impl std::fmt::Display,
+) {
+    record_warning(
+        warnings,
+        app,
+        format!(
+            "技能 '{}' 在工具 '{}' 的同步目标维护失败：{}",
+            skill,
+            tool_display_name(tool_key),
+            detail
+        ),
+    );
+}
+
+/// Warn that a real directory or foreign symlink was left untouched.
+fn warn_foreign_path_kept(
+    warnings: &mut Vec<String>,
+    app: &AppHandle,
+    skill: &str,
+    tool_key: &str,
+    link_path: &str,
+) {
+    record_warning(
+        warnings,
+        app,
+        format!(
+            "技能 '{}' 在工具 '{}' 的路径 '{}' 不是 AI Toolbox 管理的同步目标，已保留原样",
+            skill,
+            tool_display_name(tool_key),
+            link_path
+        ),
+    );
+}
+
+fn report_target_result(
+    warnings: &mut Vec<String>,
+    app: &AppHandle,
+    skill: &str,
+    tool_key: &str,
+    target: &str,
+    result: Result<bool, String>,
+) {
+    match result {
+        Ok(true) => {}
+        Ok(false) => warn_foreign_path_kept(warnings, app, skill, tool_key, target),
+        Err(error) => warn_link_maintenance_failed(warnings, app, skill, tool_key, error),
+    }
+}
 
 /// Read WSL sync config directly from database
 async fn get_wsl_config(state: &SqliteDbState) -> Result<WSLSyncConfig, String> {
@@ -76,11 +147,19 @@ fn get_all_skill_tool_keys() -> Vec<&'static str> {
 
 /// Sync all skills to WSL (called on skills-changed event)
 pub async fn sync_skills_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result<(), String> {
+    let mut warnings = Vec::new();
+    sync_skills_to_wsl_with_warnings(state, app, &mut warnings).await
+}
+
+pub(super) async fn sync_skills_to_wsl_with_warnings(
+    state: &SqliteDbState,
+    app: AppHandle,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
     let _sync_guard = SKILLS_WSL_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .await;
-
     let config = get_wsl_config(state).await?;
 
     if !config.enabled || !config.sync_skills {
@@ -143,10 +222,11 @@ pub async fn sync_skills_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result
     let windows_skill_names: HashSet<String> = skills.iter().map(|s| s.name.clone()).collect();
 
     // 3. Delete skills in WSL that no longer exist in Windows.
-    // Only app-managed symlinks into the central repo are removed; real
-    // directories or foreign symlinks at the same name are left untouched.
+    // Only app-managed targets are removed; unmarked directories and foreign
+    // symlinks at the same name are left untouched.
     for wsl_skill in &existing_wsl_skills {
         if !windows_skill_names.contains(wsl_skill) {
+            let mut target_cleanup_failed = false;
             // Remove symlinks from all tool directories first
             for tool_key in get_all_skill_tool_keys() {
                 if skipped_tool_keys.contains(tool_key) {
@@ -154,28 +234,36 @@ pub async fn sync_skills_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result
                 }
                 if let Some(wsl_skills_dir) = get_wsl_tool_skills_dir_with_db(&db, tool_key).await {
                     let link_path = format!("{}/{}", wsl_skills_dir, wsl_skill);
-                    if let Err(error) =
-                        remove_wsl_managed_symlink(&distro, &link_path, WSL_CENTRAL_DIR)
-                    {
-                        log::warn!(
-                            "Skills WSL sync: failed to remove stale tool symlink '{}': {}",
-                            link_path,
-                            error
-                        );
-                    } else if inspect_wsl_path_kind(&distro, &link_path, WSL_CENTRAL_DIR)
-                        == WslPathKind::Foreign
-                    {
-                        log::warn!(
-                            "Skills WSL sync: keeping non-app-managed path '{}' (not a symlink into {})",
-                            link_path,
-                            WSL_CENTRAL_DIR
-                        );
-                    }
+                    let source = format!("{}/{}", WSL_CENTRAL_DIR, wsl_skill);
+                    let result = manage_wsl_skill_target(
+                        &distro,
+                        &source,
+                        &link_path,
+                        WSL_CENTRAL_DIR,
+                        RemoteSkillTargetAction::Remove,
+                    );
+                    target_cleanup_failed |= result.is_err();
+                    report_target_result(warnings, &app, wsl_skill, tool_key, &link_path, result);
                 }
+            }
+            // Keep the central entry discoverable so failed target cleanup is retried.
+            if target_cleanup_failed {
+                continue;
             }
             // Remove from central repo
             let skill_path = format!("{}/{}", WSL_CENTRAL_DIR, wsl_skill);
-            let _ = remove_wsl_path(&distro, &skill_path);
+            if let Err(error) = remove_wsl_path(&distro, &skill_path) {
+                log::warn!(
+                    "Skills WSL sync: failed to remove orphan directory '{}': {}",
+                    skill_path,
+                    error
+                );
+                record_warning(
+                    warnings,
+                    &app,
+                    format!("技能 '{}' 的远端目录清理失败：{}", wsl_skill, error),
+                );
+            }
         }
     }
 
@@ -207,6 +295,15 @@ pub async fn sync_skills_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result
                 "Skills WSL sync: skip '{}', source not found: {}",
                 skill.name,
                 source.display()
+            );
+            record_warning(
+                warnings,
+                &app,
+                format!(
+                    "技能 '{}' 的源目录不存在，已跳过同步：{}",
+                    skill.name,
+                    source.display()
+                ),
             );
             continue;
         }
@@ -261,8 +358,21 @@ pub async fn sync_skills_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result
             );
             match sync_directory(&source_str, &wsl_target, &distro) {
                 Ok(_) => {
-                    // Save hash for future comparison
-                    write_wsl_file(&distro, &hash_file, windows_hash)?;
+                    // Save hash for future comparison. A hash-marker failure is
+                    // non-fatal: the content is already synced and the next run
+                    // simply re-uploads, so warn instead of aborting the run.
+                    if let Err(error) = write_wsl_file(&distro, &hash_file, windows_hash) {
+                        log::warn!(
+                            "Skills WSL sync: failed to write sync hash for '{}': {}",
+                            skill.name,
+                            error
+                        );
+                        record_warning(
+                            warnings,
+                            &app,
+                            format!("技能 '{}' 的同步哈希写入失败：{}", skill.name, error),
+                        );
+                    }
                     synced_count += 1;
                 }
                 Err(e) => {
@@ -273,69 +383,48 @@ pub async fn sync_skills_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result
                         synced_files: vec![],
                         skipped_files: vec![],
                         errors: vec![error_message.clone()],
+                        warnings: warnings.clone(),
                     };
                     let _ = super::commands::update_sync_status(state, &sync_result).await;
+                    let _ = super::commands::update_sync_warnings(state, warnings).await;
                     let _ = app.emit("wsl-sync-completed", &sync_result);
                     return Err(error_message);
                 }
             }
         }
 
-        // Ensure symlinks for each enabled tool
+        // Maintain owned copies or links for each enabled tool
         for tool_key in &skill.enabled_tools {
             if skipped_tool_keys.contains(tool_key) {
                 continue;
             }
             if let Some(wsl_skills_dir) = get_wsl_tool_skills_dir_with_db(&db, tool_key).await {
                 let link_path = format!("{}/{}", wsl_skills_dir, skill.name);
-                match inspect_wsl_path_kind(&distro, &link_path, WSL_CENTRAL_DIR) {
-                    // Nothing there: create the managed link.
-                    WslPathKind::Missing => {
-                        if let Err(error) = create_wsl_symlink(&distro, &wsl_target, &link_path) {
-                            log::warn!(
-                                "Skills WSL sync: failed to create symlink for skill '{}' tool '{}' at '{}': {}",
-                                skill.name,
-                                tool_key,
-                                link_path,
-                                error
-                            );
-                        }
-                    }
-                    // Already an app-managed link: rebuild only when stale.
-                    WslPathKind::Managed => {
-                        if !check_wsl_symlink_exists(&distro, &link_path, &wsl_target) {
-                            if let Err(error) = create_wsl_symlink(&distro, &wsl_target, &link_path)
-                            {
-                                log::warn!(
-                                    "Skills WSL sync: failed to refresh symlink for skill '{}' tool '{}' at '{}': {}",
-                                    skill.name,
-                                    tool_key,
-                                    link_path,
-                                    error
-                                );
-                            }
-                        }
-                    }
-                    // Real directory or foreign symlink: never touch user data.
-                    WslPathKind::Foreign => {
-                        log::warn!(
-                            "Skills WSL sync: keeping non-app-managed path '{}' while syncing skill '{}' to tool '{}'",
-                            link_path,
-                            skill.name,
-                            tool_key
-                        );
-                    }
-                }
+                let result = manage_wsl_skill_target(
+                    &distro,
+                    &wsl_target,
+                    &link_path,
+                    WSL_CENTRAL_DIR,
+                    RemoteSkillTargetAction::sync_for_tool(tool_key),
+                );
+                report_target_result(warnings, &app, &skill.name, tool_key, &link_path, result);
             } else {
                 log::warn!(
                     "Skills WSL sync: could not resolve WSL skills dir for skill '{}' tool '{}'",
                     skill.name,
                     tool_key
                 );
+                warn_link_maintenance_failed(
+                    warnings,
+                    &app,
+                    &skill.name,
+                    tool_key,
+                    "无法解析 Skills 目标目录",
+                );
             }
         }
 
-        // Remove symlinks for tools that are no longer enabled (managed links only)
+        // Remove owned targets for tools that are no longer enabled
         let enabled_set: HashSet<&str> = skill.enabled_tools.iter().map(|s| s.as_str()).collect();
         for tool_key in get_all_skill_tool_keys() {
             if skipped_tool_keys.contains(tool_key) {
@@ -344,26 +433,15 @@ pub async fn sync_skills_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result
             if !enabled_set.contains(tool_key) {
                 if let Some(wsl_skills_dir) = get_wsl_tool_skills_dir_with_db(&db, tool_key).await {
                     let link_path = format!("{}/{}", wsl_skills_dir, skill.name);
-                    if let Err(error) =
-                        remove_wsl_managed_symlink(&distro, &link_path, WSL_CENTRAL_DIR)
-                    {
-                        log::warn!(
-                            "Skills WSL sync: failed to remove stale symlink for skill '{}' tool '{}' at '{}': {}",
-                            skill.name,
-                            tool_key,
-                            link_path,
-                            error
-                        );
-                    } else if inspect_wsl_path_kind(&distro, &link_path, WSL_CENTRAL_DIR)
-                        == WslPathKind::Foreign
-                    {
-                        log::warn!(
-                            "Skills WSL sync: keeping non-app-managed path '{}' while unsyncing skill '{}' from tool '{}'",
-                            link_path,
-                            skill.name,
-                            tool_key
-                        );
-                    }
+                    let source = format!("{}/{}", WSL_CENTRAL_DIR, &skill.name);
+                    let result = manage_wsl_skill_target(
+                        &distro,
+                        &source,
+                        &link_path,
+                        WSL_CENTRAL_DIR,
+                        RemoteSkillTargetAction::Remove,
+                    );
+                    report_target_result(warnings, &app, &skill.name, tool_key, &link_path, result);
                 }
             }
         }
@@ -381,8 +459,10 @@ pub async fn sync_skills_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result
         synced_files: vec![],
         skipped_files: vec![],
         errors: vec![],
+        warnings: warnings.clone(),
     };
     let _ = super::commands::update_sync_status(state, &sync_result).await;
+    let _ = super::commands::update_sync_warnings(state, warnings).await;
 
     // Emit event for UI feedback
     let _ = app.emit("wsl-skills-sync-completed", ());

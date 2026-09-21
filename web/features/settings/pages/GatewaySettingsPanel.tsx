@@ -9,6 +9,8 @@ import {
   Gauge,
   Loader2,
   Network,
+  Route,
+  ShieldCheck,
   Terminal,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -25,6 +27,8 @@ import {
   type ProxyGatewaySettings,
   type ProxyGatewayStatus,
 } from '@/services';
+import GatewayPrivacySettings from '@/features/coding/gateway/components/GatewayPrivacySettings';
+import GatewayAggregateSettings from '@/features/coding/gateway/components/GatewayAggregateSettings';
 import styles from './GatewaySettingsPanel.module.less';
 
 type BusyAction = 'load' | 'autosave';
@@ -138,12 +142,13 @@ interface SwitchControlProps {
   checked: boolean;
   disabled?: boolean;
   label: string;
+  ariaLabel?: string;
   onChange: (checked: boolean) => void;
 }
 
-const SwitchControl: React.FC<SwitchControlProps> = ({ checked, disabled, label, onChange }) => (
+const SwitchControl: React.FC<SwitchControlProps> = ({ checked, disabled, label, ariaLabel, onChange }) => (
   <div className={styles.switchControl}>
-    <Switch size="small" checked={checked} disabled={disabled} onChange={onChange} />
+    <Switch size="small" checked={checked} disabled={disabled} aria-label={ariaLabel} onChange={onChange} />
     <span className={styles.switchLabel}>{label}</span>
   </div>
 );
@@ -305,6 +310,22 @@ const GatewaySettingsPanel: React.FC<GatewaySettingsPanelProps> = ({
     const entries = cliStatuses.map((cliStatus) => [cliStatus.cli_key, cliStatus] as const);
     return Object.fromEntries(entries) as Partial<Record<SupportedGatewayCliKey, GatewayCliTakeoverStatus>>;
   }, [cliStatuses]);
+
+  /**
+   * Aggregate engage/disengage rewrites the same CLI runtime config this panel
+   * reports under "接管状态". Re-read it so those tags do not go stale while the
+   * user stays on the settings tab. `getProxyGatewayCliStatuses` is the same
+   * command this panel already loads on mount, so no extra data source is added.
+   */
+  const refreshCliStatuses = React.useCallback(() => {
+    void getProxyGatewayCliStatuses()
+      .then((nextCliStatuses) => {
+        setCliStatuses(nextCliStatuses);
+      })
+      .catch((error) => {
+        console.error('Failed to refresh gateway CLI statuses:', error);
+      });
+  }, []);
 
   const triggerSave = React.useCallback(() => {
     if (!draftSettings || !savedSettings) {
@@ -554,10 +575,27 @@ const GatewaySettingsPanel: React.FC<GatewaySettingsPanelProps> = ({
           <Section icon={<ArrowRightLeft size={15} aria-hidden="true" />} title={t('settings.gateway.sections.resilience')}>
             <div className={styles.fieldStack}>
               <div className={styles.subGroup}>
+                <div className={styles.subGroupLabel}>{t('settings.gateway.subGroups.transport')}</div>
+                <FieldRow
+                  label={t('settings.gateway.fields.codexWebsocket')}
+                  description={t('settings.gateway.hints.codexWebsocketDefault')}
+                  help={t('settings.gateway.hints.codexWebsocket')}
+                  wide
+                >
+                  <SwitchControl
+                    checked={draftSettings.codex_websocket_enabled}
+                    disabled={busyAction !== null}
+                    ariaLabel={t('settings.gateway.fields.codexWebsocket')}
+                    label={draftSettings.codex_websocket_enabled ? t('common.enabled') : t('common.disabled')}
+                    onChange={(checked) => updateDraftAndSave('codex_websocket_enabled', checked)}
+                  />
+                </FieldRow>
+              </div>
+              <div className={styles.subGroup}>
                 <div className={styles.subGroupLabel}>{t('settings.gateway.subGroups.rectifier')}</div>
                 <FieldRow
                   label={t('settings.gateway.fields.thinkingRectifier')}
-                  description={t('settings.gateway.hints.thinkingRectifier')}
+                  help={t('settings.gateway.hints.thinkingRectifier')}
                   wide
                 >
                   <SwitchControl
@@ -568,7 +606,7 @@ const GatewaySettingsPanel: React.FC<GatewaySettingsPanelProps> = ({
                 </FieldRow>
                 <FieldRow
                   label={t('settings.gateway.fields.responsesEncryptedContentRectifier')}
-                  description={t('settings.gateway.hints.responsesEncryptedContentRectifier')}
+                  help={t('settings.gateway.hints.responsesEncryptedContentRectifier')}
                   wide
                 >
                   <SwitchControl
@@ -579,7 +617,7 @@ const GatewaySettingsPanel: React.FC<GatewaySettingsPanelProps> = ({
                 </FieldRow>
                 <FieldRow
                   label={t('settings.gateway.fields.thinkingBudgetRectifier')}
-                  description={t('settings.gateway.hints.thinkingBudgetRectifier')}
+                  help={t('settings.gateway.hints.thinkingBudgetRectifier')}
                   wide
                 >
                   <SwitchControl
@@ -590,7 +628,7 @@ const GatewaySettingsPanel: React.FC<GatewaySettingsPanelProps> = ({
                 </FieldRow>
                 <FieldRow
                   label={t('settings.gateway.fields.lossyRejection')}
-                  description={t('settings.gateway.hints.lossyRejection')}
+                  help={t('settings.gateway.hints.lossyRejection')}
                   wide
                 >
                   <SwitchControl
@@ -601,7 +639,7 @@ const GatewaySettingsPanel: React.FC<GatewaySettingsPanelProps> = ({
                 </FieldRow>
                 <FieldRow
                   label={t('settings.gateway.fields.cacheInjection')}
-                  description={t('settings.gateway.hints.cacheInjection')}
+                  help={t('settings.gateway.hints.cacheInjection')}
                   wide
                 >
                   <SwitchControl
@@ -881,6 +919,18 @@ const GatewaySettingsPanel: React.FC<GatewaySettingsPanelProps> = ({
               </div>
             </div>
           </Section>
+
+          {/*
+            Aggregate mode sits beside the resilience section: it also rewrites
+            the CLI runtime config, but it is controlled by its own engage /
+            restore commands instead of the panel's auto-saved settings payload.
+          */}
+          <Section icon={<Route size={15} aria-hidden="true" />} title={t('gateway.aggregate.title')}>
+            <GatewayAggregateSettings
+              running={status?.running ?? false}
+              onTakeoverChange={refreshCliStatuses}
+            />
+          </Section>
         </div>
 
         <div className={styles.contentColumn}>
@@ -991,20 +1041,47 @@ const GatewaySettingsPanel: React.FC<GatewaySettingsPanelProps> = ({
             </div>
           </Section>
 
+          <Section icon={<ShieldCheck size={15} aria-hidden="true" />} title={t('gateway.privacy.title')}>
+            <GatewayPrivacySettings running={status?.running ?? false} />
+          </Section>
+
           <Section icon={<FileText size={15} aria-hidden="true" />} title={t('settings.gateway.sections.logs')}>
             <div className={styles.fieldStack}>
-              <FieldRow label={t('settings.gateway.fields.requestLog')} wide>
+              <FieldRow
+                label={t('settings.gateway.fields.requestLog')}
+                help={t('settings.gateway.hints.requestLog')}
+                wide
+              >
                 <SwitchControl
                   checked={draftSettings.request_log_enabled}
                   label={draftSettings.request_log_enabled ? t('common.enabled') : t('common.disabled')}
                   onChange={handleRequestLogEnabledToggle}
                 />
               </FieldRow>
-              <FieldRow label={t('settings.gateway.fields.metrics')} wide>
+              <FieldRow
+                label={t('settings.gateway.fields.metrics')}
+                help={t('settings.gateway.hints.metrics')}
+                wide
+              >
                 <SwitchControl
                   checked={draftSettings.metrics_enabled}
                   label={draftSettings.metrics_enabled ? t('common.enabled') : t('common.disabled')}
                   onChange={(checked) => updateDraftAndSave('metrics_enabled', checked)}
+                />
+              </FieldRow>
+              <FieldRow
+                label={t('settings.gateway.fields.sessionUsage')}
+                help={t('settings.gateway.hints.sessionUsage')}
+                wide
+              >
+                <SwitchControl
+                  checked={draftSettings.session_usage_enabled}
+                  label={
+                    draftSettings.session_usage_enabled
+                      ? t('common.enabled')
+                      : t('common.disabled')
+                  }
+                  onChange={(checked) => updateDraftAndSave('session_usage_enabled', checked)}
                 />
               </FieldRow>
               <div className={styles.logParts} aria-label={t('settings.gateway.fields.detailStorage')}>

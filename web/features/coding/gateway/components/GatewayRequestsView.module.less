@@ -41,6 +41,7 @@
 .filterBar {
   display: flex;
   min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   overflow-x: auto;
@@ -59,14 +60,6 @@
   display: flex;
   min-width: 0;
   flex: 0 0 auto;
-  align-items: center;
-  gap: 4px;
-}
-
-.filterSectionShrink {
-  display: flex;
-  min-width: 0;
-  flex: 1 1 auto;
   align-items: center;
   gap: 4px;
 }
@@ -94,9 +87,16 @@
   min-width: 78px;
 }
 
-.dateRange {
-  min-width: 0;
-  flex: 1 1 auto;
+.rangeSelect {
+  width: auto;
+  min-width: 86px;
+}
+
+.customRangePicker {
+  width: 340px;
+  min-width: min(320px, 100%);
+  max-width: 100%;
+  flex: 0 1 auto;
 }
 
 .searchInput {
@@ -108,6 +108,7 @@
 .filterActions {
   display: flex;
   min-width: max-content;
+  margin-left: auto;
   flex: 0 0 auto;
   align-items: center;
   gap: 4px;
@@ -254,6 +255,13 @@
   gap: 2px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+
+  span,
+  small {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   small {
     color: var(--color-text-tertiary);
@@ -429,6 +437,14 @@
     font-weight: 560;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .detailNote {
+    color: var(--color-text-tertiary);
+    font-size: 10px;
+    font-weight: 400;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
 

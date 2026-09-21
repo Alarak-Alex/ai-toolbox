@@ -3,7 +3,6 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
 use uuid::Uuid;
 
 use super::cache_cleanup::get_git_cache_ttl_secs;
@@ -828,7 +827,9 @@ pub async fn update_managed_skill_from_source(
             };
         let current_target = tool_root.join(&record.name);
         let target_path_moved = target_path_changed(&t.target_path, &current_target);
-        let force_copy = t.mode == "copy" || t.tool == "cursor" || custom_tool_force_copy;
+        let force_copy = t.mode == "copy"
+            || crate::coding::tools::builtin_tool_forces_skill_copy(&t.tool)
+            || custom_tool_force_copy;
 
         let sync_result = if target_path_moved {
             let sync_result = sync_skill_to_target(
@@ -883,15 +884,11 @@ pub async fn update_managed_skill_from_source(
 /// symlinked tool directory) can be recovered. Keeps the newest 5 copies per
 /// skill; failures here are logged, not fatal — the swap still proceeds.
 fn backup_central_before_replace(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     record: &Skill,
     central_path: &Path,
 ) -> Result<(), anyhow::Error> {
-    let backups_root = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| anyhow::anyhow!("failed to resolve app data dir: {error}"))?
-        .join("skills-backup");
+    let backups_root = crate::app_paths::resolved_data_dir().join("skills-backup");
     if !backups_root.exists() {
         std::fs::create_dir_all(&backups_root)
             .with_context(|| format!("create backup root {:?}", backups_root))?;
@@ -1178,12 +1175,8 @@ fn clone_to_cache(
     clone_url: &str,
     branch: Option<&str>,
 ) -> Result<(PathBuf, String)> {
-    use tauri::Manager;
-
-    let cache_dir = app
-        .path()
-        .app_cache_dir()
-        .context("failed to resolve app cache dir")?;
+    let _ = app;
+    let cache_dir = crate::app_paths::resolved_cache_dir();
     let cache_root = cache_dir.join("skills-git-cache");
     std::fs::create_dir_all(&cache_root)
         .with_context(|| format!("failed to create cache dir {:?}", cache_root))?;

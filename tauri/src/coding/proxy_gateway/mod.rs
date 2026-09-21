@@ -1,9 +1,12 @@
+pub mod aggregate_draft;
+pub mod aggregate_naming;
 pub mod cli_proxy;
 pub mod commands;
 pub mod listen;
 pub mod model_health;
 pub mod paths;
 pub mod pricing;
+pub mod privacy;
 pub mod provider_profiles;
 pub(crate) mod provider_protocol;
 pub mod provider_switch;

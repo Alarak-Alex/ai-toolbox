@@ -613,11 +613,14 @@ mod tests {
         let paths = ProxyGatewayPaths::new(dir.path());
         let now = Utc::now();
         let summary = GatewayRequestLogSummary {
+            transport: Default::default(),
+            request_kind: Default::default(),
+            usage_metadata: None,
             data_source: None,
             trace_id: "trace-1".to_string(),
             started_at: now,
             ended_at: now,
-            cli_key: Some(GatewayCliKey::Claude),
+            cli_key: Some(GatewayCliKey::Claude.into()),
             route_name: "anthropic".to_string(),
             method: "POST".to_string(),
             path: "/anthropic/v1/messages".to_string(),
@@ -653,6 +656,8 @@ mod tests {
             detail_offset: None,
         };
         let record = new_request_log_record(GatewayRequestLogDetail {
+            privacy: None,
+            websocket: None,
             summary,
             request_headers: Some(BTreeMap::from([(
                 "Content-Type".to_string(),

@@ -213,12 +213,27 @@ pub struct CodexLocalConfigInput {
 
 /// Codex settings structure (for reading/writing config files)
 /// auth.json + config.toml combined
+// Frontend-facing wire type: the web side consumes camelCase keys, matching
+// the other command response types in this module. `auth`/`config` are single
+// words so this only renames `model_catalog`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CodexSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
+    /// Raw text of the model catalog file for the read-only config preview:
+    /// the file named by config.toml's `model_catalog_json` pointer, or —
+    /// when the pointer is absent — the AI Toolbox-managed catalog file as a
+    /// leftover fallback. `None` when neither is readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<String>,
+    /// Whether config.toml's `model_catalog_json` pointer is set (Codex
+    /// actually reads the catalog). Present whenever the preview tab is
+    /// rendered (catalog content shown or a dangling pointer exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_catalog_active: Option<bool>,
 }
 
 // ============================================================================
@@ -256,6 +271,8 @@ pub struct CodexOfficialAccountRecord {
     pub limit_weekly_reset_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_monthly_reset_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_credits_available: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_limits_fetched_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -307,6 +324,8 @@ pub struct CodexOfficialAccount {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_monthly_reset_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_credits_available: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_limits_fetched_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -341,6 +360,7 @@ impl From<CodexOfficialAccountRecord> for CodexOfficialAccount {
             limit_5h_reset_at: record.limit_5h_reset_at,
             limit_weekly_reset_at: record.limit_weekly_reset_at,
             limit_monthly_reset_at: record.limit_monthly_reset_at,
+            reset_credits_available: record.reset_credits_available,
             last_limits_fetched_at: record.last_limits_fetched_at,
             last_error: record.last_error,
             sort_index: record.sort_index,
@@ -382,6 +402,8 @@ pub struct CodexOfficialAccountContent {
     pub limit_weekly_reset_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_monthly_reset_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_credits_available: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_limits_fetched_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

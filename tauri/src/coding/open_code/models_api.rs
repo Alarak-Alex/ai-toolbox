@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+use crate::coding::config_value_host::{config_value_host_from_location, ConfigValueHost};
+use crate::coding::omp_config_value;
+use crate::coding::pi_config_value;
+use crate::coding::runtime_location;
 use crate::db::SqliteDbState;
 use crate::http_client;
 use futures_util::StreamExt;
@@ -18,6 +22,19 @@ pub enum ApiType {
     OpenaiCompat,
 }
 
+/// Config value syntax a request opts into for its credential fields.
+///
+/// Pi stores `$ENV_VAR` / `!command` templates in `models.json` and OMP stores
+/// `!command` / environment-variable names in `models.yml`. Callers that opt in
+/// ask the shared discovery/connectivity commands to resolve them before the
+/// value reaches an HTTP request; every other caller keeps sending raw literals.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigValueMode {
+    Pi,
+    Omp,
+}
+
 /// Request parameters for fetching models from provider API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +48,8 @@ pub struct FetchModelsRequest {
     pub sdk_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_value_mode: Option<ConfigValueMode>,
 }
 
 /// OpenAI compatible models list response
@@ -158,10 +177,18 @@ fn parse_anthropic_models_response(response_text: &str) -> Result<Vec<FetchedMod
 // Connectivity Test Types
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectivityApiFormat {
+    OpenaiCodexResponses,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectivityTestRequest {
     pub npm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_format: Option<ConnectivityApiFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     pub base_url: String,
@@ -183,6 +210,26 @@ pub struct ConnectivityTestRequest {
     pub model_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_value_mode: Option<ConfigValueMode>,
+}
+
+impl ConnectivityTestRequest {
+    fn is_codex(&self) -> bool {
+        self.api_format == Some(ConnectivityApiFormat::OpenaiCodexResponses)
+    }
+
+    fn effective_npm(&self) -> &str {
+        if self.is_codex() {
+            "@ai-sdk/openai"
+        } else {
+            &self.npm
+        }
+    }
+
+    fn streaming(&self) -> bool {
+        self.is_codex() || self.stream.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,17 +275,42 @@ fn resolve_provider_request(
     provider_id: Option<&str>,
     base_url: &str,
     api_key: Option<&str>,
+    allow_stored_credential_fallback: bool,
 ) -> ResolvedProviderRequest {
     let resolved_base_url = normalize_optional_string(Some(base_url))
         .or_else(|| provider_id.and_then(super::free_models::resolve_provider_api_base_url))
         .unwrap_or_default();
 
-    let resolved_api_key = normalize_optional_string(api_key)
-        .or_else(|| provider_id.and_then(super::free_models::resolve_auth_credential));
+    let resolved_api_key = normalize_optional_string(api_key).or_else(|| {
+        if allow_stored_credential_fallback {
+            provider_id.and_then(super::free_models::resolve_auth_credential)
+        } else {
+            None
+        }
+    });
 
     ResolvedProviderRequest {
         base_url: resolved_base_url,
         api_key: resolved_api_key,
+    }
+}
+
+/// Whether the shared command may fall back to a credential kept by another
+/// tool when this request resolved to no API key.
+///
+/// OMP omits an API key whose `!command` fails or prints nothing, and a
+/// configured key belongs to the OMP provider: replacing it with an entry from
+/// another tool's auth store (e.g. OpenCode `auth.json`) would authenticate the
+/// request with the wrong secret. Requests without a configured key keep the
+/// existing provider fallback.
+fn stored_credential_fallback_allowed(
+    config_value_mode: Option<ConfigValueMode>,
+    configured_api_key: Option<&str>,
+) -> bool {
+    let has_configured_key = configured_api_key.is_some_and(|key| !key.trim().is_empty());
+    match config_value_mode {
+        Some(ConfigValueMode::Omp) => !has_configured_key,
+        _ => true,
     }
 }
 
@@ -284,17 +356,165 @@ fn build_models_url(
     }
 }
 
+// ============================================================================
+// Provider config value syntax
+// ============================================================================
+
+/// Environment a config value belongs to.
+///
+/// Pi and OMP resolve `!command` inside their own runtime, so a WSL Direct root
+/// has to be resolved inside that distribution instead of against the desktop
+/// process environment.
+async fn config_value_host(
+    state: &SqliteDbState,
+    mode: ConfigValueMode,
+) -> Result<ConfigValueHost, String> {
+    let location = match mode {
+        ConfigValueMode::Pi => runtime_location::get_pi_runtime_location_async(state).await?,
+        ConfigValueMode::Omp => {
+            runtime_location::get_oh_my_pi_runtime_location_async(state).await?
+        }
+    };
+    Ok(config_value_host_from_location(&location))
+}
+
+/// Whether the mode resolves credential values in the tool's own runtime.
+fn resolves_config_values(config_value_mode: Option<ConfigValueMode>) -> bool {
+    matches!(
+        config_value_mode,
+        Some(ConfigValueMode::Pi | ConfigValueMode::Omp)
+    )
+}
+
+/// Resolve the credential fields a caller passed through.
+///
+/// Only callers that opt into a `ConfigValueMode` are touched, so every other
+/// tool keeps forwarding its provider-owned strings untouched. Pi reports an
+/// unresolvable value as an error; OMP omits it, the way its own runtime does.
+async fn resolve_credentials(
+    state: &SqliteDbState,
+    provider_id: Option<&str>,
+    api_key: Option<&str>,
+    headers: Option<&Value>,
+    config_value_mode: Option<ConfigValueMode>,
+) -> Result<(Option<String>, Option<Value>), String> {
+    let Some(mode) = config_value_mode else {
+        return Ok((api_key.map(str::to_string), headers.cloned()));
+    };
+
+    // Nothing to resolve: skip the runtime location lookup (and do not fail the
+    // request on an unrelated lookup error) when no credential field needs
+    // resolution.
+    if !has_config_values(api_key, headers) {
+        return Ok((None, headers.cloned()));
+    }
+
+    let host = config_value_host(state, mode).await?;
+    let provider_label = provider_id.unwrap_or(match mode {
+        ConfigValueMode::Pi => "pi",
+        ConfigValueMode::Omp => "omp",
+    });
+
+    match mode {
+        ConfigValueMode::Pi => {
+            let resolved_api_key = match api_key {
+                Some(raw_api_key) => {
+                    let label = format!("API key for provider \"{provider_label}\"");
+                    Some(pi_config_value::resolve_config_value(raw_api_key, &label, &host).await?)
+                }
+                None => None,
+            };
+
+            let resolved_headers = match headers {
+                Some(Value::Object(header_map)) => Some(Value::Object(
+                    pi_config_value::resolve_header_values(header_map, provider_label, &host)
+                        .await?,
+                )),
+                other => other.cloned(),
+            };
+
+            Ok((resolved_api_key, resolved_headers))
+        }
+        ConfigValueMode::Omp => {
+            let resolved_api_key = match api_key {
+                Some(raw_api_key) => {
+                    omp_config_value::resolve_config_value(raw_api_key, &host).await
+                }
+                None => None,
+            };
+
+            let resolved_headers = match headers {
+                Some(Value::Object(header_map)) => Some(Value::Object(
+                    omp_config_value::resolve_header_values(header_map, &host).await,
+                )),
+                other => other.cloned(),
+            };
+
+            Ok((resolved_api_key, resolved_headers))
+        }
+    }
+}
+
+/// Whether a request carries any value that may need resolving.
+///
+/// An empty header object and a blank API key are both common (the modal always
+/// sends the provider header map, and the pages send an empty string when a
+/// provider has no credential), so neither may trigger a runtime location lookup
+/// on its own.
+fn has_config_values(api_key: Option<&str>, headers: Option<&Value>) -> bool {
+    let has_header_values = match headers {
+        Some(Value::Object(header_map)) => !header_map.is_empty(),
+        Some(_) => true,
+        None => false,
+    };
+    let has_api_key = api_key.is_some_and(|key| !key.trim().is_empty());
+    has_api_key || has_header_values
+}
+
+/// Append a resolved Google API key to a model-discovery URL.
+///
+/// Google native auth travels in the query string rather than an Authorization
+/// header, and a Pi caller cannot embed a runtime-resolved key into the URL the
+/// modal displays, so the resolved key is added here.
+fn append_google_native_key(url: String, api_key: Option<&str>) -> String {
+    let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
+        return url;
+    };
+    if url.contains("key=") {
+        return url;
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}key={api_key}")
+}
+
 /// Fetch models list from provider API
 #[tauri::command]
 pub async fn fetch_provider_models(
     state: tauri::State<'_, SqliteDbState>,
     request: FetchModelsRequest,
 ) -> Result<FetchModelsResponse, String> {
+    // Pi / OMP credentials are resolved in that tool's own runtime, so they are
+    // resolved before the provider fallback to keep another tool's stored
+    // credential out of the config value syntax.
+    let (api_key, headers) = resolve_credentials(
+        &state,
+        request.provider_id.as_deref(),
+        request.api_key.as_deref(),
+        request.headers.as_ref(),
+        request.config_value_mode,
+    )
+    .await?;
+
     let resolved_request = resolve_provider_request(
         request.provider_id.as_deref(),
         &request.base_url,
-        request.api_key.as_deref(),
+        api_key.as_deref(),
+        stored_credential_fallback_allowed(request.config_value_mode, request.api_key.as_deref()),
     );
+
+    // Determine if this is Google Native (no Authorization header, key in URL)
+    let is_google_native = matches!(request.api_type, ApiType::Native)
+        && matches!(request.sdk_type.as_deref(), Some("@ai-sdk/google"));
 
     // Create HTTP client with timeout and proxy support
     let client = http_client::client_with_timeout(&state, 30).await?;
@@ -327,12 +547,16 @@ pub async fn fetch_provider_models(
         )
     };
 
+    // A Pi / OMP caller cannot bake a runtime-resolved key into the discovery
+    // URL, so query-parameter auth is completed here instead.
+    let url = if resolves_config_values(request.config_value_mode) && is_google_native {
+        append_google_native_key(url, resolved_request.api_key.as_deref())
+    } else {
+        url
+    };
+
     // Build request
     let mut req_builder = client.get(&url);
-
-    // Determine if this is Google Native (no Authorization header, key in URL)
-    let is_google_native = matches!(request.api_type, ApiType::Native)
-        && matches!(request.sdk_type.as_deref(), Some("@ai-sdk/google"));
 
     // Add authentication based on SDK type and API type
     match request.sdk_type.as_deref() {
@@ -364,8 +588,8 @@ pub async fn fetch_provider_models(
     }
 
     // Add custom headers
-    if let Some(headers) = &request.headers {
-        if let Some(obj) = headers.as_object() {
+    if let Some(resolved_headers) = &headers {
+        if let Some(obj) = resolved_headers.as_object() {
             for (key, value) in obj {
                 if let Some(v) = value.as_str() {
                     req_builder = req_builder.header(key, v);
@@ -624,8 +848,8 @@ fn build_default_body(
     model_id: &str,
     anthropic_user_id: Option<&str>,
 ) -> Value {
-    let stream_enabled = request.stream.unwrap_or(true);
-    match request.npm.as_str() {
+    let stream_enabled = request.streaming();
+    match request.effective_npm() {
         "@ai-sdk/google" => {
             let mut generation_config = serde_json::Map::new();
             if let Some(temperature) = request.temperature {
@@ -742,6 +966,84 @@ fn build_default_body(
     }
 }
 
+fn build_codex_connectivity_url(base_url: &str) -> String {
+    let append_path = |path: &str| {
+        let path = path.trim_end_matches('/');
+        if path.ends_with("/codex/responses") {
+            path.to_string()
+        } else if path.ends_with("/codex") {
+            format!("{path}/responses")
+        } else {
+            format!("{path}/codex/responses")
+        }
+    };
+    match reqwest::Url::parse(base_url) {
+        Ok(mut url) => {
+            url.set_path(&append_path(url.path()));
+            url.to_string()
+        }
+        Err(_) => append_path(base_url),
+    }
+}
+
+fn codex_account_id(api_key: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = api_key.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn codex_stream_error(text: &str) -> Option<String> {
+    let normalized = text.replace("\r\n", "\n");
+    let events: Vec<Value> = normalized
+        .split_inclusive("\n\n")
+        .filter(|frame| frame.ends_with("\n\n"))
+        .filter_map(|frame| {
+            let data = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::from_str(&data).ok()
+        })
+        .collect();
+    for event in &events {
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("error" | "response.failed" | "response.incomplete")
+        ) || event.get("error").is_some_and(|error| !error.is_null())
+            || matches!(
+                event.pointer("/response/status").and_then(Value::as_str),
+                Some("failed" | "incomplete")
+            )
+        {
+            return Some(
+                event
+                    .pointer("/error/message")
+                    .or_else(|| event.pointer("/response/error/message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex Responses stream failed")
+                    .to_string(),
+            );
+        }
+    }
+    if events
+        .iter()
+        .any(|event| event.get("type").and_then(Value::as_str) == Some("response.completed"))
+    {
+        None
+    } else {
+        Some("Codex Responses stream ended without response.completed".to_string())
+    }
+}
+
 fn enforce_prompt_and_model(npm: &str, body: &mut Value, model_id: &str, prompt: &str) {
     match npm {
         "@ai-sdk/google" => {
@@ -811,33 +1113,48 @@ async fn run_connectivity_test_for_model(
     model_id: &str,
 ) -> ConnectivityTestResult {
     let start_time = Instant::now();
-    let stream_enabled = request.stream.unwrap_or(true);
-    let anthropic_user_id = if request.npm == "@ai-sdk/anthropic" {
+    let stream_enabled = request.streaming();
+    let npm = request.effective_npm();
+    let anthropic_user_id = if npm == "@ai-sdk/anthropic" {
         Some(generate_anthropic_user_id())
     } else {
         None
     };
-    let url = build_connectivity_url(
-        request.npm.as_str(),
-        request.base_url.as_str(),
-        model_id,
-        request.api_key.as_deref(),
-        stream_enabled,
-    );
+    let url = if request.is_codex() {
+        build_codex_connectivity_url(&request.base_url)
+    } else {
+        build_connectivity_url(
+            npm,
+            request.base_url.as_str(),
+            model_id,
+            request.api_key.as_deref(),
+            stream_enabled,
+        )
+    };
 
     let mut body = build_default_body(request, model_id, anthropic_user_id.as_deref());
     if let Some(custom_body) = &request.body {
         merge_json(&mut body, custom_body);
     }
-    enforce_prompt_and_model(request.npm.as_str(), &mut body, model_id, &request.prompt);
+    enforce_prompt_and_model(npm, &mut body, model_id, &request.prompt);
+    if request.is_codex() {
+        body["stream"] = json!(true);
+        body["store"] = json!(false);
+        if !body.get("instructions").is_some_and(Value::is_string) {
+            body["instructions"] = json!("You are a helpful coding assistant.");
+        }
+        for field in ["temperature", "max_tokens", "max_output_tokens"] {
+            body.as_object_mut().unwrap().remove(field);
+        }
+    }
     if let Some(user_id) = anthropic_user_id.as_deref() {
         ensure_anthropic_metadata(&mut body, user_id);
     }
 
     let mut req_builder = client.post(&url).json(&body);
 
-    let is_google = request.npm == "@ai-sdk/google";
-    let is_anthropic = request.npm == "@ai-sdk/anthropic";
+    let is_google = npm == "@ai-sdk/google";
+    let is_anthropic = npm == "@ai-sdk/anthropic";
 
     let mut request_headers = BTreeMap::new();
     if is_anthropic {
@@ -879,6 +1196,16 @@ async fn run_connectivity_test_for_model(
 
     if stream_enabled && !is_google && !is_anthropic {
         request_headers.insert("Accept".to_string(), "text/event-stream".to_string());
+    }
+
+    if request.is_codex() {
+        request_headers.insert(
+            "OpenAI-Beta".to_string(),
+            "responses=experimental".to_string(),
+        );
+        if let Some(account_id) = request.api_key.as_deref().and_then(codex_account_id) {
+            request_headers.insert("ChatGPT-Account-Id".to_string(), account_id);
+        }
     }
 
     if let Some(Value::Object(obj)) = request.headers.as_ref() {
@@ -970,13 +1297,21 @@ async fn run_connectivity_test_for_model(
         parse_json_or_wrap(&body_text)
     };
 
-    if !status_code.is_success() {
+    let protocol_error = request
+        .is_codex()
+        .then(|| codex_stream_error(&body_text))
+        .flatten();
+    if !status_code.is_success() || protocol_error.is_some() {
         return ConnectivityTestResult {
             model_id: model_id.to_string(),
             status: "error".to_string(),
             first_byte_ms,
             total_ms: Some(total_ms),
-            error_message: Some(format!("API error: {}", status_code)),
+            error_message: Some(if status_code.is_success() {
+                protocol_error.unwrap()
+            } else {
+                format!("API error: {}", status_code)
+            }),
             request_url: url,
             request_headers: request_headers_value,
             request_body: request_body_value,
@@ -1006,14 +1341,25 @@ pub async fn test_provider_model_connectivity(
 ) -> Result<ConnectivityTestResponse, String> {
     let timeout_secs = request.timeout_secs.unwrap_or(30);
     let client = http_client::client_with_timeout(&state, timeout_secs).await?;
+    let mut request = request;
+    let (api_key, headers) = resolve_credentials(
+        &state,
+        request.provider_id.as_deref(),
+        request.api_key.as_deref(),
+        request.headers.as_ref(),
+        request.config_value_mode,
+    )
+    .await?;
+
     let resolved_request = resolve_provider_request(
         request.provider_id.as_deref(),
         &request.base_url,
-        request.api_key.as_deref(),
+        api_key.as_deref(),
+        stored_credential_fallback_allowed(request.config_value_mode, request.api_key.as_deref()),
     );
-    let mut request = request;
     request.base_url = resolved_request.base_url;
     request.api_key = resolved_request.api_key;
+    request.headers = headers;
 
     let mut results = Vec::new();
     for model_id in &request.model_ids {
@@ -1043,6 +1389,215 @@ pub async fn test_provider_model_connectivity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_connectivity_endpoint_preserves_the_configured_prefix() {
+        for base in [
+            "https://example.com/backend-api",
+            "https://example.com/backend-api/codex/",
+            "https://example.com/backend-api/codex/responses",
+        ] {
+            assert_eq!(
+                build_codex_connectivity_url(base),
+                "https://example.com/backend-api/codex/responses"
+            );
+        }
+        assert_eq!(
+            build_codex_connectivity_url("https://example.com/proxy?tenant=test"),
+            "https://example.com/proxy/codex/responses?tenant=test"
+        );
+        assert!(codex_account_id("third-party-api-key").is_none());
+    }
+
+    #[test]
+    fn codex_diagnostics_parse_complete_multiline_sse_frames() {
+        assert_eq!(codex_stream_error("event: response.completed\r\ndata: {\r\ndata: \"type\": \"response.completed\",\r\ndata: \"error\": null\r\ndata: }\r\n\r\n"), None);
+        assert!(codex_stream_error("data: {\"type\":\"response.completed\"}\n").is_some());
+        assert!(codex_stream_error("data: {\"type\":\"response.incomplete\"}\n\n").is_some());
+    }
+
+    #[tokio::test]
+    async fn codex_connectivity_sends_native_requests_and_requires_a_completed_stream() {
+        use base64::Engine;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let claims =
+            json!({ "https://api.openai.com/auth": { "chatgpt_account_id": "test-account" } });
+        let token = format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
+        for (response, expected_status) in [
+            ("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n", "success"),
+            ("data: {\"type\":\"error\",\"error\":{\"message\":\"rejected\"}}\n\n", "error"),
+            ("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n", "error"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let header_end = loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
+                };
+                let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                let length: usize = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(str::trim).map(str::to_string)).unwrap().parse().unwrap();
+                while bytes.len() < header_end + length {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                (headers, body)
+            });
+            let request: ConnectivityTestRequest = serde_json::from_value(json!({
+                "npm": "@ai-sdk/openai-compatible", "apiFormat": "openai-codex-responses",
+                "baseUrl": format!("http://{address}/backend-api"), "apiKey": token,
+                "prompt": "probe", "modelIds": ["test-model"], "stream": false,
+                "temperature": 1, "maxTokens": 100,
+                "headers": { "x-review": "preserved" },
+                "body": { "instructions": "Custom instructions", "store": true, "stream": false },
+            })).unwrap();
+            let client = http_client::create_client_no_proxy(5).unwrap();
+            let result = run_connectivity_test_for_model(&client, &request, "test-model").await;
+            let (headers, body) = upstream.join().unwrap();
+            assert!(headers.starts_with("POST /backend-api/codex/responses "));
+            assert!(headers.to_ascii_lowercase().contains("chatgpt-account-id: test-account"));
+            assert!(headers.to_ascii_lowercase().contains("x-review: preserved"));
+            assert_eq!(body["model"], "test-model");
+            assert_eq!(body["store"], false);
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["instructions"], "Custom instructions");
+            assert_eq!(body["input"][1]["content"][0]["text"], "probe");
+            assert!(body.get("messages").is_none());
+            assert!(body.get("temperature").is_none());
+            assert!(body.get("max_output_tokens").is_none());
+            assert_eq!(result.status, expected_status, "{:?}", result.error_message);
+        }
+    }
+
+    #[test]
+    fn empty_credentials_do_not_need_config_value_resolution() {
+        assert!(!has_config_values(None, None));
+        assert!(!has_config_values(None, Some(&json!({}))));
+        // The pages send an empty string when a provider has no credential.
+        assert!(!has_config_values(Some(""), None));
+        assert!(!has_config_values(Some("   "), Some(&json!({}))));
+        assert!(has_config_values(Some("sk-live"), None));
+        assert!(has_config_values(None, Some(&json!({ "X-Test": "1" }))));
+    }
+
+    #[test]
+    fn only_pi_and_omp_modes_resolve_config_values() {
+        assert!(!resolves_config_values(None));
+        assert!(resolves_config_values(Some(ConfigValueMode::Pi)));
+        assert!(resolves_config_values(Some(ConfigValueMode::Omp)));
+    }
+
+    #[test]
+    fn omp_mode_does_not_borrow_another_tools_stored_credential() {
+        // Non-mode callers and Pi keep the provider credential fallback.
+        assert!(stored_credential_fallback_allowed(None, Some("sk-live")));
+        assert!(stored_credential_fallback_allowed(
+            Some(ConfigValueMode::Pi),
+            Some("sk-live")
+        ));
+
+        // An OMP provider that configured its own apiKey owns the result, even
+        // when the OMP runtime omits it.
+        assert!(!stored_credential_fallback_allowed(
+            Some(ConfigValueMode::Omp),
+            Some("!vault read omp-key")
+        ));
+
+        // Without a configured key the provider fallback still applies, and a
+        // blank key is the pages' "no credential" value.
+        assert!(stored_credential_fallback_allowed(
+            Some(ConfigValueMode::Omp),
+            None
+        ));
+        assert!(stored_credential_fallback_allowed(
+            Some(ConfigValueMode::Omp),
+            Some("")
+        ));
+    }
+
+    #[test]
+    fn google_native_discovery_key_is_appended_only_when_absent() {
+        assert_eq!(
+            append_google_native_key(
+                "https://g.example/v1beta/models".to_string(),
+                Some("sk-live")
+            ),
+            "https://g.example/v1beta/models?key=sk-live"
+        );
+        assert_eq!(
+            append_google_native_key("https://g.example/v1beta/models".to_string(), None),
+            "https://g.example/v1beta/models"
+        );
+        assert_eq!(
+            append_google_native_key("https://g.example/v1beta/models".to_string(), Some("")),
+            "https://g.example/v1beta/models"
+        );
+        assert_eq!(
+            append_google_native_key(
+                "https://g.example/v1beta/models?key=stored".to_string(),
+                Some("sk-live")
+            ),
+            "https://g.example/v1beta/models?key=stored"
+        );
+        assert_eq!(
+            append_google_native_key(
+                "https://g.example/v1beta/models?tenant=acme".to_string(),
+                Some("sk-live")
+            ),
+            "https://g.example/v1beta/models?tenant=acme&key=sk-live"
+        );
+    }
+
+    #[test]
+    fn config_value_mode_stays_optional_for_existing_callers() {
+        let request: FetchModelsRequest = serde_json::from_value(json!({
+            "baseUrl": "https://api.example.com",
+            "apiType": "openai_compat",
+        }))
+        .expect("requests without a config value mode must keep deserializing");
+        assert_eq!(request.config_value_mode, None);
+
+        let request: FetchModelsRequest = serde_json::from_value(json!({
+            "baseUrl": "https://api.example.com",
+            "apiType": "openai_compat",
+            "configValueMode": "pi",
+        }))
+        .expect("the pi config value mode must deserialize");
+        assert_eq!(request.config_value_mode, Some(ConfigValueMode::Pi));
+
+        let request: FetchModelsRequest = serde_json::from_value(json!({
+            "baseUrl": "https://api.example.com",
+            "apiType": "openai_compat",
+            "configValueMode": "omp",
+        }))
+        .expect("the omp config value mode must deserialize");
+        assert_eq!(request.config_value_mode, Some(ConfigValueMode::Omp));
+
+        let request: ConnectivityTestRequest = serde_json::from_value(json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "baseUrl": "https://api.example.com",
+            "prompt": "probe",
+            "modelIds": ["model-a"],
+            "configValueMode": "omp",
+        }))
+        .expect("connectivity requests must accept the omp config value mode");
+        assert_eq!(request.config_value_mode, Some(ConfigValueMode::Omp));
+    }
 
     #[test]
     fn test_build_models_url_openai_compat() {

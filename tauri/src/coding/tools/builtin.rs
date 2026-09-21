@@ -43,14 +43,15 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         mcp_field: Some("mcp_servers"),
     },
     // Kimi Code CLI - supports both Skills and MCP
+    // MCP servers live in <root>/mcp.json (JSON mcpServers), not config.toml.
     BuiltinTool {
         key: "kimi",
         display_name: "Kimi",
         relative_skills_dir: Some("~/.kimi-code/skills"),
         relative_detect_dir: Some("~/.kimi-code"),
-        mcp_config_path: Some("~/.kimi-code/config.toml"),
-        mcp_config_format: Some("toml"),
-        mcp_field: Some("mcp_servers"),
+        mcp_config_path: Some("~/.kimi-code/mcp.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
     },
     // Gemini CLI - supports both Skills and MCP
     BuiltinTool {
@@ -92,13 +93,25 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         mcp_config_format: Some("jsonc"),
         mcp_field: Some("mcp"),
     },
-    // Antigravity - supports both Skills and MCP
+    // Antigravity (legacy IDE-era layout) - supports both Skills and MCP.
+    // Kept for users still on ~/.gemini/antigravity; new installs use antigravity_cli.
     BuiltinTool {
         key: "antigravity",
         display_name: "Antigravity",
         relative_skills_dir: Some("~/.gemini/antigravity/skills"),
         relative_detect_dir: Some("~/.gemini/antigravity"),
         mcp_config_path: Some("~/.gemini/antigravity/mcp_config.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
+    },
+    // Antigravity CLI keeps its own skills directory but reads the shared
+    // Antigravity user MCP config. Skills must be copied, not linked.
+    BuiltinTool {
+        key: "antigravity_cli",
+        display_name: "Antigravity CLI",
+        relative_skills_dir: Some("~/.gemini/antigravity-cli/skills"),
+        relative_detect_dir: Some("~/.gemini/antigravity-cli"),
+        mcp_config_path: Some("~/.gemini/config/mcp_config.json"),
         mcp_config_format: Some("json"),
         mcp_field: Some("mcpServers"),
     },
@@ -392,4 +405,11 @@ pub fn get_mcp_builtin_tools() -> Vec<&'static BuiltinTool> {
 /// Find a built-in tool by key
 pub fn builtin_tool_by_key(key: &str) -> Option<&'static BuiltinTool> {
     BUILTIN_TOOLS.iter().find(|t| t.key == key)
+}
+
+/// Built-in tools whose skills dir does not follow symlinks/junctions, so
+/// skills sync must always copy for them. All sync entry points must consult
+/// this helper instead of matching individual keys inline.
+pub fn builtin_tool_forces_skill_copy(key: &str) -> bool {
+    key.eq_ignore_ascii_case("cursor") || key.eq_ignore_ascii_case("antigravity_cli")
 }

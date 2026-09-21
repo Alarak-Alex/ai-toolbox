@@ -17,6 +17,7 @@ import { SkillsButton } from '@/features/coding/skills';
 import { McpButton } from '@/features/coding/mcp';
 import { ImageButton } from '@/features/coding/image';
 import { GatewayButton } from '@/features/coding/gateway';
+import { MiniBrowserButton } from '@/features/mini-browser';
 import KeepAliveOutlet from '@/components/layout/KeepAliveOutlet';
 import { PAGE_ROUTES } from '@/app/routeConfig';
 import { getRouteChrome, matchRouteEntry, resolveInitialTabPath, shouldShowRouteAppHeader } from '@/app/routeMatching';
@@ -88,6 +89,9 @@ const MainLayout: React.FC = () => {
   const contentTopOffset = showAppHeader ? CONTENT_TOP_OFFSET : DRAG_BAR_HEIGHT;
   const isGatewayVisible = visibleTabs.includes('gateway');
   const isImageVisible = visibleTabs.includes('image');
+  // The embedded browser has no route of its own, so its visibility is the only
+  // gate on the toolbar entry. It is off by default: the tab is opt-in.
+  const isMiniBrowserVisible = visibleTabs.includes('miniBrowser');
   const isStandalonePage = isSettingsPage || isSkillsPage || isMcpPage || isGatewayPage || isImagePage;
   const isNonTabPage = isStandalonePage || routeChrome.mode !== 'default';
   const showCodingTabs = showAppHeader && routeChrome.mode === 'default';
@@ -291,6 +295,14 @@ const MainLayout: React.FC = () => {
               {/* MCP button */}
               <McpButton />
               <div className={styles.actionsDivider} />
+
+              {/* Embedded browser (relay dashboards / API balance) */}
+              {isMiniBrowserVisible && (
+                <>
+                  <MiniBrowserButton />
+                  <div className={styles.actionsDivider} />
+                </>
+              )}
 
               {isGatewayVisible && (
                 <>

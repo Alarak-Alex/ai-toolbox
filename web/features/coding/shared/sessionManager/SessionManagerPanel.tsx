@@ -1,21 +1,18 @@
 import React from 'react';
 import {
+  CalendarOutlined,
   CheckOutlined,
   CloseOutlined,
-  ClockCircleOutlined,
-  CopyOutlined,
   DeleteOutlined,
   ExclamationCircleOutlined,
   ExportOutlined,
   ImportOutlined,
-  FolderOpenOutlined,
   MessageOutlined,
   ReloadOutlined,
   SearchOutlined,
 } from '@ant-design/icons';
 import {
   Button,
-  Checkbox,
   Collapse,
   Empty,
   Input,
@@ -23,7 +20,6 @@ import {
   Radio,
   Select,
   Spin,
-  Tag,
   Tooltip,
   Typography,
   message,
@@ -31,6 +27,8 @@ import {
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { open } from '@tauri-apps/plugin-dialog';
+
+import { useKeepAlive } from '@/components/layout/KeepAliveOutlet';
 
 import {
   deleteToolSessions,
@@ -49,6 +47,7 @@ import type {
   SessionPathOption,
   SessionSourceMode,
   SessionSourceOption,
+  SessionTimeRange,
   SessionTool,
 } from './types';
 import {
@@ -58,13 +57,13 @@ import {
 } from './sessionDetailNavigation';
 import {
   advanceVisibleContextId,
-  formatRelativeTime,
   formatSessionTitle,
   resolveEffectiveSessionSourceMode,
-  shortSessionId,
+  SESSION_TIME_RANGE_OPTIONS,
   shouldShowVisibleFeedback as shouldShowVisibleFeedbackForContext,
 } from './utils';
-import { useKeepAlive } from '@/components/layout/KeepAliveOutlet';
+import SessionList from './SessionList';
+import { reconcileSessionSelection, toggleLoadedSessionSelection } from './sessionSelection';
 import styles from './SessionManagerPanel.module.less';
 
 const { Text } = Typography;
@@ -83,6 +82,7 @@ const PAGE_SIZE = 10;
 const ALL_PATHS_VALUE = '__all_paths__';
 const SESSION_MANAGER_DEBUG_STORAGE_KEY = 'ai-toolbox.sessionManager.debug';
 let rememberedSessionSourceMode: SessionSourceMode = 'all';
+let rememberedSessionTimeRange: SessionTimeRange = 'all';
 
 type MetadataRefreshReason = 'manual-refresh' | null;
 
@@ -122,11 +122,13 @@ const buildCompleteAllSessionsKey = (
   query: string,
   pathFilter: string,
   refreshNonce: number,
+  timeRange: SessionTimeRange,
 ) => [
   tool,
   query,
   pathFilter,
   refreshNonce,
+  timeRange,
 ].join('\u001f');
 
 const sessionMatchesSourceMode = (session: SessionMeta, sourceMode: SessionSourceMode) => {
@@ -184,6 +186,7 @@ interface SessionManagerContentProps {
   refreshNonce?: number;
   manualRefreshNonce?: number;
   sourceMode: SessionSourceMode;
+  timeRange: SessionTimeRange;
   showRuntimeSourceTag: boolean;
   onAvailableSourcesChange: (sources: SessionSourceOption[]) => void;
   onMetadataRefreshStateChange: (reason: MetadataRefreshReason) => void;
@@ -195,6 +198,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
   refreshNonce = 0,
   manualRefreshNonce = 0,
   sourceMode,
+  timeRange,
   showRuntimeSourceTag,
   onAvailableSourcesChange,
   onMetadataRefreshStateChange,
@@ -221,6 +225,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
   const [importing, setImporting] = React.useState(false);
   const [selectionMode, setSelectionMode] = React.useState(false);
   const [selectedSourcePaths, setSelectedSourcePaths] = React.useState<string[]>([]);
+  const selectedSourcePathSet = React.useMemo(() => new Set(selectedSourcePaths), [selectedSourcePaths]);
   const [bulkExporting, setBulkExporting] = React.useState(false);
   const [bulkDeleting, setBulkDeleting] = React.useState(false);
   const listContextIdRef = React.useRef(0);
@@ -313,7 +318,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
       showFullListLoading = false,
       trigger = 'unknown',
     } = options;
-    const snapshotKey = buildCompleteAllSessionsKey(tool, debouncedQuery, pathFilter, refreshNonce);
+    const snapshotKey = buildCompleteAllSessionsKey(tool, debouncedQuery, pathFilter, refreshNonce, timeRange);
     const visibleContextId = captureVisibleContextId();
     const requestContextId = background ? listContextIdRef.current : listContextIdRef.current + 1;
     const requestId = listReplaceRequestIdRef.current + 1;
@@ -358,6 +363,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         showFullListLoading,
         query: debouncedQuery,
         pathFilter,
+        timeRange,
         requestContextId,
         requestId,
       });
@@ -384,6 +390,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         showFullListLoading,
         query: debouncedQuery,
         pathFilter,
+        timeRange,
         requestContextId,
         requestId,
       });
@@ -409,6 +416,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         forceRefresh,
         sourceMode,
         loadMode,
+        timeRange,
       });
 
       if (!isCurrentRequest()) {
@@ -426,9 +434,9 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         return;
       }
 
-      if (!background) {
-        clearSelection();
-      }
+      setSelectedSourcePaths((current) => background
+        ? reconcileSessionSelection(current, result.items)
+        : []);
 
       setItems(result.items);
       setTotal(result.total);
@@ -455,6 +463,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
           query: debouncedQuery,
           pathFilter,
           refreshNonce,
+          timeRange,
           itemCount: result.items.length,
           trigger,
           loadMode,
@@ -506,7 +515,6 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     }
   }, [
     captureVisibleContextId,
-    clearSelection,
     debouncedQuery,
     expanded,
     pathFilter,
@@ -514,6 +522,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     shouldShowVisibleFeedback,
     sourceMode,
     t,
+    timeRange,
     tool,
     onAvailableSourcesChange,
   ]);
@@ -523,10 +532,11 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
       return;
     }
 
-    const snapshotKey = buildCompleteAllSessionsKey(tool, debouncedQuery, pathFilter, refreshNonce);
+    const snapshotKey = buildCompleteAllSessionsKey(tool, debouncedQuery, pathFilter, refreshNonce, timeRange);
     const initialLoadKey = [
       tool,
       sourceMode,
+      timeRange,
       debouncedQuery,
       pathFilter,
       refreshNonce,
@@ -537,6 +547,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         sourceMode,
         query: debouncedQuery,
         pathFilter,
+        timeRange,
         refreshNonce,
         initialLoadKey,
       });
@@ -555,6 +566,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         sourceMode,
         query: debouncedQuery,
         pathFilter,
+        timeRange,
         refreshNonce,
         initialLoadKey,
         snapshotKey,
@@ -582,6 +594,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     debugSessionManager('initial:run', {
       tool,
       sourceMode,
+      timeRange,
       query: debouncedQuery,
       pathFilter,
       refreshNonce,
@@ -598,6 +611,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     refreshNonce,
     sourceMode,
     t,
+    timeRange,
     tool,
   ]);
 
@@ -615,6 +629,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     const backgroundKey = [
       tool,
       sourceMode,
+      timeRange,
       debouncedQuery,
       pathFilter,
       needsFullMetadata ? 'meta' : 'search',
@@ -638,6 +653,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
       sourceMode,
       query: debouncedQuery,
       pathFilter,
+      timeRange,
       backgroundKey,
       needsFullMetadata,
       needsMessageSearch,
@@ -666,6 +682,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     partial,
     pathFilter,
     sourceMode,
+    timeRange,
     tool,
   ]);
 
@@ -776,7 +793,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     }
   };
 
-  const handleOpenDetail = (session: SessionMeta) => {
+  const handleOpenDetail = React.useCallback((session: SessionMeta) => {
     const fromScrollTop = rememberScrollPosition();
     navigate(buildSessionDetailPath(tool, session.sourcePath), {
       state: {
@@ -784,19 +801,23 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         fromScrollTop,
       },
     });
-  };
+  }, [location.pathname, location.search, navigate, rememberScrollPosition, tool]);
 
-  const handleCopyText = async (text: string, successText: string) => {
+  const handleCopyResumeCommand = React.useCallback(async (command: string) => {
+    const visibleContextId = captureVisibleContextId();
     try {
-      await navigator.clipboard.writeText(text);
-      message.success(successText);
+      await navigator.clipboard.writeText(command);
+      if (shouldShowVisibleFeedback(visibleContextId)) {
+        message.success(t('sessionManager.copyResumeSuccess'));
+      }
     } catch (error) {
+      if (!shouldShowVisibleFeedback(visibleContextId)) return;
       const errorMessage = error instanceof Error ? error.message : String(error);
       message.error(errorMessage || t('common.error'));
     }
-  };
+  }, [captureVisibleContextId, shouldShowVisibleFeedback, t]);
 
-  const performDeleteSession = async (session: SessionMeta, visibleContextId: number) => {
+  const performDeleteSession = React.useCallback(async (session: SessionMeta, visibleContextId: number) => {
     await deleteToolSession(tool, session.sourcePath);
 
     await loadSessions({
@@ -809,7 +830,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     if (shouldShowVisibleFeedback(visibleContextId)) {
       message.success(t('sessionManager.deleteSuccess'));
     }
-  };
+  }, [loadSessions, shouldShowVisibleFeedback, t, tool]);
 
   const handleSelectionModeToggle = () => {
     if (selectionMode) {
@@ -821,30 +842,16 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     clearSelection();
   };
 
-  const toggleSessionSelection = (session: SessionMeta) => {
+  const toggleSessionSelection = React.useCallback((session: SessionMeta) => {
     setSelectedSourcePaths((current) => (
       current.includes(session.sourcePath)
         ? current.filter((path) => path !== session.sourcePath)
         : [...current, session.sourcePath]
     ));
-  };
+  }, []);
 
-  const handleSelectAllCurrentPage = () => {
-    const currentPagePaths = items.map((session) => session.sourcePath);
-    const allSelected = currentPagePaths.length > 0
-      && currentPagePaths.every((sourcePath) => selectedSourcePaths.includes(sourcePath));
-
-    setSelectedSourcePaths((current) => {
-      if (allSelected) {
-        return current.filter((sourcePath) => !currentPagePaths.includes(sourcePath));
-      }
-
-      const nextSelected = new Set(current);
-      currentPagePaths.forEach((sourcePath) => {
-        nextSelected.add(sourcePath);
-      });
-      return Array.from(nextSelected);
-    });
+  const handleSelectAllLoadedSessions = () => {
+    setSelectedSourcePaths((current) => toggleLoadedSessionSelection(current, items));
   };
 
   const performBulkDeleteSessions = async (
@@ -991,7 +998,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     }
 
     const previewTitles = items
-      .filter((session) => selectedSourcePaths.includes(session.sourcePath))
+      .filter((session) => selectedSourcePathSet.has(session.sourcePath))
       .slice(0, 5)
       .map((session) => formatSessionTitle(session))
       .join('、');
@@ -1026,7 +1033,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
     });
   };
 
-  const handleDeleteSession = (session: SessionMeta) => {
+  const handleDeleteSession = React.useCallback((session: SessionMeta) => {
     Modal.confirm({
       title: t('sessionManager.deleteConfirmTitle', { title: formatSessionTitle(session) }),
       content: t('sessionManager.deleteConfirmContent'),
@@ -1047,32 +1054,12 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         }
       },
     });
-  };
-
-  const renderRuntimeSourceTag = (session: SessionMeta) => {
-    if (!showRuntimeSourceTag || !session.runtimeSource) {
-      return null;
-    }
-
-    const label = session.runtimeSource === 'wsl'
-      ? session.runtimeDistro
-        ? t('sessionManager.sourceMode.wslWithDistro', { distro: session.runtimeDistro })
-        : t('sessionManager.sourceMode.wsl')
-      : t('sessionManager.sourceMode.local');
-
-    return (
-      <Tag
-        bordered={false}
-        className={session.runtimeSource === 'wsl' ? styles.runtimeSourceTagWsl : styles.runtimeSourceTagLocal}
-      >
-        {label}
-      </Tag>
-    );
-  };
+  }, [captureVisibleContextId, performDeleteSession, shouldShowVisibleFeedback, t]);
 
   const showListOverlay = loading && (
     items.length === 0 || metadataRefreshReason === 'manual-refresh'
   );
+  const hasActiveFilters = Boolean(debouncedQuery || pathFilter) || timeRange !== 'all';
   const statusHint = debouncedQuery
     ? !metaComplete
       ? t('sessionManager.searchWaitingForFullList')
@@ -1130,7 +1117,7 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
                 size="small"
                 className={styles.actionButton}
                 icon={<CheckOutlined />}
-                onClick={handleSelectAllCurrentPage}
+                onClick={handleSelectAllLoadedSessions}
               >
                 {t('sessionManager.selectLoaded')}
               </Button>
@@ -1184,90 +1171,24 @@ const SessionManagerContent: React.FC<SessionManagerContentProps> = ({
         <Spin spinning={showListOverlay}>
           {items.length === 0 ? (
             <div className={styles.emptyState}>
-              <Empty description={t(debouncedQuery || pathFilter ? 'sessionManager.emptyFiltered' : 'sessionManager.empty')} />
-              {(debouncedQuery || pathFilter) ? (
+              <Empty description={t(hasActiveFilters ? 'sessionManager.emptyFiltered' : 'sessionManager.empty')} />
+              {hasActiveFilters ? (
                 <Text className={styles.emptyHint}>
                   {t('sessionManager.emptyFilteredHint')}
                 </Text>
               ) : null}
             </div>
           ) : (
-            <div className={styles.list}>
-              {items.map((session) => {
-                const displayTime = session.lastActiveAt || session.createdAt;
-                const selected = selectedSourcePaths.includes(session.sourcePath);
-                return (
-                  <div
-                    key={`${session.providerId}-${session.sessionId}-${session.sourcePath}`}
-                    className={`${styles.sessionCard}${selected ? ` ${styles.sessionCardSelected}` : ''}`}
-                    onClick={() => {
-                      if (selectionMode) {
-                        toggleSessionSelection(session);
-                        return;
-                      }
-
-                      handleOpenDetail(session);
-                    }}
-                  >
-                    <div className={styles.sessionHeader}>
-                      {selectionMode ? (
-                        <Checkbox
-                          className={styles.sessionCheckbox}
-                          checked={selected}
-                          onChange={() => toggleSessionSelection(session)}
-                          onClick={(event) => event.stopPropagation()}
-                        />
-                      ) : null}
-                      <div className={styles.sessionHeaderMain}>
-                        <div className={styles.sessionTitleRow}>
-                          <span className={styles.sessionTitle}>
-                            {formatSessionTitle(session)}
-                          </span>
-                        </div>
-                        <div className={styles.sessionMetaRow}>
-                          <span><ClockCircleOutlined style={{ marginRight: 4 }} />{formatRelativeTime(displayTime, t)}</span>
-                          {renderRuntimeSourceTag(session)}
-                          <span>{shortSessionId(session.sessionId)}</span>
-                          {session.projectDir ? (
-                            <span><FolderOpenOutlined style={{ marginRight: 4 }} />{session.projectDir}</span>
-                          ) : null}
-                        </div>
-                      </div>
-                      <div className={styles.sessionActions} onClick={(event) => event.stopPropagation()}>
-                        <Button
-                          type="link"
-                          size="small"
-                          className={styles.actionButton}
-                          icon={<CopyOutlined />}
-                          disabled={!session.resumeCommand}
-                          onClick={() => {
-                            if (!session.resumeCommand) {
-                              return;
-                            }
-                            void handleCopyText(session.resumeCommand, t('sessionManager.copyResumeSuccess'));
-                          }}
-                        >
-                          {t('sessionManager.copyResume')}
-                        </Button>
-                        <Button
-                          type="link"
-                          size="small"
-                          danger
-                          className={styles.actionButton}
-                          icon={<DeleteOutlined />}
-                          disabled={selectionMode}
-                          onClick={() => {
-                            handleDeleteSession(session);
-                          }}
-                        >
-                          {t('common.delete')}
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+            <SessionList
+              items={items}
+              selectedSourcePaths={selectedSourcePathSet}
+              selectionMode={selectionMode}
+              showRuntimeSourceTag={showRuntimeSourceTag}
+              onOpenDetail={handleOpenDetail}
+              onToggleSelection={toggleSessionSelection}
+              onCopyResume={handleCopyResumeCommand}
+              onDelete={handleDeleteSession}
+            />
           )}
         </Spin>
 
@@ -1297,11 +1218,17 @@ const SessionManagerPanel: React.FC<SessionManagerPanelProps> = ({
   const { t } = useTranslation();
   const [expanded, setExpanded] = React.useState(false);
   const [uncontrolledSourceMode, setUncontrolledSourceMode] = React.useState<SessionSourceMode>(() => rememberedSessionSourceMode);
+  const [timeRange, setTimeRange] = React.useState<SessionTimeRange>(() => rememberedSessionTimeRange);
   const [availableSources, setAvailableSources] = React.useState<SessionSourceOption[]>([]);
   const [availableSourcesResolved, setAvailableSourcesResolved] = React.useState(false);
   const [metadataRefreshReason, setMetadataRefreshReason] = React.useState<MetadataRefreshReason>(null);
   const [manualRefreshNonce, setManualRefreshNonce] = React.useState(0);
   const sourceMode = controlledSourceMode ?? uncontrolledSourceMode;
+
+  const handleTimeRangeChange = React.useCallback((value: SessionTimeRange) => {
+    rememberedSessionTimeRange = value;
+    setTimeRange(value);
+  }, []);
 
   const handleAvailableSourcesChange = React.useCallback((sources: SessionSourceOption[]) => {
     setAvailableSources(sources);
@@ -1353,6 +1280,29 @@ const SessionManagerPanel: React.FC<SessionManagerPanelProps> = ({
     { label: t('sessionManager.sourceMode.local'), value: 'local' as const },
     { label: t('sessionManager.sourceMode.wsl'), value: 'wsl' as const },
   ], [t]);
+
+  const timeRangeOptions = React.useMemo(
+    () => SESSION_TIME_RANGE_OPTIONS.map(({ value, labelKey }) => ({ label: t(labelKey), value })),
+    [t],
+  );
+
+  const timeRangeFilter = (
+    // Select options render in a body portal but bubble through the React
+    // tree; the extra span mirrors the ProviderSortDropdown double guard so
+    // picking an option cannot collapse the panel.
+    <span onClick={(event) => event.stopPropagation()}>
+      <Select
+        className={styles.timeFilterSelect}
+        size="small"
+        prefix={<CalendarOutlined />}
+        popupMatchSelectWidth={false}
+        value={timeRange}
+        options={timeRangeOptions}
+        onChange={handleTimeRangeChange}
+        aria-label={t('sessionManager.timeRange.label')}
+      />
+    </span>
+  );
 
   const sourceSwitcher = showSourceSwitcher ? (
     <div className={styles.sourceSegmented} role="tablist" aria-label={t('sessionManager.title')}>
@@ -1408,13 +1358,14 @@ const SessionManagerPanel: React.FC<SessionManagerPanelProps> = ({
     </div>
   );
 
-  const headerExtra = sourceSwitcher || extra || refreshControl ? (
+  const headerExtra = sourceSwitcher || extra || refreshControl || timeRangeFilter ? (
     <div
       className={styles.headerExtra}
       onClick={(event) => event.stopPropagation()}
       onMouseDown={(event) => event.stopPropagation()}
     >
       {extra}
+      {timeRangeFilter}
       {sourceSwitcher}
       {refreshControl}
     </div>
@@ -1450,6 +1401,7 @@ const SessionManagerPanel: React.FC<SessionManagerPanelProps> = ({
               refreshNonce={refreshNonce}
               manualRefreshNonce={manualRefreshNonce}
               sourceMode={effectiveSourceMode}
+              timeRange={timeRange}
               showRuntimeSourceTag={showSourceSwitcher && effectiveSourceMode === 'all'}
               onAvailableSourcesChange={handleAvailableSourcesChange}
               onMetadataRefreshStateChange={setMetadataRefreshReason}

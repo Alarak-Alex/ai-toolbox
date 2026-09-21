@@ -36,6 +36,7 @@ import {
   RightOutlined,
   RobotOutlined,
   SettingOutlined,
+  TeamOutlined,
   ThunderboltOutlined,
   ToolOutlined,
   ImportOutlined,
@@ -43,6 +44,7 @@ import {
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { useTranslation } from 'react-i18next';
 
+import { useProviderSharing } from '@/features/coding/shared/providerShare';
 import AllApiHubIcon from '@/components/common/AllApiHubIcon';
 import ImportProviderModal from '@/components/common/ImportProviderModal';
 import JsonEditor from '@/components/common/JsonEditor';
@@ -64,6 +66,17 @@ import SidebarSettingsModal from '@/components/common/SidebarSettingsModal';
 import CliManualPathSetting from '@/components/common/CliManualPathSetting';
 import { TRAY_CONFIG_REFRESH_EVENT } from '@/constants/configEvents';
 import { findPresetModelById } from '@/constants/presetModels';
+import {
+  getOmpApiBaseUrlUpdate,
+  OMP_API_DESCRIPTION_I18N_KEYS,
+  OMP_API_OPTIONS,
+  type OmpApiValue,
+} from '../utils/ompApiOptions';
+import {
+  getOmpDiagnostics,
+  getTestableOmpModelIds,
+  toOmpModelConnectionMap,
+} from '../utils/ompDiagnostics';
 import {
   buildFetchedOmpModel,
   ompApiToSdkName,
@@ -110,10 +123,10 @@ import {
 import { useSettingsStore } from '@/stores';
 import {
   PI_INPUT_TYPES,
-  PI_THINKING_LEVEL_KEYS,
   buildOmpThinkingFromPreset,
   getOmpModelDefaultThinkingLevel,
-  getOmpModelThinkingLevels,
+  getOmpModelThinkingLevelOptions,
+  getProviderModelRecords,
 } from '@/utils/ompModelMetadata';
 import {
   deleteOmpRuntimeProvider,
@@ -135,6 +148,8 @@ import ImportFromAllApiHubModal from '../components/ImportFromAllApiHubModal';
 import ImportFromCcSwitchModal from '@/features/coding/shared/ccSwitch/ImportFromCcSwitchModal';
 import { hasCcSwitchDb, type CcSwitchProviderCandidate } from '@/services/ccSwitchApi';
 import { extractOmpProviderFromCcSwitch } from '../utils/importMapping';
+import OmpAgentsSettings from '../components/OmpAgentsSettings';
+import { OMP_CORE_MODEL_ROLES } from '../utils/ompAgentsUtils';
 import OmpExtensionsSection from '../components/OmpExtensionsSection';
 import styles from './OhMyPiPage.module.less';
 
@@ -153,16 +168,10 @@ interface OmpModelModalState {
   model?: Record<string, unknown>;
 }
 
-const PI_API_OPTIONS = [
-  'openai-completions',
-  'openai-responses',
-  'anthropic-messages',
-  'google-generative-ai',
-].map((value) => ({ value, label: value }));
-
 const SIDEBAR_ICON_BY_SECTION_ID: Record<string, React.ReactNode> = {
   'pi-model-settings': <RobotOutlined />,
   'pi-providers': <DatabaseOutlined />,
+  'pi-agents': <TeamOutlined />,
   'pi-extensions': <AppstoreAddOutlined />,
   'pi-global-prompt': <FileTextOutlined />,
   'pi-other-configuration': <ToolOutlined />,
@@ -223,32 +232,6 @@ const parseStringArray = (value: string | undefined): string[] => {
   }
 };
 
-const getProviderModelRecords = (
-  providerConfig: Record<string, unknown> | undefined,
-): Array<{ id: string; model: Record<string, unknown> }> => {
-  if (!providerConfig) {
-    return [];
-  }
-  const models = providerConfig.models;
-  if (!Array.isArray(models)) {
-    return [];
-  }
-  return models
-    .map((model) => {
-      if (typeof model === 'string') {
-        return { id: model, model: { id: model } };
-      }
-      if (model && typeof model === 'object' && typeof (model as Record<string, unknown>).id === 'string') {
-        return {
-          id: (model as Record<string, string>).id,
-          model: model as Record<string, unknown>,
-        };
-      }
-      return null;
-    })
-    .filter((entry): entry is { id: string; model: Record<string, unknown> } => !!entry);
-};
-
 const setOptionalStringField = (
   target: Record<string, unknown>,
   key: string,
@@ -287,37 +270,6 @@ const hasProviderConfigContent = (providerConfig: Record<string, unknown>): bool
   })
 );
 
-const getOmpModelThinkingLevelOptions = (
-  model: Record<string, unknown> | undefined,
-): Array<{ value: string; label: string }> => {
-  const levels = getOmpModelThinkingLevels(model);
-  if (levels.length === 0) {
-    return [];
-  }
-  const levelSet = new Set(levels);
-  const optionSet = new Set<string>();
-  const options: Array<{ value: string; label: string }> = [];
-  // `off`(关闭思考)是独立于级别区间的选项,恒可为 defaultThinkingLevel。
-  options.push({ value: 'off', label: 'off' });
-  optionSet.add('off');
-  // 标准级别始终打头,再附上模型声明的扩展级别(去重、保序)。
-  for (const levelKey of PI_THINKING_LEVEL_KEYS) {
-    if (levelSet.has(levelKey) && !optionSet.has(levelKey)) {
-      optionSet.add(levelKey);
-      options.push({ value: levelKey, label: levelKey });
-    }
-  }
-  for (const levelKey of levels) {
-    if (levelSet.has(levelKey) && !optionSet.has(levelKey)) {
-      optionSet.add(levelKey);
-      options.push({ value: levelKey, label: levelKey });
-    }
-  }
-  // OMP 支持 `auto`(自动选择思考级别)作为全局默认思考级别选项。
-  options.push({ value: 'auto', label: 'auto' });
-  return options;
-};
-
 const isOmpThinkingLevelSupported = (
   thinkingLevel: string | undefined,
   model: Record<string, unknown> | undefined,
@@ -337,6 +289,8 @@ const asStringRecord = (value: unknown): Record<string, string> => {
 
 const sdkNameToOmpApi = (sdkName?: string): string => {
   switch (sdkName) {
+    case '@ai-sdk/openai':
+      return 'openai-responses';
     case '@ai-sdk/anthropic':
       return 'anthropic-messages';
     case '@ai-sdk/google':
@@ -543,6 +497,7 @@ const dedupeOmpFavoriteProviders = (
 
 const OhMyPiPage: React.FC = () => {
   const { t } = useTranslation();
+  const { shareProvider, shareModal } = useProviderSharing('omp', () => loadConfig());
   const { sidebarHiddenByPage, setSidebarHidden } = useSettingsStore();
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
@@ -552,6 +507,7 @@ const OhMyPiPage: React.FC = () => {
   const [modelForm] = Form.useForm();
   const [providerModal, setProviderModal] = React.useState<ProviderJsonModalState | null>(null);
   const [providerModalForm] = Form.useForm();
+  const automaticProviderBaseUrlRef = React.useRef<string | undefined>(undefined);
   const [providerConfigJson, setProviderConfigJson] = React.useState<Record<string, unknown>>({});
   const [providerHeadersJson, setProviderHeadersJson] = React.useState<Record<string, unknown>>({});
   const [providerCompatJson, setProviderCompatJson] = React.useState<Record<string, unknown>>({});
@@ -594,24 +550,29 @@ const OhMyPiPage: React.FC = () => {
       order: 2,
     },
     {
+      id: 'pi-agents',
+      title: t('ohMyPi.subagents.title'),
+      order: 3,
+    },
+    {
       id: 'pi-extensions',
       title: t('ohMyPi.extensions.title'),
-      order: 3,
+      order: 4,
     },
     {
       id: 'pi-global-prompt',
       title: t('ohMyPi.prompt.title'),
-      order: 4,
+      order: 5,
     },
     {
       id: 'pi-other-configuration',
       title: t('ohMyPi.otherConfig.title'),
-      order: 5,
+      order: 6,
     },
     {
       id: 'pi-session-manager',
       title: t('sessionManager.title'),
-      order: 6,
+      order: 7,
     },
   ], [t]);
 
@@ -711,6 +672,37 @@ const OhMyPiPage: React.FC = () => {
     return Array.from(options.entries()).map(([value, label]) => ({ value, label }));
   }, [runtimeConfig]);
 
+  /** 分组模型选项(供 subagent 方案编辑弹窗复用): 角色别名 + provider -> model list。 */
+  const ompAgentsModelOptions = React.useMemo(() => {
+    const groups: Array<{ label: string; options: Array<{ label: string; value: string }> }> = [];
+
+    // 常用内置角色别名(供自定义 Subagent 快速委派使用)。标签走 i18n:
+    // 这份列表会直接出现在弹窗的模型下拉里,英文界面不能显示中文。
+    const roleAliasOptions = OMP_CORE_MODEL_ROLES.map((role) => ({
+      label: `@${role.key} (${t(`ohMyPi.subagents.aliasLabels.${role.key}`)})`,
+      value: `@${role.key}`,
+    }));
+    groups.push({
+      label: t('ohMyPi.subagents.roleAliasesGroup'),
+      options: roleAliasOptions,
+    });
+
+    runtimeConfig?.providers.forEach((provider) => {
+      const modelIds = provider.modelIds ?? [];
+      if (modelIds.length === 0) {
+        return;
+      }
+      groups.push({
+        label: provider.displayName || provider.providerKey,
+        options: modelIds.map((modelId) => ({
+          label: modelId,
+          value: `${provider.providerKey}/${modelId}`,
+        })),
+      });
+    });
+    return groups;
+  }, [runtimeConfig, t]);
+
   const selectedProviderKey = Form.useWatch('defaultProvider', modelForm);
   const selectedDefaultModel = Form.useWatch('defaultModel', modelForm);
   const selectedProvider = runtimeConfig?.providers.find(
@@ -765,14 +757,18 @@ const OhMyPiPage: React.FC = () => {
       return null;
     }
     const providerConfig = provider.modelsProvider ?? {};
-    const api = getStringField(providerConfig, 'api');
+    const diagnostics = getOmpDiagnostics(providerConfig);
+    if (!diagnostics.supportsModelDiscovery) return null;
     return {
       providerId: provider.providerKey,
       name: provider.displayName,
-      baseUrl: getStringField(providerConfig, 'baseUrl'),
+      baseUrl: diagnostics.baseUrl,
       apiKey: getStringField(providerConfig, 'apiKey'),
       headers: asStringRecord(providerConfig.headers),
-      sdkName: ompApiToSdkName(api),
+      sdkName: diagnostics.npm,
+      // OMP resolves `apiKey` / header values itself; the shared commands must
+      // resolve the models.yml config value syntax instead of sending templates.
+      configValueMode: 'omp' as const,
       existingModelIds: getProviderModelRecords(provider.modelsProvider).map((entry) => entry.id),
     };
   }, [fetchModelsProviderId, ompProviders]);
@@ -786,12 +782,18 @@ const OhMyPiPage: React.FC = () => {
       return null;
     }
     const providerConfig = provider.modelsProvider ?? {};
-    const modelIds = getProviderModelRecords(provider.modelsProvider).map((entry) => entry.id);
+    const diagnostics = getOmpDiagnostics(providerConfig);
+    if (!diagnostics.supportsConnectivity) return null;
+    const connection = buildOmpOpenCodeProvider(provider, providerConfig);
     return {
       providerId: provider.providerKey,
       providerName: provider.displayName,
-      providerConfig: buildOmpOpenCodeProvider(provider, providerConfig),
-      modelIds,
+      providerConfig: { ...connection, npm: diagnostics.npm, options: { ...connection.options, baseURL: diagnostics.baseUrl } },
+      apiFormat: diagnostics.apiFormat,
+      configValueMode: 'omp' as const,
+      // 每个模型按自己的连接测试：模型级覆盖只影响它自己的请求。
+      modelIds: getTestableOmpModelIds(diagnostics.modelConnections),
+      modelConnections: toOmpModelConnectionMap(diagnostics.modelConnections),
     };
   }, [connectivityProviderId, ompProviders]);
 
@@ -914,6 +916,7 @@ const OhMyPiPage: React.FC = () => {
   ) => {
     const isCopy = options?.copy === true;
     const isExistingProviderEdit = !!provider && !isCopy;
+    automaticProviderBaseUrlRef.current = provider ? undefined : '';
     const nextProviderConfigJson = provider?.modelsProvider
       ? asRecord(provider.modelsProvider)
       : isExistingProviderEdit
@@ -940,6 +943,18 @@ const OhMyPiPage: React.FC = () => {
         ? nextProviderConfigJson.authHeader
         : undefined,
     });
+  };
+
+  const handleProviderApiChange = (apiValue?: string) => {
+    const nextBaseUrl = getOmpApiBaseUrlUpdate(
+      apiValue, providerModalForm.getFieldValue('baseUrl'), automaticProviderBaseUrlRef.current,
+    );
+    automaticProviderBaseUrlRef.current = nextBaseUrl;
+    if (nextBaseUrl !== undefined) providerModalForm.setFieldValue('baseUrl', nextBaseUrl);
+  };
+
+  const handleProviderBaseUrlChange = () => {
+    automaticProviderBaseUrlRef.current = undefined;
   };
 
   const handleSaveProviderModal = async () => {
@@ -1597,15 +1612,22 @@ const OhMyPiPage: React.FC = () => {
   }, [clearBatchDeleteState, connectivityProviderId, modelForm, ompProviders]);
 
   const handleBatchTestProviders = React.useCallback(async () => {
-    const targets = ompProviders.map((provider) => {
+    const eligibleProviders = ompProviders.filter(provider => getOmpDiagnostics(provider.modelsProvider ?? {}).supportsConnectivity);
+    const targets = eligibleProviders.map((provider) => {
       const providerConfig = buildOmpOpenCodeProvider(provider);
-      const modelIds = getProviderModelRecords(provider.modelsProvider).map((entry) => entry.id);
+      const diagnostics = getOmpDiagnostics(provider.modelsProvider ?? {});
+      providerConfig.npm = diagnostics.npm;
+      providerConfig.options = { ...providerConfig.options, baseURL: diagnostics.baseUrl };
+      const modelIds = getTestableOmpModelIds(diagnostics.modelConnections);
       return buildProviderConnectivityBatchTarget(
         {
           providerId: provider.providerKey,
           providerName: provider.displayName,
           providerConfig,
+          apiFormat: diagnostics.apiFormat,
+          configValueMode: 'omp' as const,
           modelIds,
+          modelConnections: toOmpModelConnectionMap(diagnostics.modelConnections),
         },
         {
           requireBaseUrl: true,
@@ -1620,7 +1642,7 @@ const OhMyPiPage: React.FC = () => {
     });
 
     setConnectivityStatuses(
-      Object.fromEntries(ompProviders.map((provider) => [
+      Object.fromEntries(eligibleProviders.map((provider) => [
         provider.providerKey,
         { status: 'running' as const },
       ])),
@@ -1787,13 +1809,24 @@ const OhMyPiPage: React.FC = () => {
     const selectedModelIds = selectedModelIdsByProvider[provider.providerKey] ?? [];
     const selectedModelCount = selectedModelIds.length;
     const providerBaseUrl = getStringField(providerConfig, 'baseUrl');
+    const diagnostics = getOmpDiagnostics(providerConfig);
     const hasModelIds = getProviderModelRecords(provider.modelsProvider).length > 0;
-    const connectivityTooltip = !providerBaseUrl
+    const connectivityTooltip = !diagnostics.supportsConnectivity
+      // 有模型却测不了，说明每个模型各自用了不支持的协议。
+      ? hasModelIds
+        ? t('ohMyPi.diagnostics.noTestableModel')
+        : t('ohMyPi.diagnostics.unsupportedApi', { api: diagnostics.api || t('common.notSet') })
+      : !diagnostics.baseUrl
       ? t('common.baseUrlMissing')
       : !hasModelIds
         ? t('common.modelMissing')
-        : '';
-    const fetchModelsTooltip = !providerBaseUrl ? t('common.baseUrlMissing') : '';
+        // 混用连接不再是禁用理由，只是提示：测试会按各模型自己的连接分别发。
+        : diagnostics.mixedConnections
+          ? t('ohMyPi.diagnostics.mixedConnections')
+          : '';
+    const fetchModelsTooltip = !diagnostics.supportsModelDiscovery
+      ? t('ohMyPi.diagnostics.modelDiscoveryUnavailable')
+      : !diagnostics.baseUrl ? t('common.baseUrlMissing') : '';
     const providerDisplay: ProviderDisplayData = {
       id: provider.providerKey,
       name: provider.displayName,
@@ -1815,13 +1848,19 @@ const OhMyPiPage: React.FC = () => {
         models={modelDisplayList}
         onEdit={() => openProviderModal(provider)}
         onCopy={() => openProviderModal(provider, { copy: true })}
+        onShare={() => shareProvider({
+          id: provider.providerKey, name: provider.displayName, category: 'custom',
+          settingsConfig: JSON.stringify(providerConfig), credential: provider.credential,
+          credentialUnavailable: provider.credentialKind === 'oauth' || provider.credentialKind === 'env_possible',
+          defaultModel: provider.isDefault ? runtimeConfig?.modelSettings.modelId ?? undefined : undefined,
+        })}
         onDelete={canDeleteProvider ? () => handleDeleteSupplier(provider) : undefined}
         deleteConfirm={false}
         deleteDisabledReason={deleteDisabledReason}
         selectable={providerBatch.selectionMode && providerBatch.isSelectable(provider.providerKey)}
         selected={providerBatch.selectedIds.has(provider.providerKey)}
         onSelectChange={(checked) => providerBatch.toggleSelect(provider.providerKey, checked)}
-        connectivityStatus={connectivityStatuses[provider.providerKey]}
+        connectivityStatus={diagnostics.supportsConnectivity ? connectivityStatuses[provider.providerKey] : undefined}
         extraActions={
           <Space size={0}>
             <Button
@@ -1864,7 +1903,7 @@ const OhMyPiPage: React.FC = () => {
                   type="text"
                   style={{ fontSize: 12 }}
                   onClick={() => handleOpenConnectivityTest(provider.providerKey)}
-                  disabled={!providerBaseUrl || !hasModelIds}
+                  disabled={!diagnostics.supportsConnectivity || !diagnostics.baseUrl || !hasModelIds}
                 >
                   <ApiOutlined style={{ marginRight: 4 }} />
                   {t('ohMyPi.connectivity.button')}
@@ -1878,7 +1917,7 @@ const OhMyPiPage: React.FC = () => {
                   type="text"
                   style={{ fontSize: 12 }}
                   onClick={() => handleOpenFetchModels(provider.providerKey)}
-                  disabled={!providerBaseUrl}
+                  disabled={!diagnostics.supportsModelDiscovery || !diagnostics.baseUrl}
                 >
                   <CloudDownloadOutlined style={{ marginRight: 4 }} />
                   {t('ohMyPi.fetchModels.button')}
@@ -2104,6 +2143,7 @@ const OhMyPiPage: React.FC = () => {
                         style={{ fontSize: 12 }}
                         icon={<ThunderboltOutlined />}
                         loading={batchTestingProviders}
+                        disabled={!ompProviders.some(provider => getOmpDiagnostics(provider.modelsProvider ?? {}).supportsConnectivity)}
                         onClick={handleBatchTestProviders}
                       >
                         {t('common.batchTest')}
@@ -2165,6 +2205,21 @@ const OhMyPiPage: React.FC = () => {
                   ),
                 },
               ]}
+            />
+          </div>
+
+          <div
+            id="pi-agents"
+            className={styles.ompSection}
+            data-pi-sidebar-section="true"
+            data-sidebar-title={t('ohMyPi.subagents.title')}
+          >
+            <OmpAgentsSettings
+              modelOptions={ompAgentsModelOptions}
+              providers={runtimeConfig?.providers ?? []}
+              onConfigUpdated={() => {
+                void loadConfig(true);
+              }}
             />
           </div>
 
@@ -2296,12 +2351,26 @@ const OhMyPiPage: React.FC = () => {
                   <Select
                     allowClear
                     showSearch
-                    options={PI_API_OPTIONS}
+                    options={OMP_API_OPTIONS}
+                    onChange={handleProviderApiChange}
+                    optionRender={(option) => {
+                      const description = OMP_API_DESCRIPTION_I18N_KEYS[
+                        String(option.value) as OmpApiValue
+                      ];
+                      return (
+                        <div>
+                          <div>{option.label}</div>
+                          {description ? (
+                            <div className={styles.apiOptionDescription}>{t(description)}</div>
+                          ) : null}
+                        </div>
+                      );
+                    }}
                     placeholder={t('ohMyPi.provider.apiTypePlaceholder')}
                   />
                 </Form.Item>
                 <Form.Item label={t('ohMyPi.provider.baseUrl')} name="baseUrl">
-                  <Input placeholder="https://api.example.com/v1" />
+                  <Input placeholder="https://api.example.com/v1" onChange={handleProviderBaseUrlChange} />
                 </Form.Item>
                 <Form.Item label={t('ohMyPi.provider.providerApiKey')} name="providerApiKey">
                   <Input.Password autoComplete="off" />
@@ -2415,7 +2484,7 @@ const OhMyPiPage: React.FC = () => {
           showModalities={false}
           showInputTypes
           showApi
-          apiOptions={PI_API_OPTIONS}
+          apiOptions={OMP_API_OPTIONS}
           showReasoning
           showOmpThinking
           showCompat
@@ -2440,6 +2509,7 @@ const OhMyPiPage: React.FC = () => {
             apiKey={fetchModelsProviderInfo.apiKey}
             headers={fetchModelsProviderInfo.headers}
             sdkType={fetchModelsProviderInfo.sdkName}
+            configValueMode={fetchModelsProviderInfo.configValueMode}
             existingModelIds={fetchModelsProviderInfo.existingModelIds}
             onCancel={() => setFetchModelsModalOpen(false)}
             onSuccess={handleFetchModelsSuccess}
@@ -2527,6 +2597,8 @@ const OhMyPiPage: React.FC = () => {
         >
           <CliManualPathSetting commandName="omp" labelKey="subModules.ohMyPi" toolNameKey="subModules.ohMyPiFull" />
         </SidebarSettingsModal>
+
+        {shareModal}
       </SectionSidebarLayout>
     </Spin>
   );

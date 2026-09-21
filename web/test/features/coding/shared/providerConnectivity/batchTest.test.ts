@@ -135,3 +135,62 @@ test('buildProviderConnectivityBatchTarget does not require a frontend API key f
     timeoutSecs: 30,
   });
 });
+
+test('buildProviderConnectivityBatchTarget forwards an opt-in config value mode', () => {
+  const target = buildProviderConnectivityBatchTarget(
+    createConnectivityInfo({
+      configValueMode: 'pi',
+      providerConfig: {
+        npm: '@ai-sdk/openai-compatible',
+        options: {
+          baseURL: 'https://api.example.com/v1',
+          apiKey: '$PI_PROVIDER_KEY',
+        },
+      },
+    }),
+    {
+      requireBaseUrl: true,
+      requireApiKey: false,
+      errorMessages,
+    },
+  );
+
+  assert.equal(target.request?.configValueMode, 'pi');
+  // The template reaches the backend untouched so it can resolve it there.
+  assert.equal(target.request?.apiKey, '$PI_PROVIDER_KEY');
+});
+
+test('buildProviderConnectivityBatchTarget forwards the OMP config value mode', () => {
+  const target = buildProviderConnectivityBatchTarget(
+    createConnectivityInfo({
+      configValueMode: 'omp',
+      providerConfig: {
+        npm: '@ai-sdk/openai-compatible',
+        options: {
+          baseURL: 'https://api.example.com/v1',
+          apiKey: 'MY_OMP_PROVIDER_KEY',
+        },
+      },
+    }),
+    {
+      requireBaseUrl: true,
+      requireApiKey: false,
+      errorMessages,
+    },
+  );
+
+  assert.equal(target.request?.configValueMode, 'omp');
+  // The env var name reaches the backend untouched so it can resolve it there.
+  assert.equal(target.request?.apiKey, 'MY_OMP_PROVIDER_KEY');
+});
+
+test('buildProviderConnectivityBatchTarget omits the config value mode for other tools', () => {
+  const target = buildProviderConnectivityBatchTarget(createConnectivityInfo(), {
+    requireBaseUrl: true,
+    requireApiKey: false,
+    errorMessages,
+  });
+
+  assert.equal(target.request?.configValueMode, undefined);
+  assert.equal('configValueMode' in (target.request ?? {}), false);
+});

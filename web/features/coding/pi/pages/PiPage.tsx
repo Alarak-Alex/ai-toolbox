@@ -43,6 +43,7 @@ import {
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { useTranslation } from 'react-i18next';
 
+import { useProviderSharing } from '@/features/coding/shared/providerShare';
 import AllApiHubIcon from '@/components/common/AllApiHubIcon';
 import ImportProviderModal from '@/components/common/ImportProviderModal';
 import JsonEditor from '@/components/common/JsonEditor';
@@ -553,6 +554,7 @@ const dedupePiFavoriteProviders = (
 
 const PiPage: React.FC = () => {
   const { t } = useTranslation();
+  const { shareProvider, shareModal } = useProviderSharing('pi', () => loadConfig());
   const { sidebarHiddenByPage, setSidebarHidden } = useSettingsStore();
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
@@ -786,6 +788,9 @@ const PiPage: React.FC = () => {
       apiKey: getStringField(providerConfig, 'apiKey'),
       headers: asStringRecord(providerConfig.headers),
       sdkName: piApiToSdkName(api),
+      // Pi resolves `apiKey` / header values itself; the shared commands must
+      // resolve the models.json config value syntax instead of sending templates.
+      configValueMode: 'pi' as const,
       existingModelIds: getProviderModelRecords(provider.modelsProvider).map((entry) => entry.id),
     };
   }, [fetchModelsProviderId, piProviders]);
@@ -805,6 +810,7 @@ const PiPage: React.FC = () => {
       providerName: provider.displayName,
       providerConfig: buildPiOpenCodeProvider(provider, providerConfig),
       modelIds,
+      configValueMode: 'pi' as const,
     };
   }, [connectivityProviderId, piProviders]);
 
@@ -1626,6 +1632,7 @@ const PiPage: React.FC = () => {
           providerName: provider.displayName,
           providerConfig,
           modelIds,
+          configValueMode: 'pi' as const,
         },
         {
           requireBaseUrl: true,
@@ -1850,6 +1857,12 @@ const PiPage: React.FC = () => {
         models={modelDisplayList}
         onEdit={() => openProviderModal(provider)}
         onCopy={() => openProviderModal(provider, { copy: true })}
+        onShare={() => shareProvider({
+          id: provider.providerKey, name: provider.displayName, category: 'custom',
+          settingsConfig: JSON.stringify(providerConfig), credential: provider.credential,
+          credentialUnavailable: provider.credentialKind === 'oauth' || provider.credentialKind === 'env_possible',
+          defaultModel: provider.isDefault ? runtimeConfig?.modelSettings.modelId ?? undefined : undefined,
+        })}
         onDelete={canDeleteProvider ? () => handleDeleteSupplier(provider) : undefined}
         deleteConfirm={false}
         deleteDisabledReason={deleteDisabledReason}
@@ -2525,6 +2538,7 @@ const PiPage: React.FC = () => {
             apiKey={fetchModelsProviderInfo.apiKey}
             headers={fetchModelsProviderInfo.headers}
             sdkType={fetchModelsProviderInfo.sdkName}
+            configValueMode={fetchModelsProviderInfo.configValueMode}
             existingModelIds={fetchModelsProviderInfo.existingModelIds}
             onCancel={() => setFetchModelsModalOpen(false)}
             onSuccess={handleFetchModelsSuccess}
@@ -2592,6 +2606,8 @@ const PiPage: React.FC = () => {
         >
           <CliManualPathSetting commandName="pi" labelKey="subModules.pi" />
         </SidebarSettingsModal>
+
+        {shareModal}
       </SectionSidebarLayout>
     </Spin>
   );

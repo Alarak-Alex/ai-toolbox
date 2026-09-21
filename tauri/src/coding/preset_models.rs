@@ -1,6 +1,7 @@
 use crate::db::SqliteDbState;
 use crate::http_client;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -42,6 +43,139 @@ fn get_bundled_preset_models() -> Option<Value> {
     } else {
         None
     }
+}
+
+// ============================================================================
+// Display-name lookup
+// ============================================================================
+
+/// Model id -> display name index built once from the bundled preset models.
+///
+/// Built from the compile-time bundled file instead of the app-data cache so
+/// callers stay deterministic and work offline; the cache is the frontend's
+/// remote-refresh target, not a backend read path.
+static PRESET_DISPLAY_NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// Display name the preset models declare for one model id.
+///
+/// Returns `None` for an unknown or blank id so callers keep their own fallback
+/// (normally the raw id).
+pub fn display_name_for_model_id(model_id: &str) -> Option<String> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return None;
+    }
+    PRESET_DISPLAY_NAMES
+        .get_or_init(build_preset_display_name_index)
+        .get(model_id)
+        .cloned()
+}
+
+fn build_preset_display_name_index() -> HashMap<String, String> {
+    let mut index = HashMap::new();
+    let Ok(presets) = serde_json::from_str::<Value>(DEFAULT_PRESET_MODELS_JSON) else {
+        return index;
+    };
+    let Some(groups) = presets.as_object() else {
+        return index;
+    };
+    for models in groups.values() {
+        let Some(models) = models.as_array() else {
+            continue;
+        };
+        for model in models {
+            let id = model
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            if let (Some(id), Some(name)) = (id, name) {
+                // First group wins if one id ever appears twice; the bundled file
+                // has no conflicting duplicates today.
+                index
+                    .entry(id.to_string())
+                    .or_insert_with(|| name.to_string());
+            }
+        }
+    }
+    index
+}
+
+// ============================================================================
+// Input-modality lookup
+// ============================================================================
+
+/// Model id -> declared `modalities.input` index built once from the bundled
+/// preset models.
+///
+/// Same read path as `PRESET_DISPLAY_NAMES`: compile-time bundled file only,
+/// so callers stay deterministic and work offline; the app-data cache is the
+/// frontend's remote-refresh target, not a backend read path.
+static PRESET_INPUT_MODALITIES: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+
+/// Input modalities the preset models declare for one model id.
+///
+/// Returns `None` for an unknown id or an entry without a usable
+/// `modalities.input` array, so callers keep their own fallback (the entry for
+/// `gpt-5.4-nano`, which ships no modalities at all, lands here too).
+pub fn input_modalities_for_model_id(model_id: &str) -> Option<Vec<String>> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return None;
+    }
+    PRESET_INPUT_MODALITIES
+        .get_or_init(build_preset_input_modalities_index)
+        .get(model_id)
+        .cloned()
+}
+
+fn build_preset_input_modalities_index() -> HashMap<String, Vec<String>> {
+    let mut index = HashMap::new();
+    let Ok(presets) = serde_json::from_str::<Value>(DEFAULT_PRESET_MODELS_JSON) else {
+        return index;
+    };
+    let Some(groups) = presets.as_object() else {
+        return index;
+    };
+    for models in groups.values() {
+        let Some(models) = models.as_array() else {
+            continue;
+        };
+        for model in models {
+            let Some(id) = model
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let Some(modalities) = model
+                .pointer("/modalities/input")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::trim))
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+            else {
+                continue;
+            };
+            // First group wins if one id ever appears twice; the bundled file
+            // has no conflicting duplicates today.
+            index.entry(id.to_string()).or_insert(modalities);
+        }
+    }
+    index
 }
 
 // ============================================================================
@@ -144,6 +278,8 @@ pub async fn fetch_remote_preset_models(
 
 #[cfg(test)]
 mod tests {
+    use super::display_name_for_model_id;
+    use super::input_modalities_for_model_id;
     use super::DEFAULT_PRESET_MODELS_JSON;
     use serde_json::Value;
 
@@ -151,6 +287,89 @@ mod tests {
     const EXTENDED_ADAPTIVE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
     const LEGACY_THINKING_LEVELS: [(&str, u64); 3] =
         [("low", 5_000), ("medium", 13_000), ("high", 18_000)];
+
+    #[test]
+    fn display_name_lookup_covers_bundled_ids_and_rejects_unknown_ones() {
+        assert_eq!(
+            display_name_for_model_id("gpt-6-astra").as_deref(),
+            Some("GPT-6 Astra")
+        );
+        // Ids are trimmed before lookup.
+        assert_eq!(
+            display_name_for_model_id(" gpt-5.6-sol ").as_deref(),
+            Some("GPT-5.6 Sol")
+        );
+        // Unknown or blank ids stay unknown so callers keep their own fallback.
+        assert_eq!(display_name_for_model_id("no-such-model"), None);
+        assert_eq!(display_name_for_model_id("   "), None);
+
+        // Every bundled group's `id`/`name` pairs stay reachable through the
+        // index, so a new preset does not silently drop out of the lookup.
+        let presets: Value =
+            serde_json::from_str(DEFAULT_PRESET_MODELS_JSON).expect("bundled JSON should parse");
+        for models in presets.as_object().expect("preset groups").values() {
+            for model in models.as_array().expect("group is an array") {
+                let (Some(id), Some(name)) = (
+                    model.get("id").and_then(Value::as_str),
+                    model.get("name").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                assert_eq!(display_name_for_model_id(id).as_deref(), Some(name), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn input_modalities_lookup_covers_bundled_declarations_and_rejects_unknown_ones() {
+        // A text-only preset stays text-only (the Codex catalog generator uses
+        // this as its confirmed-text-only registry).
+        assert_eq!(
+            input_modalities_for_model_id("deepseek-chat"),
+            Some(vec!["text".to_string()])
+        );
+        // An image-capable preset keeps its full declared set.
+        assert_eq!(
+            input_modalities_for_model_id("deepseek-v4.1-flash"),
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
+        // Non-text modalities survive verbatim (Gemini presets declare audio).
+        let gemini = input_modalities_for_model_id("gemini-2.5-flash")
+            .expect("gemini-2.5-flash declares modalities");
+        assert!(gemini.contains(&"audio".to_string()), "{gemini:?}");
+
+        // Unknown or blank ids stay unknown so callers keep their own fallback.
+        assert_eq!(input_modalities_for_model_id("no-such-model"), None);
+        assert_eq!(input_modalities_for_model_id("   "), None);
+
+        // Every bundled group's id with a `modalities.input` array stays
+        // reachable through the index; entries without one (gpt-5.4-nano) must
+        // stay unknown rather than resolving to an empty set.
+        let presets: Value =
+            serde_json::from_str(DEFAULT_PRESET_MODELS_JSON).expect("bundled JSON should parse");
+        for models in presets.as_object().expect("preset groups").values() {
+            for model in models.as_array().expect("group is an array") {
+                let Some(id) = model.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let declared: Option<Vec<String>> = model
+                    .pointer("/modalities/input")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .filter(|items: &Vec<String>| !items.is_empty());
+                assert_eq!(
+                    input_modalities_for_model_id(id),
+                    declared,
+                    "{id} modality lookup must mirror the bundled declaration"
+                );
+            }
+        }
+    }
 
     fn bundled_anthropic_models() -> Value {
         let presets: Value = serde_json::from_str(DEFAULT_PRESET_MODELS_JSON)
@@ -395,62 +614,78 @@ mod tests {
     }
 
     #[test]
-    fn xai_presets_define_only_canonical_grok_4_5_with_supported_reasoning() {
+    fn xai_presets_define_canonical_grok_4_6_and_4_5_with_supported_reasoning() {
         const GROK_4_5_REASONING_LEVELS: [&str; 3] = ["low", "medium", "high"];
+        const GROK_4_6_REASONING_LEVELS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
         let models = bundled_xai_models();
         let model_list = models
             .as_array()
             .expect("xAI preset group should be an array");
-        assert_eq!(model_list.len(), 1);
+        let model_ids: Vec<&str> = model_list
+            .iter()
+            .filter_map(|preset| preset.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(model_ids, ["grok-4.6", "grok-4.5"]);
 
-        let preset = model_list.first().expect("Grok 4.5 preset should exist");
-        assert_eq!(preset.get("id").and_then(Value::as_str), Some("grok-4.5"));
-        assert_eq!(
-            preset.get("contextLimit").and_then(Value::as_u64),
-            Some(500_000)
-        );
-        assert_eq!(
-            preset.get("outputLimit").and_then(Value::as_u64),
-            Some(500_000)
-        );
-        assert_eq!(preset.get("reasoning").and_then(Value::as_bool), Some(true));
-        assert_eq!(preset.get("tool_call").and_then(Value::as_bool), Some(true));
-        assert_eq!(
-            preset.get("attachment").and_then(Value::as_bool),
-            Some(true)
-        );
-        assert!(preset.get("temperature").is_none());
-        assert_eq!(
-            preset.pointer("/modalities/input"),
-            Some(&serde_json::json!(["text", "image"]))
-        );
-        assert_eq!(
-            preset.pointer("/modalities/output"),
-            Some(&serde_json::json!(["text"]))
-        );
-
-        let variants = preset
-            .get("variants")
-            .and_then(Value::as_object)
-            .expect("Grok 4.5 should define reasoning variants");
-        assert_eq!(variants.len(), GROK_4_5_REASONING_LEVELS.len());
-        for reasoning_level in GROK_4_5_REASONING_LEVELS {
-            let variant = variants
-                .get(reasoning_level)
-                .unwrap_or_else(|| panic!("Grok 4.5 should define {reasoning_level}"));
+        let assert_shared_grok_fields = |model_id: &str, reasoning_levels: &[&str]| {
+            let preset = model_list
+                .iter()
+                .find(|preset| preset.get("id").and_then(Value::as_str) == Some(model_id))
+                .unwrap_or_else(|| panic!("{model_id} preset should exist"));
             assert_eq!(
-                variant.get("reasoningEffort").and_then(Value::as_str),
-                Some(reasoning_level)
+                preset.get("contextLimit").and_then(Value::as_u64),
+                Some(500_000)
             );
-        }
+            assert_eq!(
+                preset.get("outputLimit").and_then(Value::as_u64),
+                Some(500_000)
+            );
+            assert_eq!(preset.get("reasoning").and_then(Value::as_bool), Some(true));
+            assert_eq!(preset.get("tool_call").and_then(Value::as_bool), Some(true));
+            assert_eq!(
+                preset.get("attachment").and_then(Value::as_bool),
+                Some(true)
+            );
+            assert!(preset.get("temperature").is_none());
+            assert_eq!(
+                preset.pointer("/modalities/input"),
+                Some(&serde_json::json!(["text", "image"]))
+            );
+            assert_eq!(
+                preset.pointer("/modalities/output"),
+                Some(&serde_json::json!(["text"]))
+            );
 
-        for alias in ["grok-4.5-latest", "grok-build-latest"] {
+            let variants = preset
+                .get("variants")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{model_id} should define reasoning variants"));
+            assert_eq!(variants.len(), reasoning_levels.len());
+            for reasoning_level in reasoning_levels {
+                let variant = variants.get(*reasoning_level).unwrap_or_else(|| {
+                    panic!("{model_id} should define the {reasoning_level} variant")
+                });
+                assert_eq!(
+                    variant.get("reasoningEffort").and_then(Value::as_str),
+                    Some(*reasoning_level)
+                );
+            }
+        };
+
+        assert_shared_grok_fields("grok-4.6", &GROK_4_6_REASONING_LEVELS);
+        assert_shared_grok_fields("grok-4.5", &GROK_4_5_REASONING_LEVELS);
+
+        for alias in [
+            "grok-4.6-latest",
+            "grok-4.5-latest",
+            "grok-build-latest",
+        ] {
             assert!(
                 model_list
                     .iter()
                     .all(|model| model.get("id").and_then(Value::as_str) != Some(alias)),
-                "{alias} should not duplicate the canonical Grok 4.5 preset"
+                "{alias} should not duplicate a canonical Grok preset"
             );
         }
     }

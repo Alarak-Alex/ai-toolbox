@@ -6,6 +6,7 @@ import type { KimiProvider } from '@/types/kimi';
 import type { OpenCodeProvider } from '@/types/opencode';
 import type { OpenCodeDiagnosticsConfig } from '@/services/opencodeApi';
 import { extractCodexBaseUrl, extractCodexModel, extractCodexReasoningEffort } from '@/utils/codexConfigUtils';
+import { buildCodexConnectivityModelIds } from '@/features/coding/codex/utils/codexCatalogModels';
 import {
   extractGrokSettingsBaseUrl,
   extractGrokSettingsModel,
@@ -16,6 +17,7 @@ import {
   parseKimiSettingsConfig,
 } from '@/features/coding/kimi/utils/settingsConfig';
 import ConnectivityTestModal from '@/features/coding/opencode/components/ConnectivityTestModal';
+import type { ProviderModelConnections } from '@/features/coding/shared/providerConnectivity/modelConnection';
 import type { GatewayCliKey } from '@/services/proxyGatewayApi';
 
 const DEFAULT_CLAUDE_BASE_URL = 'https://api.anthropic.com/v1';
@@ -28,6 +30,10 @@ export interface ProviderConnectivityInfo {
   providerConfig: OpenCodeProvider;
   modelIds: string[];
   reasoningEffort?: string;
+  apiFormat?: 'openai-codex-responses';
+  configValueMode?: 'pi' | 'omp';
+  /** Models whose own api/baseUrl overrides the provider connection (OMP). */
+  modelConnections?: ProviderModelConnections;
 }
 
 interface ProviderConnectivityTestModalProps {
@@ -104,7 +110,9 @@ export function buildCodexProviderConnectivityInfo(provider: CodexProvider): Pro
   const reasoningEffort = extractCodexReasoningEffort(settingsConfig.config)?.trim();
   const apiKey = settingsConfig.auth?.OPENAI_API_KEY?.trim();
   const baseUrl = extractCodexBaseUrl(settingsConfig.config)?.trim() || DEFAULT_CODEX_BASE_URL;
-  const modelIds = modelId ? [modelId] : [];
+  // The catalog is the provider's real model list, so the test covers every
+  // catalog row in addition to the config.toml default.
+  const modelIds = buildCodexConnectivityModelIds(modelId, settingsConfig.modelCatalog?.models);
 
   return {
     providerId: provider.id,
@@ -225,6 +233,9 @@ const ProviderConnectivityTestModal: React.FC<ProviderConnectivityTestModalProps
       providerId={connectivityInfo.providerId}
       providerName={connectivityInfo.providerName}
       providerConfig={connectivityInfo.providerConfig}
+      apiFormat={connectivityInfo.apiFormat}
+      configValueMode={connectivityInfo.configValueMode}
+      modelConnections={connectivityInfo.modelConnections}
       modelIds={connectivityInfo.modelIds}
       removableModelIds={removableModelIds ?? connectivityInfo.modelIds}
       diagnostics={diagnostics}

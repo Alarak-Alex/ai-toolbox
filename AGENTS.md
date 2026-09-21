@@ -35,6 +35,7 @@ This document provides essential information for AI coding agents working on thi
 | 模块目录 | 说明 |
 |---------|------|
 | `tauri/src/coding/` | Coding 域共享规则：runtime location、事件驱动托盘、WSL Direct、跨工具 CLI/路径语义 |
+| `tauri/src/coding/deeplink/` | 供应商跨工具分享、通用连接适配、确认导入与原有保存链路 |
 | `tauri/src/coding/auth_refresh/` | 官方账号 OAuth 共享调度：启动首次 + 周期 ensure_fresh（Grok/Codex/Gemini） |
 | `tauri/src/coding/claude_code/` | Claude Code 后端配置、prompt、plugin、MCP 与 WSL 同步约束 |
 | `tauri/src/coding/codex/` | Codex 后端配置、auth/config.toml、prompt、plugin 与 WSL 同步约束 |
@@ -48,7 +49,7 @@ This document provides essential information for AI coding agents working on thi
 | `tauri/src/coding/open_claw/` | OpenClaw 后端配置文件与 WSL 同步约束 |
 | `tauri/src/coding/oh_my_openagent/` | Oh My OpenAgent 后端配置、临时本地态、应用链路与 OpenCode WSL 联动 |
 | `tauri/src/coding/oh_my_opencode_slim/` | Oh My OpenCode Slim 后端配置、临时本地态、应用链路与 OpenCode WSL 联动 |
-| `tauri/src/coding/oh_my_pi/` | Oh My Pi 运行时根目录、models.yml provider、config.yml 设置与本地 MCP/Skills 路径边界 |
+| `tauri/src/coding/oh_my_pi/` | Oh My Pi 运行时根目录、models.yml provider、config.yml 设置、subagent 集中配置方案(agents/*.md)与本地 MCP/Skills 路径边界 |
 | `tauri/src/coding/proxy_gateway/` | 本机代理网关、CLI 接管 manifest、配置备份恢复与模型级健康/日志文件 |
 | `tauri/src/coding/proxy_gateway/transformer/` | 网关协议转换独立模块：Anthropic/OpenAI Chat/OpenAI Responses/Gemini Native JSON 与 SSE 互转 |
 | `tauri/src/coding/session_manager/` | 会话浏览、详情、重命名、导入导出与运行时路径解析 |
@@ -64,7 +65,7 @@ This document provides essential information for AI coding agents working on thi
 | `web/features/coding/grok/` | Grok CLI 前端页面、根目录配置、provider、官方账号、plugin、prompt 与 session 交互 |
 | `web/features/coding/geminicli/` | Gemini CLI 前端页面、根目录配置、provider、prompt、usage 与 session 交互 |
 | `web/features/coding/kimi/` | Kimi Code CLI 前端页面、根目录配置、provider、官方账号、prompt 与通用配置交互 |
-| `web/features/coding/gateway/` | Gateway 前端页面、统计/请求/设置 Tab、顶部入口与 visibleTabs 可见性 |
+| `web/features/coding/gateway/` | Gateway 前端页面、统计/明细/设置 Tab、顶部入口与 visibleTabs 可见性 |
 | `web/features/coding/image/` | Image 前端页面、工作台、渠道管理、历史与结果交互 |
 | `web/features/coding/mcp/` | MCP 前端页面、服务器管理、导入流程与工具同步交互 |
 | `web/features/coding/opencode/` | OpenCode 前端页面、配置路径、provider、prompt 与模型刷新交互 |
@@ -74,7 +75,7 @@ This document provides essential information for AI coding agents working on thi
 | `web/features/shared/deepLink/` | `aitoolbox://` 深链接前端两侧：导入确认弹窗与分享链接生成（URL 格式事实源在后端 `deeplink/parser.rs`） |
 | `web/features/settings/` | WSL/SSH 设置页、同步入口、moduleStatuses 消费和 UI 边界 |
 | `web/components/common/` | 共享编辑器与基础交互组件的性能和正确性约束 |
-| `tauri/src/settings/backup/` | 备份恢复、WebDAV、自动备份与恢复后续链路 |
+| `tauri/src/settings/backup/` | 备份恢复（本地/WebDAV/GitHub-Gitee 仓库）、可选加密、自动备份与恢复后续链路 |
 | `tauri/src/coding/image/` | Image 后端渠道配置、任务、资产落盘、图片 API 调用与备份联动 |
 
 后续新增模块级 `AGENTS.md` 时，继续在此表追加，不在根文档其他位置零散登记。
@@ -226,6 +227,7 @@ cd tauri && cargo test test_name
 - 对跨模块、跨层、会影响“保存/应用/同步/恢复/导入导出/配置落盘”的**大功能迭代**，不要只跑针对性测试；在交付前必须补跑当前仓库可用的全量测试集合。
 - 当前仓库前端测试统一通过 `pnpm test` 执行；该脚本会发现并运行 `web/test/**` 下的 `.test.ts` / `.spec.ts` 文件。
 - `node:test.run()` 会先发送各文件的 `test:summary`，不能用第一个 summary 决定整套测试成败。测试入口必须等事件流结束，并让任何 `test:fail` 设置非零退出码；用“首文件成功、后续文件失败”的子进程回归验证，避免本地和 CI 假通过。
+- `run-web-tests.mjs` 结束时会按测试事件里的 `file` 字段校验每个发现的测试文件都产生过测试点。Node 22 + Windows 下实测出现过同一命令一次 543 个用例、一次 554 个且都 exit 0：某个测试文件被静默跳过但仍报全绿。这类守卫触发时是 runner/子进程调度问题，必须保留失败输出排查，不能靠重跑掩盖；不要移除该守卫或 `test:fail` 的退出码逻辑。
 - 前端测试文件必须放在 `web/test/` 下，并镜像对应功能目录结构；不要把 `.test.ts` 文件继续与实现文件并排放在 `web/features/**`、`web/components/**` 等源码目录里。
   - 例如：`web/features/coding/opencode/components/foo.ts` 对应测试应放在 `web/test/features/coding/opencode/components/foo.test.ts`
 - Rust 测试保持分层约定：
@@ -249,7 +251,7 @@ cd tauri && cargo test test_name
 - 如果本轮只改一个非常局部的点，但用户明确要求“全量测试”或“完整验证”，仍然按上面的全量集合执行，而不是自行降级为 smoke test。
 - macOS 本地全量 `cargo test` 有两个已知环境失败，不是代码回归：`tray::tests::skills_section_*` 会因 muda 要求 `Menu`/`MenuChild` 只能在主线程创建而 panic（CI/Linux 不受影响）；另外 `coding::codex::official_accounts::tests::browser_oauth_callback_rejects_invalid_state` 在全量高并行下偶发 flaky，单测重跑可通过。判断是否为既有失败时，用 `git worktree` 检出干净 HEAD 单跑同一测试对比，不要直接归因为本轮改动。
 - 涉及真实 CLI 的 session 导入导出往返测试（如 opencode round trip）在 macOS 上会遇到 `/var` -> `/private/var` symlink realpath 差异；断言前必须用 `normalize_test_path` + `ai-toolbox-session-manager-` marker 对 `path`/`directory` 等临时目录字段做归一化，不能直接比较原始绝对路径。
-- Windows 本地 `cargo test` 的 doctest 段偶发 `error[E0460]: found possibly newer version of crate 'windows'`（可伴随 `memory allocation of ... failed`、`failed to mmap ... os error 1455` / `页面文件太小`）：rustdoc 加载到损坏/半写状态的 rlib 元数据所致，常见诱因是 ① 并发构建写同一 target（其它 `cargo run`/`cargo build` 与测试共用 `tauri/target`）；② 本机或沙箱存在进程级 commit 配额时，默认高并行度的全量 `cargo test` 会让 rustdoc mmap 整个依赖图超限（物理内存再空闲也会报 1455）。自愈顺序：先 `cargo clean -p windows && cargo test --doc`（只重编 windows 相关产物，约 1-2 分钟）；若全量仍在 doctest 段复现 mmap/E0460，改用 `cargo test --jobs 2`（限并行后已验证稳定通过）或错开其它 cargo 构建进程。另一个 Windows 特有失败是 `failed to remove file target\debug\ai-toolbox.exe`：exe 被正在运行的进程锁定（如其它 `cargo run` 启动的应用），等该进程退出后重试即可。若全量 `cargo test` 仅 doctest 段失败而其余套件全过，应先按上述自愈流程处理，不要误判为本轮代码回归。还有一个 Windows lib 单元测试二进制的入口点失败：`exit code: 0xc0000139 (STATUS_ENTRYPOINT_NOT_FOUND)`，表现为测试二进制启动即崩、`dumpbin /imports` 显示静态导入与可用 baseline 完全一致、但 `RT_MANIFEST`（type 24）资源缺失 → common-controls v6 未激活 → 被链接进来的 `tauri-plugin-dialog` 的 `TaskDialogIndirect` 在 comctl32 v5 中无法解析。`tauri/build.rs` 的 `embed_windows_test_manifest` 本应经 `/MANIFEST:EMBED /MANIFESTINPUT:<OUT_DIR>/ai-toolbox-test.manifest` 注入该资源；全量 `cargo clean` 后的全新构建偶发不嵌入、而增量构建稳定嵌入（manifest 文件与 `cargo:rustc-link-arg-tests` 参数均存在却仍不嵌入，疑似 MSVC `link.exe` 在全新链接时的 arg 顺序或本机安全软件干扰）。判别与自愈：用 `git worktree` 检出干净 HEAD 单跑同一 `cargo test --lib` 对比——若 baseline 通过而本轮失败、且二进制确缺 `RT_MANIFEST`，先 `touch tauri/build.rs` 强制 build script 重跑、再增量 `cargo test --lib`（已验证通过）；不要把这种 fresh-build manifest 缺失误判为源码回归——影响测试二进制的 `#[cfg(not(test))]` 分支不参与测试编译，逻辑上不可能改变测试二进制链接图。
+- Windows 本地 `cargo test` 的 doctest 段偶发 `error[E0460]: found possibly newer version of crate 'windows'`（可伴随 `memory allocation of ... failed`、`failed to mmap ... os error 1455` / `页面文件太小`）：rustdoc 加载到损坏/半写状态的 rlib 元数据所致，常见诱因是 ① 并发构建写同一 target（其它 `cargo run`/`cargo build` 与测试共用 `tauri/target`）；② 本机或沙箱存在进程级 commit 配额时，默认高并行度的全量 `cargo test` 会让 rustdoc mmap 整个依赖图超限（物理内存再空闲也会报 1455）。自愈顺序：先 `cargo clean -p windows && cargo test --doc`（只重编 windows 相关产物，约 1-2 分钟）；若全量仍在 doctest 段复现 mmap/E0460，改用 `cargo test --jobs 2`（限并行后已验证稳定通过）或错开其它 cargo 构建进程。另一个 Windows 特有失败是 `failed to remove file target\debug\ai-toolbox.exe`：exe 被正在运行的进程锁定（如其它 `cargo run` 启动的应用）。cargo 的 `test` 系列命令（包括显式 `--test <name>` / `--lib --tests`）总会把 bin 纳入构建计划，lib 变更后 bin 必须重链，因此不能靠缩小 target 范围绕过；也不必杀掉用户正在使用的应用——Windows 允许重命名运行中的 exe，先 `mv target/debug/ai-toolbox.exe target/debug/ai-toolbox.exe.locked-by-running-app`（运行中进程的句柄仍指向旧文件，应用不受影响），cargo 即可重新链接出新 exe，全量测试照常执行；改名产物可在应用退出后删除。若全量 `cargo test` 仅 doctest 段失败而其余套件全过，应先按上述自愈流程处理，不要误判为本轮代码回归。还有一个 Windows lib 单元测试二进制的入口点失败：`exit code: 0xc0000139 (STATUS_ENTRYPOINT_NOT_FOUND)`，表现为测试二进制启动即崩、`dumpbin /imports` 显示静态导入与可用 baseline 完全一致、但 `RT_MANIFEST`（type 24）资源缺失 → common-controls v6 未激活 → 被链接进来的 `tauri-plugin-dialog` 的 `TaskDialogIndirect` 在 comctl32 v5 中无法解析。`tauri/build.rs` 的 `embed_windows_test_manifest` 本应经 `/MANIFEST:EMBED /MANIFESTINPUT:<OUT_DIR>/ai-toolbox-test.manifest` 注入该资源；全量 `cargo clean` 后的全新构建偶发不嵌入、而增量构建稳定嵌入（manifest 文件与 `cargo:rustc-link-arg-tests` 参数均存在却仍不嵌入，疑似 MSVC `link.exe` 在全新链接时的 arg 顺序或本机安全软件干扰）。判别与自愈：用 `git worktree` 检出干净 HEAD 单跑同一 `cargo test --lib` 对比——若 baseline 通过而本轮失败、且二进制确缺 `RT_MANIFEST`，先 `touch tauri/build.rs` 强制 build script 重跑、再增量 `cargo test --lib`（已验证通过）；不要把这种 fresh-build manifest 缺失误判为源码回归——影响测试二进制的 `#[cfg(not(test))]` 分支不参与测试编译，逻辑上不可能改变测试二进制链接图。
 - 新增或修复高价值回归时，应优先补**最贴近用户路径**的自动化用例；不要只补实现细节测试而漏掉“表单提交 -> 持久化 -> 再读取”这类关键往返语义。
 
 ## Code Style Guidelines
@@ -441,6 +443,7 @@ fn command_name(param: &str) -> Result<ReturnType, String> {
 
 - 普通 Ant Design `<Modal>` 居中由 `ConfigProvider` 和全局 `web/App.css` 处理；静态 `Modal.confirm/info/error/success/warning` 通过 `ConfigProvider.config({ holderRender })` 取得同一上下文。
 - 高弹窗必须依赖 `web/App.css` 的 viewport-safe modal 规则：`.ant-modal-wrap` 使用 `--ai-modal-viewport-block-gap` 和 `--ai-modal-viewport-inline-gap`，modal body 内部滚动。不要重新添加 per-modal `top` 偏移或一次性 max-height hack。
+- Ant Design 6 当前 Modal 内容容器使用 `.ant-modal-container`；全局 viewport-safe 规则需同时覆盖历史 `.ant-modal-content` 与该容器。只保留旧 selector 会让高弹窗 footer 溢出视口；浏览器验收须检查 footer 可见且 body 内滚动，不能只检查横向不溢出。
 - 真正全屏弹窗可通过 `rootClassName` 或 `wrapClassName` 将 `--ai-modal-viewport-block-gap` / `--ai-modal-viewport-inline-gap` 设为 `0px`，并明确接管内部滚动。
 - 弹窗内使用 `<Collapse>` 做 section 时，必须传 `bordered={false}` 或 `ghost`，否则 Ant Design CSS-in-JS 的默认白色 header/content 和边框会覆盖模块样式。
 - 自定义 collapse section 时，`.ant-collapse-content` 和 `.ant-collapse-content-box` 都需要显式设置 `background: transparent !important`，避免默认 `colorBgContainer` 破坏 section 背景。
@@ -513,6 +516,7 @@ When implementing new components or features, test light, dark, and system theme
   - `pnpm i18n:prune --prefix <key-prefix> --write` removes high-confidence unused keys only inside the explicit prefix; do not run broad prune without a prefix.
 - Do not patch `web/i18n/locales/*.json` directly for ordinary add/update/delete work. If `scripts/i18n-keys.mjs` cannot perform the needed i18n edit, extend the script first in the same task, then use the script command and run `pnpm i18n:check`.
 - `pnpm test` includes the i18n key coverage test. If it fails, fix missing or mismatched locale keys rather than suppressing the check.
+- `scripts/i18n-keys.mjs` writes locale files through a directory lock plus temp-file `rename`. On Windows, Defender / the search indexer can briefly hold the target (or lock directory) open and fail the rename with `EPERM`/`EACCES`; the script retries those codes within the lock timeout. Do not remove that retry or replace `rename` with a direct `writeFile` (a reader in another process would observe a half-written locale). The concurrent `set-key` test in `web/test/i18n/i18nKeysScript.test.ts` prints child stderr in its assertion message; use it, not the bare exit-code diff, when diagnosing failures.
 
 ```typescript
 const { t } = useTranslation();
@@ -563,11 +567,16 @@ features/
 - 迁移失败不能写完成标记；不完整 SQLite 文件需要清理，下次启动重试。连续 3 次失败后应向用户展示 `migration.log` 路径。
 - 备份恢复以 SQLite 单文件和 `db_manifest.json` 为准。旧 SurrealDB 备份只能作为恢复输入，恢复时导入 SQLite；新备份不要再包含旧 SurrealDB 快照作为事实源。
 - 跨表状态切换（如 applied flag）必须在 SQLite 事务或 helper 组合内完成；单表 applied 切换优先用 `db_update_applied_status`，不能在业务层逐条 `db_patch_where_bool` 后再单独 patch 目标记录。
+- 同一 JSONB 记录同时承载用户配置和后台诊断时，各写入方只更新自己负责的字段；表单保存不能回写旧快照里的 `last_sync_*`。局部更新用 `db_patch_fields`，读改写全过程放在同一次 `with_conn` 内，不能分两次获取连接，否则并发状态更新会丢失相邻字段（WSL/SSH 同步警告曾因此受影响）。
+- 兼容记录的懒迁移也必须把存在检查、旧值读取和新记录写入放在同一事务内；读取与保存共用迁移入口，避免首次保存早于首次读取时丢失旧凭据，也避免迁移覆盖并发保存的新记录。
 - 少数独立物理表（如 Gateway `model_pricing`）使用官方默认数据补齐时，必须优先保护用户已有行；默认 seed / 远端同步只能用 `INSERT OR IGNORE` 这类增量插入语义，不能覆盖用户自定义值。
 - 列式统计表新增指标时，必须覆盖实际写入、列表/聚合查询、摘要详情回退和旧数据兼容链路；未知/未采集与有效的 `0` 应明确区分。没有本期采集或消费需求的指标不预埋占位列；迁移测试必须验证已有行保留和可重复升级，不能只检查空库新列存在。
 - 已经被实际运行的开发版本执行过的 schema migration 也视为已发布契约，不能往同一个版本号继续追加列或表并期待旧库重跑。应新增更高版本的幂等迁移；回归必须从“user_version 已是旧迁移版本、但缺少后来补入的字段”开始，不能把版本号降到更早来掩盖漏升级。兼容字段已存在时保留原值；真实文件库修复仍须先创建 SQLite 快照。
 - 历史汇总/保留期裁剪属于维护任务，失败不得阻止新业务记录落库，也不得把已经提交的导入结果报告成整体失败或丢弃变更事件。维护失败应记录日志、保留原始行并限频重试；新业务写入本身的失败仍须准确返回。
 - 增量导入外部记录时，导入账本/游标必须与对应业务行在同一 SQLite 事务提交；明细归档后仍保留已处理身份，不能因原明细不存在而重新计入历史。日聚合累加与删除原明细也必须原子提交，删除失败不能留下已累加的汇总。合并有测量和未测量的数据源时，平均值必须保留独立的有效样本数，不能把未知值按零计入分母；SQL 加权平均应显式使用浮点除法，避免归档前后整数截断改变结果。
+- 外部用量的“记录条数”“模型调用数”和“统计粒度”必须分开：回合/累计记录不能用 `COUNT(*)` 冒充请求数，缺少调用数时不推算；超出已知 Token 分类的原生总量差额独立保留，不套用普通输入价格。修正已归档贡献必须有已保存的精确贡献快照，旧账本缺少贡献时只处理能整组严格对账的汇总；回退、修复快照和账本标记同事务提交，不能清空汇总重算或凭文件消失扣减。
+- 用量验收必须使用真实模型 ID（含渠道包装、版本/日期后缀）和实际价格表验证成本，不能用空价格表下 Token 正确、导入幂等代替金额校验。未定价与明确零价格不同；后补缺失估算只能修改成本和审计快照，不能重复导入 Token/调用数，也不能随当前价格调整重算已定价的历史费用。
+- 累计用量来源必须区分缺价、已估算和明确的实际零费用/套餐内用量。缺价期间保留未定价贡献，后补价格只计入这部分；后来收到原生累计金额时，以它与已计入金额的差额修正，不能叠加全额。明确零价也要持久化已定价状态，避免下一次价格变化又补算旧用量。
 
 ## Skills / WSL / SSH Quick Notes
 
@@ -645,6 +654,14 @@ features/
   - 有 CLI 的 tab（opencode/claudecode/grok/pi/oh_my_pi/hermes/dsh/openclaw）的“更多选项”支持用户手动指定本机 CLI 路径；保存前会执行 `--version`/`-v`/`version` 校验，打开“更多选项”时每次重新探测并显示版本。本机 CLI 解析统一经 `tauri/src/coding/cli_resolver.rs` 的手动覆盖注册表优先使用该路径（文件不存在时回退自动发现）。改动 CLI 调用时不要绕过该注册表直接 `Command::new("<tool>")`。
 
 ## Data Storage Architecture
+
+### Application Data Directory Bootstrap
+
+- 应用自身的数据根目录统一经 `app_paths::resolved_data_dir()` 读取；瞬时缓存统一经 `resolved_cache_dir()`。两者在进程首次访问时一起冻结，设置页保存只改变下次启动目录，禁止单独重读 bootstrap 让某个缓存提前切换。
+- `app_paths.json` 是启动主库前所需的唯一目录覆盖配置，固定留在平台默认应用数据目录，不放 SQLite、不随覆盖目录移动、也不由数据库备份恢复覆盖。保存必须先验证目标目录可创建/可写，再同目录原子替换 bootstrap；失败保留旧设置。选中默认目录等同清除覆盖。
+- 自定义目录不能只替换 Rust 的 `app_data_dir()` 调用：同时检查 Tauri asset protocol scope、WebView profile、恢复标记的读写、网关 manifest 和缓存路径。默认 data/cache 路径必须与当前 Tauri resolver 保持一致，用 MockRuntime 回归验证；不改变外部 CLI 的目录解析规则。
+- 更改应用数据目录前必须先恢复所有 Gateway CLI 直连；接管 manifest 与原始备份不自动迁移。目录保存和完整的 Gateway 接管/切换编排共用互斥，待重启期间禁止新增接管，避免丢失原始恢复依据。
+- “备份 → 切目录 → 重启 → 恢复”只迁移备份包实际覆盖的数据，不是整个目录的镜像迁移；独立自定义的 Skills 中央仓库和外部工具目录仍遵循各自设置。
 
 **IMPORTANT**: All data storage and retrieval must go through the service layer API and interact directly with the backend SQLite JSONB database. SurrealDB is only a legacy import source during startup migration.
 
@@ -1031,7 +1048,7 @@ let client = http_client::client(&state).await?;
 let client = http_client::client_with_timeout(&state, 60).await?;
 
 // Bypass proxy (special cases only)
-let client = http_client::client_no_proxy(30)?;
+let client = http_client::create_client_no_proxy(30)?;
 
 // Get proxy URL directly (for non-HTTP use cases like git)
 let proxy_url = http_client::get_proxy_from_settings(&state).await?;
@@ -1042,7 +1059,7 @@ let proxy_url = http_client::get_proxy_from_settings(&state).await?;
 
 1. **NEVER** use `reqwest::Client::new()` or `reqwest::Client::builder()` directly
 2. **ALWAYS** use `http_client::client()` for requests that should respect proxy settings
-3. Use `http_client::client_no_proxy()` only when you explicitly need to bypass proxy
+3. Use `http_client::create_client_no_proxy()` only when you explicitly need to bypass proxy
 4. **For non-HTTP proxy needs** (e.g., git operations, external CLI tools): Use `http_client::get_proxy_from_settings()` to retrieve the proxy URL and apply it appropriately (e.g., set environment variables like `HTTP_PROXY`/`HTTPS_PROXY`)
 
 ### Supported Proxy Formats

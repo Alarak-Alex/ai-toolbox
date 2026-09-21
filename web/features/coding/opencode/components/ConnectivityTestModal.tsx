@@ -14,6 +14,11 @@ import {
   type GatewayConnectivityTestRequest,
 } from '@/services/proxyGatewayApi';
 import type { OpenCodeProvider } from '@/types/opencode';
+import {
+  buildTokenCapFields,
+  resolveModelConnection,
+  type ProviderModelConnections,
+} from '@/features/coding/shared/providerConnectivity/modelConnection';
 import styles from './ConnectivityTestModal.module.less';
 
 
@@ -23,6 +28,10 @@ interface ConnectivityTestModalProps {
   providerId: string;
   providerName: string;
   providerConfig: OpenCodeProvider;
+  apiFormat?: ConnectivityTestRequest['apiFormat'];
+  configValueMode?: ConnectivityTestRequest['configValueMode'];
+  /** Per-model connection overrides (OMP `models.yml` allows per-model api/baseUrl). */
+  modelConnections?: ProviderModelConnections;
   modelIds: string[];
   removableModelIds?: string[];
   diagnostics?: OpenCodeDiagnosticsConfig;
@@ -51,6 +60,9 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
   providerId,
   providerName,
   providerConfig,
+  apiFormat,
+  configValueMode,
+  modelConnections,
   modelIds,
   removableModelIds,
   diagnostics,
@@ -108,9 +120,9 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
     if (open && !prevOpenRef.current) {
       form.setFieldsValue({
         prompt: diagnostics?.prompt || 'say hi!',
-        temperature: diagnostics?.temperature,
-        maxTokens: diagnostics?.maxTokens ?? diagnostics?.maxOutputTokens,
-        stream: diagnostics?.stream ?? true,
+        temperature: apiFormat ? undefined : diagnostics?.temperature,
+        maxTokens: apiFormat ? undefined : diagnostics?.maxTokens ?? diagnostics?.maxOutputTokens,
+        stream: apiFormat ? true : diagnostics?.stream ?? true,
       });
 
       setHeadersJson(diagnostics?.headers || {});
@@ -130,7 +142,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
       })));
     }
     prevOpenRef.current = open;
-  }, [open, diagnostics, modelIds, form, resolvedDefaultTestModelId]);
+  }, [open, diagnostics, modelIds, form, resolvedDefaultTestModelId, apiFormat]);
 
   const handleDefaultTestModelChange = React.useCallback(async (modelId?: string) => {
     setDefaultTestModelId(modelId);
@@ -192,7 +204,6 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
 
       // 1. Save diagnostics configuration
       const npm = providerConfig.npm || '@ai-sdk/openai-compatible';
-      const isGoogle = npm === '@ai-sdk/google';
 
       const headersObject = (headersJson && typeof headersJson === 'object' && !Array.isArray(headersJson))
         ? (headersJson as Record<string, unknown>)
@@ -206,9 +217,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
         defaultTestModelId,
         stream: values.stream,
         ...(values.temperature !== undefined ? { temperature: values.temperature } : {}),
-        ...(values.maxTokens !== undefined
-          ? (isGoogle ? { maxOutputTokens: values.maxTokens } : { maxTokens: values.maxTokens })
-          : {}),
+        ...buildTokenCapFields(npm, values.maxTokens),
         ...(headersObject ? { headers: headersObject } : {}),
         ...(bodyObject ? { body: bodyObject } : {}),
       };
@@ -220,6 +229,8 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
 
       const baseRequest: ConnectivityTestRequest = {
         npm,
+        ...(apiFormat ? { apiFormat } : {}),
+        ...(configValueMode ? { configValueMode } : {}),
         providerId,
         baseUrl: providerConfig.options?.baseURL || '',
         apiKey: providerConfig.options?.apiKey,
@@ -229,9 +240,8 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
         prompt: values.prompt,
         stream: values.stream,
         ...(values.temperature !== undefined ? { temperature: values.temperature } : {}),
-        ...(values.maxTokens !== undefined
-          ? (isGoogle ? { maxOutputTokens: values.maxTokens } : { maxTokens: values.maxTokens })
-          : {}),
+        // The token cap is added per model below: the field name depends on the
+        // SDK that actually serves the request, which a model may override.
         ...(Object.keys(mergedHeaders).length > 0 ? { headers: mergedHeaders } : {}),
         ...(bodyObject ? { body: bodyObject } : {}),
         modelIds: [],
@@ -242,6 +252,10 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
       const failedModelIds: string[] = [];
       const promises = modelsToTest.map(async (modelId) => {
         try {
+          // A model may override the provider's connection (OMP `models.yml`), so
+          // each test follows the model it is probing instead of the provider.
+          const modelRequest = resolveModelConnection(baseRequest, modelId, modelConnections);
+          const request = { ...modelRequest, ...buildTokenCapFields(modelRequest.npm, values.maxTokens) };
           const response = gatewayRequest
             ? await testGatewayProviderModelConnectivity({
                 ...gatewayRequest,
@@ -251,7 +265,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
                 timeoutSecs: 30,
               })
             : await testProviderModelConnectivity({
-                ...baseRequest,
+                ...request,
                 modelIds: [modelId],
               });
 
@@ -267,15 +281,18 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
             }
             return r;
           }));
-        } catch (error: any) {
+        } catch (error: unknown) {
           failedModelIds.push(modelId);
+          // Tauri rejects with the backend error string, so `error.message`
+          // alone would hide messages such as an unresolvable provider API key.
+          const errorMessage = error instanceof Error ? error.message : String(error);
           setResults(prev => prev.map(r => {
             if (r.modelId === modelId) {
               return {
                 key: modelId,
                 modelId,
                 status: 'error',
-                errorMessage: error.message || 'Unknown error',
+                errorMessage: errorMessage || 'Unknown error',
                 loading: false,
                 requestUrl: '',
                 requestHeaders: {},
@@ -606,7 +623,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
                               name="temperature"
                               style={{ marginBottom: 0 }}
                             >
-                              <InputNumber min={0} max={2} step={0.1} style={{ width: '100%' }} />
+                              <InputNumber disabled={!!apiFormat} min={0} max={2} step={0.1} style={{ width: '100%' }} />
                             </Form.Item>
                           </div>
                           <div className={styles.metricCard}>
@@ -617,7 +634,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
                               name="maxTokens"
                               style={{ marginBottom: 0 }}
                             >
-                              <InputNumber min={1} step={100} style={{ width: '100%' }} />
+                              <InputNumber disabled={!!apiFormat} min={1} step={100} style={{ width: '100%' }} />
                             </Form.Item>
                           </div>
                           <div className={styles.metricCard}>
@@ -629,7 +646,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
                               valuePropName="checked"
                               style={{ marginBottom: 0 }}
                             >
-                              <Switch />
+                              <Switch disabled={!!apiFormat} />
                             </Form.Item>
                           </div>
                         </div>

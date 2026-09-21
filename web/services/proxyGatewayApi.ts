@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { GatewayPrivacyDetail } from './gatewayPrivacyApi';
 import type { ConnectivityTestResponse } from './opencodeApi';
 
 const MODEL_PRICING_REMOTE_URL =
@@ -13,7 +14,86 @@ export type GatewayCliKey =
   | 'opencode'
   | 'claude_desktop';
 export type GatewayPricingModelSource = 'upstream' | 'requested';
-export type GatewayProxyMode = 'single' | 'failover';
+export type GatewayProxyMode = 'single' | 'failover' | 'aggregate';
+export type GatewayAggregateNamingMode = 'site_model' | 'model_at_site' | 'model_only';
+
+/**
+ * Aggregate-mode routing config. Every selected site becomes a candidate and
+ * each request is routed by the model name the CLI asked for: the generated
+ * model list exposes `<site_id><separator><model>` and the gateway strips that
+ * prefix before forwarding. Mirrors the backend `AggregateManifestConfig`.
+ */
+export interface GatewayAggregateConfig {
+  /** Selected site ids in display order, which is also the fallback order. */
+  provider_ids: string[];
+  /** Separator between site id and model name. Defaults to `.`. */
+  separator: string;
+  /** Optional selected-site aliases used in aggregate slugs and labels. */
+  aliases?: Record<string, string>;
+  /** Template used to name each selected `(site, model)` pair. */
+  naming?: GatewayAggregateNamingMode;
+  /**
+   * Whether a request may fail over to another selected site when the site its
+   * slug names fails.
+   *
+   * Absent means the backend default, which refuses cross-site failover: the
+   * request fails instead of spending another site's balance.
+   */
+  cross_site_failover?: boolean;
+  /**
+   * Bare upstream model names the generated Codex catalog keeps publishing as
+   * hidden aliases.
+   *
+   * Those entries never appear in Codex's native model picker; they stay
+   * addressable by exact slug (`spawn_agent`, `[agents]` defaults, auto-review)
+   * and are how aggregate mode stays a drop-in replacement for the bare names
+   * the single-provider catalog used to expose. Absent or empty keeps the
+   * default of publishing every declared bare model, so an empty list must
+   * never be read as "publish none".
+   */
+  subagent_exposed_models?: string[];
+  /**
+   * Codex `[agents]` defaults this aggregate takeover owns, if any.
+   *
+   * Aggregate mode replaces the model list, so a bare-name default such as
+   * `gpt-5.6-luna` resolves through the published catalog. Absent when the
+   * takeover wrote no `[agents]` keys, which is also how the restore knows to
+   * leave the user's own settings alone.
+   */
+  subagent?: {
+    model?: string;
+    reasoning_effort?: string;
+  };
+}
+
+/**
+ * One bare model name available to the aggregate catalog's programmable
+ * aliases, with the site that declares it.
+ */
+export interface GatewayAggregateBareModel {
+  model: string;
+  provider_id: string;
+  provider_name: string;
+}
+
+/**
+ * Read-only catalog view behind the aggregate drawer's exposure block.
+ *
+ * `entries` are the hidden aliases the generated catalog currently publishes.
+ * `bare_models` is the full universe the selected sites declare: it is the
+ * candidate list precisely because a name dropped by a narrowed exposure set
+ * must stay selectable again. Older backends omit it, hence the fallback in
+ * `resolveSubagentExposureCandidates`.
+ */
+export interface GatewaySubagentCatalog {
+  cli_key: GatewayCliKey;
+  aggregate_mode: boolean;
+  entries: GatewayAggregateBareModel[];
+  bare_models?: GatewayAggregateBareModel[];
+}
+
+/** Default separator between site id and upstream model name in aggregate mode. */
+export const DEFAULT_AGGREGATE_SEPARATOR = '.';
 
 export interface AppProxyConfig {
   streaming_first_byte_timeout_secs?: number | null;
@@ -51,9 +131,13 @@ export interface ProxyGatewaySettings {
   port_auto_select: boolean;
   wsl_host: string;
   enabled_cli_keys: GatewayCliKey[];
+  /** Opt in to Codex Responses WebSocket; defaults to false for existing settings. */
+  codex_websocket_enabled: boolean;
   request_log_enabled: boolean;
   request_log_level: string;
   metrics_enabled: boolean;
+  /** Whether locally imported CLI session usage shows up in stats and requests. */
+  session_usage_enabled: boolean;
   store_request_body: boolean;
   store_headers: boolean;
   store_response_body: boolean;
@@ -164,6 +248,8 @@ export interface GatewayCliTakeoverStatus {
   managed_targets: GatewayManagedTarget[];
   mode: GatewayProxyMode | null;
   primary_provider_id: string | null;
+  /** Present only for aggregate-mode manifests; absent for single/failover. */
+  aggregate?: GatewayAggregateConfig | null;
   provider_priorities: ProviderPriorityEntry[];
   message: string | null;
 }
@@ -179,7 +265,8 @@ export interface ProxyGatewayRequestLogListInput {
 }
 
 export interface GatewayRequestLogFilters {
-  cli_key?: GatewayCliKey | null;
+  data_source?: 'proxy' | 'session' | null;
+  cli_key?: GatewayUsageTool | null;
   provider_name?: string | null;
   model?: string | null;
   status_code?: number | null;
@@ -204,9 +291,14 @@ export interface GatewayPaginatedRequestLogs {
 }
 
 export interface GatewayRequestLogItem {
+  transport?: 'http' | 'websocket';
+  request_kind?: 'request' | 'websocket_handshake' | 'websocket_warmup';
+  stream_outcome?: 'completed' | 'failed' | 'incomplete' | 'canceled' | null;
+  usage_metadata?: SessionUsageMetadata | null;
+  extra_tokens?: number;
   trace_id: string;
   data_source: string;
-  cli_key: GatewayCliKey;
+  cli_key: GatewayUsageTool;
   route_name?: string | null;
   method?: string | null;
   path?: string | null;
@@ -244,7 +336,7 @@ export interface GatewayUsageSummary {
 }
 
 export interface GatewayUsageSummaryByCli {
-  cli_key: GatewayCliKey;
+  cli_key: GatewayUsageTool;
   summary: GatewayUsageSummary;
 }
 
@@ -260,7 +352,7 @@ export interface GatewayUsageTrendPoint {
 }
 
 export interface GatewayProviderStats {
-  cli_key: GatewayCliKey;
+  cli_key: GatewayUsageTool;
   provider_id: string;
   provider_name: string | null;
   request_count: number;
@@ -272,20 +364,26 @@ export interface GatewayProviderStats {
 }
 
 export interface GatewayModelStats {
-  cli_key: GatewayCliKey;
+  cli_key: GatewayUsageTool;
   model: string;
   request_count: number;
   total_tokens: number;
   total_cost_usd: string;
+  success_rate: number | null;
   avg_latency_ms: number | null;
+  cache_hit_rate: number | null;
 }
 
 export interface GatewayRequestLogSummary {
+  transport?: 'http' | 'websocket';
+  request_kind?: 'request' | 'websocket_handshake' | 'websocket_warmup';
+  stream_outcome?: 'completed' | 'failed' | 'incomplete' | 'canceled' | null;
+  usage_metadata?: SessionUsageMetadata | null;
   trace_id: string;
   data_source?: string | null;
   started_at: string;
   ended_at: string;
-  cli_key: GatewayCliKey | null;
+  cli_key: GatewayUsageTool | null;
   route_name: string;
   method: string;
   path: string;
@@ -328,6 +426,19 @@ export interface GatewayProviderAttempt {
 }
 
 export interface GatewayRequestLogDetail extends GatewayRequestLogSummary {
+  privacy?: GatewayPrivacyDetail | null;
+  websocket?: {
+    connection_id: string;
+    response_id: string | null;
+    stream_id: string | null;
+    previous_response_id: string | null;
+    event_type: string | null;
+    handshake_status: number;
+    upstream_handshake_status: number | null;
+    error_status: number | null;
+    fallback_reason: string | null;
+    handshake_attempts?: GatewayProviderAttempt[];
+  } | null;
   request_headers: Record<string, string> | null;
   request_body: string | null;
   upstream_request_body: string | null;
@@ -355,7 +466,7 @@ export interface GatewayModelHealthItem {
   last_error_category: string | null;
 }
 
-export type GatewaySessionImportCli = 'all' | GatewayCliKey;
+export type GatewaySessionImportCli = 'all' | GatewayUsageTool;
 
 export interface GatewaySessionUsageImportInput {
   cli_key: GatewaySessionImportCli;
@@ -371,7 +482,7 @@ export interface GatewaySessionUsageImportResult {
 }
 
 export interface DataSourceBreakdownInput {
-  cli_key?: GatewayCliKey | null;
+  cli_key?: GatewayUsageTool | null;
   start_unix_secs?: number | null;
   end_unix_secs?: number | null;
 }
@@ -510,6 +621,79 @@ export const engageProxyGatewayFailover = async (
   return invoke<GatewayCliTakeoverStatus>('proxy_gateway_engage_failover', { cliKey });
 };
 
+export const engageProxyGatewayAggregate = async (
+  cliKey: GatewayCliKey,
+  providerIds: string[],
+  separator: string,
+  aliases?: Record<string, string>,
+  naming: GatewayAggregateNamingMode = 'site_model',
+  subagentModel?: string,
+  subagentReasoningEffort?: string,
+  crossSiteFailover?: boolean,
+  subagentExposedModels?: string[],
+): Promise<GatewayCliTakeoverStatus> => {
+  return invoke<GatewayCliTakeoverStatus>('proxy_gateway_engage_aggregate', {
+    cliKey,
+    providerIds,
+    separator,
+    aliases: aliases ?? {},
+    naming,
+    subagentModel,
+    subagentReasoningEffort,
+    crossSiteFailover: crossSiteFailover ?? false,
+    // Always a concrete set: an empty array is the backend's "publish every
+    // bare model" default and is exactly what "expose all" sends.
+    subagentExposedModels: subagentExposedModels ?? [],
+  });
+};
+
+/**
+ * Read the saved aggregate draft: the site selection the settings page shows
+ * while aggregate mode is not engaged.
+ */
+export const getProxyGatewayAggregateDraft = async (
+  cliKey: GatewayCliKey,
+): Promise<GatewayAggregateConfig | null> => {
+  return invoke<GatewayAggregateConfig | null>('proxy_gateway_aggregate_draft', { cliKey });
+};
+
+/**
+ * Read the hidden bare-name aliases the aggregate catalog publishes, plus the
+ * full universe the selected sites declare.
+ *
+ * Read-only and local-only: it reads the engaged manifest, the generated
+ * catalog file and the selected providers' declared models.
+ */
+export const getProxyGatewaySubagentCatalog = async (
+  cliKey: GatewayCliKey,
+): Promise<GatewaySubagentCatalog> =>
+  invoke<GatewaySubagentCatalog>('proxy_gateway_subagent_catalog', { cliKey });
+
+/**
+ * Persist the aggregate draft without engaging the mode, so the selection
+ * survives closing the editor. No CLI runtime config is rewritten and the
+ * gateway does not have to be running.
+ */
+export const saveProxyGatewayAggregateDraft = async (
+  cliKey: GatewayCliKey,
+  providerIds: string[],
+  separator: string,
+  aliases?: Record<string, string>,
+  naming: GatewayAggregateNamingMode = 'site_model',
+  crossSiteFailover?: boolean,
+  subagentExposedModels?: string[],
+): Promise<GatewayAggregateConfig> => {
+  return invoke<GatewayAggregateConfig>('proxy_gateway_save_aggregate_draft', {
+    cliKey,
+    providerIds,
+    separator,
+    aliases: aliases ?? {},
+    naming,
+    crossSiteFailover: crossSiteFailover ?? false,
+    subagentExposedModels: subagentExposedModels ?? [],
+  });
+};
+
 export const disengageProxyGatewayFailover = async (
   cliKey: GatewayCliKey
 ): Promise<GatewayCliTakeoverStatus> => {
@@ -563,7 +747,7 @@ export const exportProxyGatewayRequestLogDetail = async (
 export const getProxyGatewayUsageSummary = async (
   startDate?: number,
   endDate?: number,
-  cliKey?: GatewayCliKey
+  cliKey?: GatewayUsageTool
 ): Promise<GatewayUsageSummary> => {
   return invoke<GatewayUsageSummary>('proxy_gateway_usage_summary', {
     startDate: startDate ?? null,
@@ -585,7 +769,7 @@ export const getProxyGatewayUsageSummaryByCli = async (
 export const getProxyGatewayUsageTrends = async (
   startDate?: number,
   endDate?: number,
-  cliKey?: GatewayCliKey
+  cliKey?: GatewayUsageTool
 ): Promise<GatewayUsageTrendPoint[]> => {
   return invoke<GatewayUsageTrendPoint[]>('proxy_gateway_usage_trends', {
     startDate: startDate ?? null,
@@ -597,7 +781,7 @@ export const getProxyGatewayUsageTrends = async (
 export const getProxyGatewayProviderStats = async (
   startDate?: number,
   endDate?: number,
-  cliKey?: GatewayCliKey
+  cliKey?: GatewayUsageTool
 ): Promise<GatewayProviderStats[]> => {
   return invoke<GatewayProviderStats[]>('proxy_gateway_provider_stats', {
     startDate: startDate ?? null,
@@ -609,7 +793,7 @@ export const getProxyGatewayProviderStats = async (
 export const getProxyGatewayModelStats = async (
   startDate?: number,
   endDate?: number,
-  cliKey?: GatewayCliKey
+  cliKey?: GatewayUsageTool
 ): Promise<GatewayModelStats[]> => {
   return invoke<GatewayModelStats[]>('proxy_gateway_model_stats', {
     startDate: startDate ?? null,
@@ -639,3 +823,22 @@ export const getProxyGatewayDataSourceBreakdown = async (
 export const listProxyGatewayModelHealthEntries = async (): Promise<GatewayModelHealthItem[]> => {
   return invoke<GatewayModelHealthItem[]>('proxy_gateway_model_health_entries');
 };
+
+/** Collecting local usage does not enable proxy takeover for a tool. */
+export type GatewayUsageTool = GatewayCliKey | 'pi' | 'oh_my_pi' | 'dsh' | 'hermes' | 'openclaw' | 'kimi_cli';
+
+export const GATEWAY_USAGE_TOOLS: readonly GatewayUsageTool[] = [
+  'claude', 'claude_desktop', 'codex', 'grok', 'kimi', 'gemini', 'opencode',
+  'pi', 'oh_my_pi', 'dsh', 'hermes', 'openclaw', 'kimi_cli',
+];
+
+export interface SessionUsageMetadata {
+  granularity: 'request' | 'turn' | 'session';
+  native_provider?: string | null;
+  call_count?: number | null;
+  reported_total_tokens?: number | null;
+  incomplete: boolean;
+  cost_source?: string | null;
+  window_start?: number | null;
+  window_end?: number | null;
+}

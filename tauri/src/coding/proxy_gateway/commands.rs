@@ -1,3 +1,5 @@
+use super::aggregate_draft;
+use super::aggregate_naming::AggregateNamingMode;
 use super::cli_proxy;
 use super::listen::check_port_available;
 use super::model_health;
@@ -9,11 +11,13 @@ use super::runtime::ProxyGatewayState;
 use super::session_import;
 use super::settings;
 use super::types::{
-    DataSourceBreakdownInput, DataSourceBreakdownItem, GatewayCliKey, GatewayCliTakeoverStatus,
+    DataSourceBreakdownInput, DataSourceBreakdownItem, GatewayAggregateBareModel,
+    GatewayAggregateConfig, GatewayCliKey, GatewayCliTakeoverStatus,
     GatewayConnectivityTestRequest, GatewayConnectivityTestResponse, GatewayModelHealthItem,
-    GatewayModelStats, GatewayPaginatedRequestLogs, GatewayProviderStats, GatewayRequestLogDetail,
-    GatewayRequestLogFilters, GatewaySessionUsageImportInput, GatewaySessionUsageImportResult,
-    GatewayUsageSummary, GatewayUsageSummaryByCli, GatewayUsageTrendPoint, ModelPricing,
+    GatewayModelStats, GatewayPaginatedRequestLogs, GatewayProviderStats, GatewayProxyMode,
+    GatewayRequestLogDetail, GatewayRequestLogFilters, GatewaySessionUsageImportInput,
+    GatewaySessionUsageImportResult, GatewaySubagentCatalog, GatewayUsageSummary,
+    GatewayUsageSummaryByCli, GatewayUsageTool, GatewayUsageTrendPoint, ModelPricing,
     ProxyGatewayHealthCheckResult, ProxyGatewayPortCheckInput, ProxyGatewayPortCheckResult,
     ProxyGatewayRequestLogListInput, ProxyGatewaySettings, ProxyGatewayStatus,
     ProxyGatewayStopPreflight,
@@ -26,7 +30,7 @@ use chrono::Utc;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 
 pub async fn proxy_gateway_start_if_enabled_on_startup(
     db_state: &SqliteDbState,
@@ -54,6 +58,37 @@ pub async fn proxy_gateway_get_settings(
     sqlite_state: tauri::State<'_, SqliteDbState>,
 ) -> Result<ProxyGatewaySettings, String> {
     settings::load_settings_from_sqlite_state(&sqlite_state)
+}
+
+#[tauri::command]
+pub async fn proxy_gateway_get_privacy_settings(
+    sqlite_state: tauri::State<'_, SqliteDbState>,
+) -> Result<super::privacy::PrivacySettings, String> {
+    super::privacy::load_settings(&sqlite_state)
+}
+
+#[tauri::command]
+pub async fn proxy_gateway_update_privacy_settings(
+    gateway_state: tauri::State<'_, ProxyGatewayState>,
+    sqlite_state: tauri::State<'_, SqliteDbState>,
+    update: super::privacy::PrivacySettingsUpdate,
+) -> Result<super::privacy::PrivacySettings, String> {
+    // Serialize with start/restart and other policy updates. Publish only after persistence succeeds.
+    let manager = gateway_state
+        .manager
+        .lock()
+        .map_err(|_| "Proxy gateway manager lock poisoned")?;
+    let (settings, policy) = super::privacy::update_settings(&sqlite_state, update)?;
+    manager.update_privacy_policy(policy);
+    Ok(settings)
+}
+
+#[tauri::command]
+pub async fn proxy_gateway_preview_privacy(
+    rules: super::privacy::PrivacyRules,
+    text: String,
+) -> Result<super::privacy::PrivacyPreview, String> {
+    super::privacy::preview(rules, text)
 }
 
 #[tauri::command]
@@ -290,6 +325,8 @@ pub async fn proxy_gateway_engage_single(
     cli_key: GatewayCliKey,
     provider_id: String,
 ) -> Result<GatewayCliTakeoverStatus, String> {
+    let _data_dir_transition = crate::app_paths::DATA_DIR_CHANGE_LOCK.lock().await;
+    crate::app_paths::ensure_no_pending_data_dir_change()?;
     let status = {
         let manager = gateway_state
             .manager
@@ -312,6 +349,8 @@ pub async fn proxy_gateway_engage_failover(
     app: tauri::AppHandle,
     cli_key: GatewayCliKey,
 ) -> Result<GatewayCliTakeoverStatus, String> {
+    let _data_dir_transition = crate::app_paths::DATA_DIR_CHANGE_LOCK.lock().await;
+    crate::app_paths::ensure_no_pending_data_dir_change()?;
     let status = {
         let manager = gateway_state
             .manager
@@ -325,6 +364,255 @@ pub async fn proxy_gateway_engage_failover(
     gateway_state.clear_provider_cache()?;
     emit_gateway_cli_wsl_sync_request(&app, cli_key);
     Ok(next_status)
+}
+
+/// Engage aggregate mode for Codex: one model list across the selected sites.
+///
+/// `provider_ids` is the user's selected sites in display order; `separator` is
+/// the string placed between the site id and the model name in the generated
+/// catalog (default `.`).
+#[tauri::command]
+pub async fn proxy_gateway_engage_aggregate(
+    gateway_state: tauri::State<'_, ProxyGatewayState>,
+    db_state: tauri::State<'_, SqliteDbState>,
+    app: tauri::AppHandle,
+    cli_key: GatewayCliKey,
+    provider_ids: Vec<String>,
+    separator: Option<String>,
+    aliases: Option<BTreeMap<String, String>>,
+    naming: Option<AggregateNamingMode>,
+    cross_site_failover: Option<bool>,
+    subagent_exposed_models: Option<std::collections::BTreeSet<String>>,
+    subagent_model: Option<String>,
+    subagent_reasoning_effort: Option<String>,
+) -> Result<GatewayCliTakeoverStatus, String> {
+    let _data_dir_transition = crate::app_paths::DATA_DIR_CHANGE_LOCK.lock().await;
+    crate::app_paths::ensure_no_pending_data_dir_change()?;
+    let status = {
+        let manager = gateway_state
+            .manager
+            .lock()
+            .map_err(|_| "Proxy gateway manager lock poisoned".to_string())?;
+        manager.status()
+    };
+    let paths = proxy_gateway_paths(&app)?;
+    let separator = separator
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| cli_proxy::manifest::AGGREGATE_DEFAULT_SEPARATOR.to_string());
+    // Opt-in Codex `[agents]` defaults. Blank values mean "leave the user's
+    // config alone", so an untouched form never writes these keys.
+    let subagent_defaults =
+        crate::coding::proxy_gateway::cli_proxy::manifest::AggregateSubagentDefaults {
+            model: subagent_model,
+            reasoning_effort: subagent_reasoning_effort,
+        }
+        .normalized();
+    let next_status = cli_proxy::engage_aggregate_cli(
+        db_state.db(),
+        &paths,
+        cli_key,
+        &status,
+        provider_ids,
+        separator,
+        aliases.unwrap_or_default(),
+        naming.unwrap_or_default(),
+        cross_site_failover.unwrap_or(false),
+        subagent_exposed_models.unwrap_or_default(),
+        subagent_defaults,
+    )
+    .await?;
+    gateway_state.clear_provider_cache()?;
+    emit_gateway_cli_wsl_sync_request(&app, cli_key);
+    Ok(next_status)
+}
+
+/// Read the saved aggregate draft: the site selection the settings page shows
+/// while aggregate mode is not engaged.
+#[tauri::command]
+pub async fn proxy_gateway_aggregate_draft(
+    app: tauri::AppHandle,
+    cli_key: GatewayCliKey,
+) -> Result<Option<GatewayAggregateConfig>, String> {
+    let paths = proxy_gateway_paths(&app)?;
+    Ok(aggregate_draft::load_aggregate_draft(&paths, cli_key))
+}
+
+/// Persist the aggregate draft without engaging the mode.
+///
+/// This is not an engage command: the gateway does not have to be running and no
+/// CLI runtime config is rewritten, so a user can prepare the site selection
+/// first and enable it later.
+#[tauri::command]
+pub async fn proxy_gateway_save_aggregate_draft(
+    db_state: tauri::State<'_, SqliteDbState>,
+    app: tauri::AppHandle,
+    cli_key: GatewayCliKey,
+    provider_ids: Vec<String>,
+    separator: Option<String>,
+    aliases: Option<BTreeMap<String, String>>,
+    naming: Option<AggregateNamingMode>,
+    cross_site_failover: Option<bool>,
+    subagent_exposed_models: Option<std::collections::BTreeSet<String>>,
+) -> Result<GatewayAggregateConfig, String> {
+    let paths = proxy_gateway_paths(&app)?;
+    let separator =
+        separator.unwrap_or_else(|| cli_proxy::manifest::AGGREGATE_DEFAULT_SEPARATOR.to_string());
+    cli_proxy::save_aggregate_draft(
+        db_state.db(),
+        &paths,
+        cli_key,
+        GatewayAggregateConfig {
+            provider_ids,
+            separator,
+            aliases: aliases.unwrap_or_default(),
+            naming: naming.unwrap_or_default(),
+            cross_site_failover: cross_site_failover.unwrap_or(false),
+            subagent_exposed_models: subagent_exposed_models.unwrap_or_default(),
+            // The draft stores the site selection; the `[agents]` defaults are
+            // only written when the mode is actually engaged.
+            subagent: None,
+        },
+    )
+    .await
+}
+
+/// Read the aggregate catalog's programmable bare names for the settings drawer.
+///
+/// Read-only and local-only: it reads the manifest plus, when an aggregate
+/// takeover is enabled, the generated catalog file and the selected providers'
+/// declared models. It never contacts an upstream endpoint and never writes.
+///
+/// `bare_models` is the full universe the selected sites declare, which is
+/// deliberately *not* the same as `entries` (the names the catalog publishes as
+/// hidden aliases): narrowing the exposure set removes entries, and only the
+/// universe keeps a removed name selectable again.
+#[tauri::command]
+pub async fn proxy_gateway_subagent_catalog(
+    db_state: tauri::State<'_, SqliteDbState>,
+    app: tauri::AppHandle,
+    cli_key: GatewayCliKey,
+) -> Result<GatewaySubagentCatalog, String> {
+    if cli_key != GatewayCliKey::Codex {
+        return Ok(GatewaySubagentCatalog {
+            cli_key,
+            aggregate_mode: false,
+            entries: Vec::new(),
+            bare_models: Vec::new(),
+        });
+    }
+    let empty = |aggregate_mode: bool| GatewaySubagentCatalog {
+        cli_key,
+        aggregate_mode,
+        entries: Vec::new(),
+        bare_models: Vec::new(),
+    };
+    let paths = proxy_gateway_paths(&app)?;
+    let Some(manifest) = cli_proxy::read_manifest_for_catalog(&paths, cli_key)? else {
+        return Ok(empty(false));
+    };
+    if !manifest.enabled || manifest.mode != GatewayProxyMode::Aggregate {
+        return Ok(empty(false));
+    }
+    let aggregate = manifest.aggregate.clone().unwrap_or_default();
+    let providers = super::runtime::load_candidate_providers(db_state.db(), cli_key).await?;
+    // Universe: the models the selected sites declare, first site wins. This is
+    // the same source the published catalog is built from, so the two can never
+    // describe different name sets.
+    let selected_sites = aggregate
+        .provider_ids
+        .iter()
+        .filter_map(|site_id| {
+            providers
+                .iter()
+                .find(|provider| &provider.id == site_id)
+                .map(|provider| (provider.id.clone(), provider.meta.declared_models.clone()))
+        })
+        .collect::<Vec<_>>();
+    let universe = super::aggregate_naming::build_aggregate_bare_model_universe(&selected_sites);
+    let describe = |site_id: &str, model: &str| GatewayAggregateBareModel {
+        model: model.to_string(),
+        provider_id: site_id.to_string(),
+        provider_name: providers
+            .iter()
+            .find(|provider| provider.id == site_id)
+            .map(|provider| provider.name.clone())
+            .unwrap_or_default(),
+    };
+    // The hidden aliases the generated catalog currently publishes, read from
+    // the catalog file instead of re-derived: the exposure set (or a hand-edited
+    // catalog) is what Codex actually sees. Names the universe does not know
+    // are still reported, with no owning site.
+    let published = read_generated_hidden_alias_models(db_state.db())
+        .await
+        .into_iter()
+        .map(|model| {
+            universe
+                .iter()
+                .find(|entry| entry.model == model)
+                .map(|entry| describe(&entry.site_id, &entry.model))
+                .unwrap_or(GatewayAggregateBareModel {
+                    model,
+                    provider_id: String::new(),
+                    provider_name: String::new(),
+                })
+        })
+        .collect::<Vec<_>>();
+    // A legacy manifest whose selected sites cannot be resolved right now has no
+    // universe; fall back to the published names so the drawer still lists what
+    // can be selected instead of looking empty.
+    let bare_models = if universe.is_empty() {
+        published
+            .iter()
+            .map(|entry| GatewayAggregateBareModel {
+                model: entry.model.clone(),
+                provider_id: String::new(),
+                provider_name: String::new(),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        universe
+            .iter()
+            .map(|entry| describe(&entry.site_id, &entry.model))
+            .collect::<Vec<_>>()
+    };
+    Ok(GatewaySubagentCatalog {
+        cli_key,
+        aggregate_mode: true,
+        entries: published,
+        bare_models,
+    })
+}
+
+/// Hidden bare-name alias slugs of the currently generated Codex catalog.
+///
+/// Best-effort: a missing or unreadable catalog file yields an empty list, so
+/// browsing the drawer can never fail the settings page.
+async fn read_generated_hidden_alias_models(db: &SqliteDbState) -> Vec<String> {
+    use crate::coding::codex::constants::AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME;
+
+    let Ok(config_dir) =
+        crate::coding::codex::commands::get_codex_config_dir_from_db_async(db).await
+    else {
+        return Vec::new();
+    };
+    let Ok(content) =
+        std::fs::read_to_string(config_dir.join(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME))
+    else {
+        return Vec::new();
+    };
+    let Ok(catalog) = serde_json::from_str::<Value>(&content) else {
+        return Vec::new();
+    };
+    catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("visibility").and_then(Value::as_str) == Some("hide"))
+        .filter_map(|item| item.get("slug").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 #[tauri::command]
@@ -413,6 +701,7 @@ pub fn proxy_gateway_request_logs(
         &filters.unwrap_or_default(),
         page.unwrap_or(0),
         page_size,
+        session_usage_enabled(&db_state)?,
     )
 }
 
@@ -536,8 +825,10 @@ fn build_request_log_detail_export(detail: &GatewayRequestLogDetail) -> Value {
     let mut summary_value = serde_json::to_value(summary).unwrap_or(Value::Null);
     let mut provider_attempts_value =
         serde_json::to_value(&detail.provider_attempts).unwrap_or(Value::Null);
+    let mut websocket_value = serde_json::to_value(&detail.websocket).unwrap_or(Value::Null);
     redact_json_value(&mut summary_value);
     redact_json_value(&mut provider_attempts_value);
+    redact_json_value(&mut websocket_value);
     serde_json::json!({
         "schema_version": 1,
         "exported_at": Utc::now().to_rfc3339(),
@@ -547,6 +838,8 @@ fn build_request_log_detail_export(detail: &GatewayRequestLogDetail) -> Value {
         },
         "summary": summary_value,
         "provider_attempts": provider_attempts_value,
+        "websocket": websocket_value,
+        "privacy": detail.privacy,
         "request": {
             "headers": redact_header_map(detail.request_headers.as_ref()),
             "body_before_conversion": redact_body(detail.request_body.as_deref()),
@@ -904,16 +1197,20 @@ mod tests {
         assert_eq!(redacted, "https://example.test/search?monkey=value&alt=sse");
     }
 
-    #[test]
-    fn display_sanitization_redacts_path_and_upstream_url_queries() {
+    fn request_detail_fixture() -> GatewayRequestLogDetail {
         let now = Utc::now();
         let detail = GatewayRequestLogDetail {
+            privacy: None,
+            websocket: None,
             summary: GatewayRequestLogSummary {
+                transport: Default::default(),
+                request_kind: Default::default(),
+                usage_metadata: None,
                 data_source: None,
                 trace_id: "trace-redact-display".to_string(),
                 started_at: now,
                 ended_at: now,
-                cli_key: Some(GatewayCliKey::Gemini),
+                cli_key: Some(GatewayCliKey::Gemini.into()),
                 route_name: "gemini".to_string(),
                 method: "GET".to_string(),
                 path: "/gemini/v1beta/models?key=secret&api%5Fkey=encoded&api-key=hyphen&client-secret=clientSecretValue&alt=sse".to_string(),
@@ -960,7 +1257,61 @@ mod tests {
             provider_attempts: Vec::new(),
         };
 
-        let sanitized = sanitize_request_log_detail_for_display(detail);
+        detail
+    }
+
+    #[test]
+    fn websocket_export_includes_transport_lifecycle_and_handshake_details() {
+        use super::super::types::{
+            GatewayRequestTransport, GatewayStreamOutcome, GatewayWebSocketMetadata,
+        };
+        let mut detail = request_detail_fixture();
+        detail.summary.transport = GatewayRequestTransport::Websocket;
+        detail.summary.status_code = None;
+        detail.summary.stream_outcome = Some(GatewayStreamOutcome::Completed);
+        detail.websocket = Some(GatewayWebSocketMetadata {
+            connection_id: "connection-export".to_string(),
+            response_id: Some("response-export".to_string()),
+            previous_response_id: Some("previous-export".to_string()),
+            stream_id: Some("lane-export".to_string()),
+            handshake_status: 101,
+            upstream_handshake_status: Some(101),
+            ..Default::default()
+        });
+        let exported = build_request_log_detail_export(&detail);
+        assert_eq!(exported["summary"]["transport"], "websocket");
+        assert!(exported["summary"]["status_code"].is_null());
+        assert_eq!(exported["summary"]["stream_outcome"], "completed");
+        assert_eq!(exported["websocket"]["connection_id"], "connection-export");
+        assert_eq!(exported["websocket"]["response_id"], "response-export");
+        assert_eq!(
+            exported["websocket"]["previous_response_id"],
+            "previous-export"
+        );
+        assert_eq!(exported["websocket"]["stream_id"], "lane-export");
+        assert_eq!(exported["websocket"]["handshake_status"], 101);
+        assert!(!exported.to_string().contains("key=secret"));
+    }
+
+    #[test]
+    fn privacy_export_keeps_the_recorded_log_redaction_marker() {
+        let mut detail = request_detail_fixture();
+        detail.privacy = Some(super::super::privacy::PrivacyDetail {
+            matched_values: 1,
+            restored_values: 2,
+            log_redacted: true,
+            ..Default::default()
+        });
+        let exported = build_request_log_detail_export(&detail);
+        assert_eq!(exported["privacy"]["log_redacted"], true);
+        assert_eq!(exported["privacy"]["matched_values"], 1);
+        assert_eq!(exported["privacy"]["restored_values"], 2);
+        assert!(exported["privacy"].get("mapping").is_none());
+    }
+
+    #[test]
+    fn display_sanitization_redacts_path_and_upstream_url_queries() {
+        let sanitized = sanitize_request_log_detail_for_display(request_detail_fixture());
 
         assert_eq!(
             sanitized.summary.path,
@@ -986,9 +1337,10 @@ pub fn proxy_gateway_usage_summary(
     db_state: tauri::State<'_, SqliteDbState>,
     start_date: Option<i64>,
     end_date: Option<i64>,
-    cli_key: Option<GatewayCliKey>,
+    cli_key: Option<GatewayUsageTool>,
 ) -> Result<GatewayUsageSummary, String> {
-    usage_stats::usage_summary(&db_state, start_date, end_date, cli_key)
+    let include_session = session_usage_enabled(&db_state)?;
+    usage_stats::usage_summary(&db_state, start_date, end_date, cli_key, include_session)
 }
 
 #[tauri::command]
@@ -997,7 +1349,8 @@ pub fn proxy_gateway_usage_summary_by_cli(
     start_date: Option<i64>,
     end_date: Option<i64>,
 ) -> Result<Vec<GatewayUsageSummaryByCli>, String> {
-    usage_stats::usage_summary_by_cli(&db_state, start_date, end_date)
+    let include_session = session_usage_enabled(&db_state)?;
+    usage_stats::usage_summary_by_cli(&db_state, start_date, end_date, include_session)
 }
 
 #[tauri::command]
@@ -1005,9 +1358,10 @@ pub fn proxy_gateway_usage_trends(
     db_state: tauri::State<'_, SqliteDbState>,
     start_date: Option<i64>,
     end_date: Option<i64>,
-    cli_key: Option<GatewayCliKey>,
+    cli_key: Option<GatewayUsageTool>,
 ) -> Result<Vec<GatewayUsageTrendPoint>, String> {
-    usage_stats::usage_trends(&db_state, start_date, end_date, cli_key)
+    let include_session = session_usage_enabled(&db_state)?;
+    usage_stats::usage_trends(&db_state, start_date, end_date, cli_key, include_session)
 }
 
 #[tauri::command]
@@ -1015,9 +1369,10 @@ pub fn proxy_gateway_provider_stats(
     db_state: tauri::State<'_, SqliteDbState>,
     start_date: Option<i64>,
     end_date: Option<i64>,
-    cli_key: Option<GatewayCliKey>,
+    cli_key: Option<GatewayUsageTool>,
 ) -> Result<Vec<GatewayProviderStats>, String> {
-    usage_stats::provider_stats(&db_state, start_date, end_date, cli_key)
+    let include_session = session_usage_enabled(&db_state)?;
+    usage_stats::provider_stats(&db_state, start_date, end_date, cli_key, include_session)
 }
 
 #[tauri::command]
@@ -1025,9 +1380,10 @@ pub fn proxy_gateway_model_stats(
     db_state: tauri::State<'_, SqliteDbState>,
     start_date: Option<i64>,
     end_date: Option<i64>,
-    cli_key: Option<GatewayCliKey>,
+    cli_key: Option<GatewayUsageTool>,
 ) -> Result<Vec<GatewayModelStats>, String> {
-    usage_stats::model_stats(&db_state, start_date, end_date, cli_key)
+    let include_session = session_usage_enabled(&db_state)?;
+    usage_stats::model_stats(&db_state, start_date, end_date, cli_key, include_session)
 }
 
 #[tauri::command]
@@ -1035,7 +1391,8 @@ pub fn proxy_gateway_data_source_breakdown(
     db_state: tauri::State<'_, SqliteDbState>,
     input: Option<DataSourceBreakdownInput>,
 ) -> Result<Vec<DataSourceBreakdownItem>, String> {
-    usage_stats::data_source_breakdown(&db_state, input.unwrap_or_default())
+    let include_session = session_usage_enabled(&db_state)?;
+    usage_stats::data_source_breakdown(&db_state, input.unwrap_or_default(), include_session)
 }
 
 #[tauri::command]
@@ -1044,9 +1401,16 @@ pub async fn proxy_gateway_import_session_usage(
     db_state: tauri::State<'_, SqliteDbState>,
     input: GatewaySessionUsageImportInput,
 ) -> Result<GatewaySessionUsageImportResult, String> {
+    // Gating by `session_usage_enabled` lives inside `import_session_usage`, so
+    // the 60s background scheduler and this command share one authority.
     let result = session_import::import_session_usage(db_state.db().clone(), input).await?;
     session_import::notify_usage_changed(&app, &result);
     Ok(result)
+}
+
+/// Reads the local-session-usage display toggle from gateway settings.
+fn session_usage_enabled(db_state: &SqliteDbState) -> Result<bool, String> {
+    Ok(settings::load_settings_from_sqlite_state(db_state)?.session_usage_enabled)
 }
 
 #[tauri::command]
@@ -1144,10 +1508,8 @@ pub async fn proxy_gateway_test_provider_model_connectivity(
 }
 
 fn proxy_gateway_paths(app: &tauri::AppHandle) -> Result<ProxyGatewayPaths, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    let app_data_dir = crate::app_paths::resolved_data_dir();
+    let _ = app; // data dir is resolved from the bootstrap override cache
     Ok(ProxyGatewayPaths::new(app_data_dir))
 }
 

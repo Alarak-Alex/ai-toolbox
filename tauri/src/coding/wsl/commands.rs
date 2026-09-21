@@ -20,12 +20,12 @@ use crate::coding::proxy_gateway::{
     types::ProxyGatewaySettings,
 };
 use crate::coding::runtime_location;
-use crate::db::helpers::{db_delete, db_delete_all, db_get, db_list, db_put};
+use crate::db::helpers::{db_delete, db_delete_all, db_get, db_list, db_patch_fields, db_put};
 use crate::db::schema::{DbTable, OrderDirection, OrderField, OrderSpec};
 use crate::db::SqliteDbState;
 use chrono::Local;
 use std::path::Path;
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 
 // ============================================================================
 // WSL Detection Commands
@@ -80,6 +80,36 @@ fn load_wsl_config(state: &SqliteDbState) -> Result<WSLSyncConfig, String> {
     })
 }
 
+fn patch_wsl_config_record(
+    state: &SqliteDbState,
+    fields: &[(&str, serde_json::Value)],
+) -> Result<(), String> {
+    // Keep the complete read/modify/write under one connection lock. Settings,
+    // file sync status, and Skills warnings can be updated independently.
+    state.with_conn(|conn| {
+        if db_get(conn, DbTable::WslSyncConfig, "config")?.is_none() {
+            db_put(
+                conn,
+                DbTable::WslSyncConfig,
+                "config",
+                &adapter::config_to_db_value(&WSLSyncConfig::default()),
+            )?;
+        }
+        db_patch_fields(conn, DbTable::WslSyncConfig, "config", fields)?;
+        Ok(())
+    })
+}
+
+fn save_wsl_config_record(state: &SqliteDbState, config: &WSLSyncConfig) -> Result<(), String> {
+    patch_wsl_config_record(
+        state,
+        &[
+            ("enabled", serde_json::json!(config.enabled)),
+            ("distro", serde_json::json!(config.distro)),
+        ],
+    )
+}
+
 fn load_wsl_file_mappings(state: &SqliteDbState) -> Result<Vec<FileMapping>, String> {
     let order = wsl_mapping_order()?;
     state.with_conn(|conn| {
@@ -131,38 +161,7 @@ pub async fn wsl_save_config(
     }
 
     {
-        // Save config
-        let existing_status = state
-            .with_conn(|conn| db_get(conn, DbTable::WslSyncConfig, "config"))
-            .ok()
-            .flatten();
-
-        let mut config_data = adapter::config_to_db_value(&config);
-        if let Some(payload) = config_data.as_object_mut() {
-            payload.insert(
-                "last_sync_time".to_string(),
-                existing_status
-                    .as_ref()
-                    .and_then(|row| row.get("last_sync_time").cloned())
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            payload.insert(
-                "last_sync_status".to_string(),
-                existing_status
-                    .as_ref()
-                    .and_then(|row| row.get("last_sync_status").cloned())
-                    .unwrap_or_else(|| serde_json::Value::String("never".to_string())),
-            );
-            payload.insert(
-                "last_sync_error".to_string(),
-                existing_status
-                    .as_ref()
-                    .and_then(|row| row.get("last_sync_error").cloned())
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
-
-        state.with_conn(|conn| db_put(conn, DbTable::WslSyncConfig, "config", &config_data))?;
+        save_wsl_config_record(&state, &config)?;
 
         // Update file mappings - follow open_code/free_models pattern: use backtick format table:`id`
         for mapping in config.file_mappings.iter() {
@@ -292,6 +291,7 @@ pub(super) async fn do_full_sync(
                 synced_files: vec![],
                 skipped_files: vec![],
                 errors: vec![error],
+                warnings: vec![],
             };
         }
     };
@@ -307,6 +307,7 @@ pub(super) async fn do_full_sync(
                 synced_files: vec![],
                 skipped_files: vec![],
                 errors: vec![e],
+                warnings: vec![],
             };
         }
     };
@@ -360,7 +361,15 @@ pub(super) async fn do_full_sync(
         }
     }
     if config.sync_skills {
-        if let Err(e) = super::skills_sync::sync_skills_to_wsl(state, app.clone()).await {
+        let mut skills_warnings = Vec::new();
+        let skills_result = super::skills_sync::sync_skills_to_wsl_with_warnings(
+            state,
+            app.clone(),
+            &mut skills_warnings,
+        )
+        .await;
+        result.warnings.extend(skills_warnings);
+        if let Err(e) = skills_result {
             log::warn!("Skills WSL sync failed: {}", e);
             result.errors.push(format!("Skills sync: {}", e));
             result.success = false;
@@ -453,7 +462,7 @@ struct GatewayWslRewriteContext {
 
 fn build_gateway_wsl_rewrite_context(
     db: &SqliteDbState,
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
 ) -> Option<GatewayWslRewriteContext> {
     let settings = match proxy_gateway_settings::load_settings_from_sqlite_state(db) {
         Ok(settings) => settings,
@@ -466,13 +475,7 @@ fn build_gateway_wsl_rewrite_context(
         return None;
     }
 
-    let app_data_dir = match app.path().app_data_dir() {
-        Ok(path) => path,
-        Err(error) => {
-            log::warn!("Gateway WSL endpoint rewrite skipped: {}", error);
-            return None;
-        }
-    };
+    let app_data_dir = crate::app_paths::resolved_data_dir();
 
     Some(GatewayWslRewriteContext {
         paths: ProxyGatewayPaths::new(app_data_dir),
@@ -563,6 +566,7 @@ fn sync_mappings_with_progress(
         synced_files,
         skipped_files,
         errors,
+        warnings: vec![],
     }
 }
 
@@ -843,6 +847,7 @@ pub async fn wsl_get_status(
         last_sync_time: config.last_sync_time,
         last_sync_status: config.last_sync_status,
         last_sync_error: config.last_sync_error,
+        last_sync_warnings: config.last_sync_warnings,
         module_statuses: config.module_statuses,
     })
 }
@@ -948,7 +953,7 @@ async fn backfill_default_mappings(
     mut file_mappings: Vec<FileMapping>,
 ) -> Vec<FileMapping> {
     // Bump this number whenever new default mappings are added.
-    const CURRENT_DEFAULTS_VERSION: u64 = 16;
+    const CURRENT_DEFAULTS_VERSION: u64 = 18;
     const DEFAULTS_VERSION_BEFORE_AGENT_DIRECTORIES: u64 = 7;
     const DEFAULT_MAPPING_IDS_ADDED_IN_V8: &[&str] = &["opencode-agents"];
     const DEFAULT_MAPPING_IDS_ADDED_IN_V9: &[&str] =
@@ -970,6 +975,8 @@ async fn backfill_default_mappings(
         "kimi-credentials",
         "kimi-plugins",
     ];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V17: &[&str] = &["omp-agents-dir"];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V18: &[&str] = &["kimi-mcp"];
 
     // Read stored version
     let stored_version: u64 = db
@@ -1025,6 +1032,16 @@ async fn backfill_default_mappings(
                 16,
                 &default_mapping.id,
                 DEFAULT_MAPPING_IDS_ADDED_IN_V16,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                17,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V17,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                18,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V18,
             ))
         {
             let mapping_data = adapter::mapping_to_db_value(&default_mapping);
@@ -1321,6 +1338,13 @@ pub(super) async fn resolve_dynamic_paths_with_db(
                         runtime_location::get_kimi_wsl_target_path_async(db, "config.toml").await;
                 }
             }
+            "kimi-mcp" => {
+                if let Ok(path) = runtime_location::get_kimi_mcp_config_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_kimi_wsl_target_path_async(db, "mcp.json").await;
+                }
+            }
             "kimi-prompt" => {
                 if let Ok(path) = runtime_location::get_kimi_prompt_path_async(db).await {
                     mapping.windows_path = path.to_string_lossy().to_string();
@@ -1491,6 +1515,18 @@ pub(super) async fn resolve_dynamic_paths_with_db(
                     mapping.wsl_path = omp_wsl_target_path_from_location(&location, "RULES.md");
                 }
             }
+            "omp-agents-dir" => {
+                if let Ok(location) =
+                    runtime_location::get_oh_my_pi_runtime_location_async(db).await
+                {
+                    mapping.windows_path = location
+                        .host_path
+                        .join("agents")
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.wsl_path = omp_wsl_target_path_from_location(&location, "agents");
+                }
+            }
             "hermes-config" | "hermes-prompt" => {
                 if let Ok((config_dir, _)) =
                     crate::coding::hermes::get_hermes_config_dir_from_db_async(db).await
@@ -1575,25 +1611,27 @@ pub(super) async fn update_sync_status(
 
     let now = Local::now().to_rfc3339();
 
-    let mut config_data = state
-        .with_conn(|conn| db_get(conn, DbTable::WslSyncConfig, "config"))?
-        .unwrap_or_else(|| adapter::config_to_db_value(&WSLSyncConfig::default()));
-    if let Some(payload) = config_data.as_object_mut() {
-        payload.insert("last_sync_time".to_string(), serde_json::Value::String(now));
-        payload.insert(
-            "last_sync_status".to_string(),
-            serde_json::Value::String(status),
-        );
-        payload.insert(
-            "last_sync_error".to_string(),
-            error
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null),
-        );
-    }
-    state.with_conn(|conn| db_put(conn, DbTable::WslSyncConfig, "config", &config_data))?;
+    patch_wsl_config_record(
+        state,
+        &[
+            ("last_sync_time", serde_json::json!(now)),
+            ("last_sync_status", serde_json::json!(status)),
+            ("last_sync_error", serde_json::json!(error)),
+        ],
+    )
+}
 
-    Ok(())
+/// Replace the persisted Skills sync warnings. Only the Skills sync chain
+/// calls this so that unrelated silent chains (e.g. file mappings) cannot
+/// clear or mix warnings from a different sub-run.
+pub(super) async fn update_sync_warnings(
+    state: &SqliteDbState,
+    warnings: &[String],
+) -> Result<(), String> {
+    patch_wsl_config_record(
+        state,
+        &[("last_sync_warnings", serde_json::json!(warnings))],
+    )
 }
 
 /// Get default file mappings
@@ -2050,6 +2088,22 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             directory_excludes: vec![],
             cleanup_paths: vec![],
         },
+        FileMapping {
+            // Subagents 集中配置渲染出的 `agents/*.md`(`<agentDir>/agents`,与
+            // OMP 用户级 agent 发现路径一致)。目录映射是**整体镜像**:apply 后同步
+            // 会把新文件推过去,clear applied 后本机目录为空,同步同样会清掉 WSL
+            // 侧残留——删除语义因此不依赖"本机文件不存在就跳过"的单文件链路。
+            id: "omp-agents-dir".to_string(),
+            name: "Oh My Pi Subagents 目录（agents）".to_string(),
+            module: "oh_my_pi".to_string(),
+            windows_path: "~/.omp/agent/agents".to_string(),
+            wsl_path: "~/.omp/agent/agents".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: true,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
         // Hermes - runtime config.yaml + authored global prompt.
         FileMapping {
             id: "hermes-config".to_string(),
@@ -2131,6 +2185,19 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             module: "kimi".to_string(),
             windows_path: "~/.kimi-code/config.toml".to_string(),
             wsl_path: "~/.kimi-code/config.toml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        // Kimi MCP servers live in <root>/mcp.json (not config.toml).
+        FileMapping {
+            id: "kimi-mcp".to_string(),
+            name: "Kimi Code CLI MCP 配置".to_string(),
+            module: "kimi".to_string(),
+            windows_path: "~/.kimi-code/mcp.json".to_string(),
+            wsl_path: "~/.kimi-code/mcp.json".to_string(),
             enabled: true,
             is_pattern: false,
             is_directory: false,
@@ -2300,6 +2367,92 @@ mod tests {
         should_backfill_default_mapping, should_backfill_versioned_mapping,
     };
 
+    #[tokio::test]
+    async fn saving_sync_preferences_preserves_latest_skills_warnings() {
+        let state = crate::db::SqliteDbState::in_memory_for_test().unwrap();
+        super::save_wsl_config_record(&state, &super::WSLSyncConfig::default()).unwrap();
+        let mut stale_config = super::load_wsl_config(&state).unwrap();
+        let warnings = vec!["Keep external skill directory".to_string()];
+        super::update_sync_warnings(&state, &warnings)
+            .await
+            .unwrap();
+        let file_result = super::SyncResult {
+            success: false,
+            synced_files: vec![],
+            skipped_files: vec![],
+            errors: vec!["File sync failed".to_string()],
+            warnings: vec![],
+        };
+        super::update_sync_status(&state, &file_result)
+            .await
+            .unwrap();
+        let synced_config = super::load_wsl_config(&state).unwrap();
+        stale_config.distro = "Debian".to_string();
+        super::save_wsl_config_record(&state, &stale_config).unwrap();
+
+        let reloaded = super::load_wsl_config(&state).unwrap();
+        assert_eq!(reloaded.distro, "Debian");
+        assert_eq!(reloaded.last_sync_warnings, warnings);
+        assert_eq!(reloaded.last_sync_time, synced_config.last_sync_time);
+        assert_eq!(reloaded.last_sync_status, "error");
+        assert_eq!(
+            reloaded.last_sync_error.as_deref(),
+            Some("File sync failed")
+        );
+
+        // Only a later Skills run can replace or clear its diagnostic snapshot.
+        super::update_sync_warnings(&state, &[]).await.unwrap();
+        let cleared = super::load_wsl_config(&state).unwrap();
+        assert!(cleared.last_sync_warnings.is_empty());
+        assert_eq!(cleared.last_sync_status, "error");
+        assert_eq!(cleared.distro, "Debian");
+    }
+
+    #[test]
+    fn concurrent_sync_status_and_warnings_preserve_both_snapshots() {
+        let state = crate::db::SqliteDbState::in_memory_for_test().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for write_warnings in [true, false] {
+                let state = &state;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    for index in 0..32 {
+                        barrier.wait();
+                        if write_warnings {
+                            runtime
+                                .block_on(super::update_sync_warnings(
+                                    state,
+                                    &[format!("warning-{index}")],
+                                ))
+                                .unwrap();
+                        } else {
+                            runtime
+                                .block_on(super::update_sync_status(
+                                    state,
+                                    &super::SyncResult {
+                                        success: false,
+                                        synced_files: vec![],
+                                        skipped_files: vec![],
+                                        errors: vec![format!("error-{index}")],
+                                        warnings: vec![],
+                                    },
+                                ))
+                                .unwrap();
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        let config = super::load_wsl_config(&state).unwrap();
+        assert_eq!(config.last_sync_warnings, ["warning-31"]);
+        assert_eq!(config.last_sync_error.as_deref(), Some("error-31"));
+    }
+
     #[test]
     fn pi_mcp_default_mapping_is_regular_file() {
         let mapping = default_file_mappings()
@@ -2311,6 +2464,50 @@ mod tests {
         assert_eq!(mapping.windows_path, "~/.pi/agent/mcp.json");
         assert_eq!(mapping.wsl_path, "~/.pi/agent/mcp.json");
         assert!(!mapping.is_directory);
+    }
+
+    #[test]
+    fn omp_agents_dir_default_mapping_is_a_directory() {
+        let mapping = default_file_mappings()
+            .into_iter()
+            .find(|mapping| mapping.id == "omp-agents-dir")
+            .expect("omp-agents-dir default mapping exists");
+
+        assert_eq!(mapping.module, "oh_my_pi");
+        assert!(mapping.is_directory);
+        assert_eq!(mapping.windows_path, "~/.omp/agent/agents");
+        assert_eq!(mapping.wsl_path, "~/.omp/agent/agents");
+    }
+
+    #[test]
+    fn omp_agents_dir_mapping_does_not_shadow_the_prompt_mapping() {
+        // `omp-agents` 是 AGENTS.md(全局提示词),和 agents 目录是两条不同映射。
+        let prompt = default_file_mappings()
+            .into_iter()
+            .find(|mapping| mapping.id == "omp-agents")
+            .expect("omp-agents default mapping exists");
+        assert!(!prompt.is_directory);
+        assert_eq!(prompt.windows_path, "~/.omp/agent/AGENTS.md");
+    }
+
+    #[test]
+    fn defaults_backfill_v17_only_adds_omp_agents_dir_for_existing_v16_users() {
+        let ids = ["omp-agents-dir"];
+        assert!(should_backfill_versioned_mapping(
+            16,
+            17,
+            "omp-agents-dir",
+            &ids
+        ));
+        assert!(!should_backfill_versioned_mapping(
+            16, 17, "omp-config", &ids
+        ));
+        assert!(!should_backfill_versioned_mapping(
+            17,
+            17,
+            "omp-agents-dir",
+            &ids
+        ));
     }
 
     #[test]

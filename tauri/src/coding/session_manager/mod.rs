@@ -1,6 +1,7 @@
 mod claude_code;
 mod claude_desktop;
 mod codex;
+mod codex_rollout;
 mod dsh;
 mod gemini_cli;
 mod grok;
@@ -288,6 +289,13 @@ struct ExportedSessionFile {
 enum ToolSessionContext {
     Codex {
         sessions_root: PathBuf,
+        /// The Codex home directory — `sessions_root`'s parent.
+        ///
+        /// Carried explicitly because the Codex CLI's own state database
+        /// (`state_<N>.sqlite`) is a sibling of `sessions/`, and it decides which
+        /// rollout file a thread currently uses. `None` when the root is not a
+        /// `sessions` directory, which keeps every DB-dependent path optional.
+        codex_home: Option<PathBuf>,
     },
     ClaudeCode {
         projects_root: PathBuf,
@@ -399,6 +407,78 @@ impl SessionListLoadMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionTimeRange {
+    All,
+    Today,
+    Last7Days,
+    Last30Days,
+    OlderThan30Days,
+}
+
+impl SessionTimeRange {
+    fn parse(raw: Option<String>) -> Result<Self, String> {
+        match raw
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("all")
+        {
+            "all" => Ok(Self::All),
+            "today" => Ok(Self::Today),
+            "7d" => Ok(Self::Last7Days),
+            "30d" => Ok(Self::Last30Days),
+            "older_30d" => Ok(Self::OlderThan30Days),
+            value => Err(format!("Unsupported session time range: {value}")),
+        }
+    }
+
+    /// Inclusive-lower / exclusive-upper activity-time bounds in epoch millis.
+    /// `None` means the unfiltered `all` view. Last-30-days and older-than-30
+    /// days share one cutoff so the two views partition the full list.
+    fn bounds(self, now_ms: i64) -> Option<SessionTimeBounds> {
+        const DAY_MS: i64 = 86_400_000;
+        match self {
+            Self::All => None,
+            Self::Today => Some(SessionTimeBounds {
+                min_ts: Some(local_day_start_ms(now_ms)),
+                max_ts: None,
+            }),
+            Self::Last7Days => Some(SessionTimeBounds {
+                min_ts: Some(now_ms - 7 * DAY_MS),
+                max_ts: None,
+            }),
+            Self::Last30Days => Some(SessionTimeBounds {
+                min_ts: Some(now_ms - 30 * DAY_MS),
+                max_ts: None,
+            }),
+            Self::OlderThan30Days => Some(SessionTimeBounds {
+                min_ts: None,
+                max_ts: Some(now_ms - 30 * DAY_MS),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionTimeBounds {
+    min_ts: Option<i64>,
+    max_ts: Option<i64>,
+}
+
+/// Start of the local calendar day (00:00) containing `now_ms`, in epoch
+/// millis. Derived by subtracting the wall-clock offset from local midnight;
+/// on DST-shift days it degrades to the first instant of the day.
+fn local_day_start_ms(now_ms: i64) -> i64 {
+    use chrono::{Local, TimeZone, Timelike};
+    let Some(now) = Local.timestamp_millis_opt(now_ms).single() else {
+        return now_ms;
+    };
+    let elapsed_since_midnight_ms = i64::from(now.time().num_seconds_from_midnight()) * 1000
+        + i64::from(now.timestamp_subsec_millis());
+    now_ms - elapsed_since_midnight_ms
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionListCacheState {
     None,
     Quick,
@@ -486,7 +566,21 @@ impl SessionTool {
 impl ToolSessionContext {
     fn cache_key(&self) -> String {
         match self {
-            Self::Codex { sessions_root } => format!("codex:{}", sessions_root.display()),
+            Self::Codex {
+                sessions_root,
+                codex_home,
+            } => {
+                // The state database is part of the key: it decides which rollout
+                // file represents a thread, so swapping `CODEX_SQLITE_HOME` under a
+                // stable `sessions/` root must not serve cached rows for the TTL.
+                // Mirrors the OpenCode arm, which keys on its own sqlite path.
+                let state_db = codex_home
+                    .as_deref()
+                    .and_then(codex_rollout::resolve_state_db_path)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                format!("codex:{}:{}", sessions_root.display(), state_db)
+            }
             Self::ClaudeCode { projects_root } => {
                 format!("claudecode:{}", projects_root.display())
             }
@@ -530,6 +624,7 @@ pub async fn list_tool_sessions(
     force_refresh: Option<bool>,
     source_mode: Option<String>,
     load_mode: Option<String>,
+    time_range: Option<String>,
 ) -> Result<SessionListPage, String> {
     let session_tool = SessionTool::parse(tool.trim())?;
     let query = normalize_query(query);
@@ -539,6 +634,8 @@ pub async fn list_tool_sessions(
     let force_refresh = force_refresh.unwrap_or(false);
     let source_mode = SessionSourceMode::parse(source_mode)?;
     let load_mode = SessionListLoadMode::parse(load_mode)?;
+    let time_range = SessionTimeRange::parse(time_range)?;
+    let now_ms = Utc::now().timestamp_millis();
     let contexts = resolve_session_contexts(&state.db(), session_tool).await?;
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -551,6 +648,8 @@ pub async fn list_tool_sessions(
             page_size as usize,
             force_refresh,
             load_mode,
+            time_range,
+            now_ms,
         )
     })
     .await
@@ -897,6 +996,186 @@ fn annotate_session_source(mut session: SessionMeta, entry: &SessionContextEntry
     session
 }
 
+/// Timestamp the list orders by and the live-artifact pick compares on.
+fn session_activity_ts(meta: &SessionMeta) -> i64 {
+    meta.last_active_at.or(meta.created_at).unwrap_or(0)
+}
+
+/// A session passes a specific time range only when its activity timestamp is
+/// inside the bounds. Sessions without any parseable timestamp are excluded
+/// from filtered views; they remain visible under `all`.
+fn session_activity_in_range(meta: &SessionMeta, bounds: Option<&SessionTimeBounds>) -> bool {
+    let Some(bounds) = bounds else {
+        return true;
+    };
+    let ts = session_activity_ts(meta);
+    if ts <= 0 {
+        return false;
+    }
+    if let Some(min_ts) = bounds.min_ts {
+        if ts < min_ts {
+            return false;
+        }
+    }
+    if let Some(max_ts) = bounds.max_ts {
+        if ts >= max_ts {
+            return false;
+        }
+    }
+    true
+}
+
+/// Collapse the artifacts of one logical session into a single row.
+///
+/// Several runtimes keep one session as more than one on-disk artifact: Codex
+/// opens a fresh `rollout-<ts>-<id>.jsonl` on resume while keeping the thread id
+/// in `session_meta`, Gemini CLI spreads a session over several
+/// `session-<ts>-<first8>.jsonl` chat files, and a copied pi/open-claw session
+/// directory can hold a second artifact. The list keys rows on `source_path`, so
+/// every artifact used to become its own row — the same session id showed up N
+/// times with N different "last active" times.
+///
+/// Identity is `(runtime context, session id)`: one row per logical session, and
+/// the artifact with the greatest activity wins because that is the live one for
+/// those layouts. The same id under two runtime contexts (local vs WSL/SSH) stays
+/// two rows — those are genuinely different sessions. Ties break on the greater
+/// `source_path`, which follows the dated directory/file ordering those layouts
+/// use, so the pick stays deterministic.
+///
+/// Codex overrides the heuristic when its state database is readable: after
+/// `thread/revert` a scan cannot tell which of a thread's rollouts is the live
+/// one, so the database's selected path is the authority and the heuristic is
+/// only the fallback. `authorities` holds that index per context index; a missing
+/// entry means "no hint", which is also what an unreadable database yields.
+fn collapse_sessions_by_identity(
+    sessions: Vec<SessionWithContext>,
+    authorities: &HashMap<usize, codex_rollout::CodexStateIndex>,
+) -> Vec<SessionWithContext> {
+    let mut id_less: Vec<SessionWithContext> = Vec::new();
+    let mut groups: HashMap<(usize, String), Vec<SessionWithContext>> = HashMap::new();
+    let mut key_order: Vec<(usize, String)> = Vec::new();
+
+    for session in sessions {
+        // An absent id is not an identity; merging every id-less session into
+        // one row would hide real sessions, so keep them apart.
+        if session.meta.session_id.is_empty() {
+            id_less.push(session);
+            continue;
+        }
+
+        let key = (session.context_index, session.meta.session_id.clone());
+        if !groups.contains_key(&key) {
+            key_order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(session);
+    }
+
+    // Every artifact of one identity has to be known before the winner is picked,
+    // because the authority can name any of them, including an older one.
+    let mut collapsed: Vec<SessionWithContext> = Vec::with_capacity(groups.len() + id_less.len());
+    for key in key_order {
+        let Some(artifacts) = groups.remove(&key) else {
+            continue;
+        };
+        if let Some(winner) = pick_session_artifact(artifacts, authorities.get(&key.0), &key.1) {
+            collapsed.push(winner);
+        }
+    }
+    // Id-less rows are not part of any identity, so they keep their scanned order.
+    collapsed.extend(id_less);
+    collapsed
+}
+
+/// Load the Codex state database per context that has one.
+///
+/// Only Codex threads can be ambiguous (a reverted thread owns several rollouts
+/// and a scan cannot say which is live), so this is the only tool that consults a
+/// database. An absent or unreadable database simply leaves its context out, and
+/// every consumer falls back to the scan-based heuristic.
+fn codex_authorities(
+    contexts: &SessionContextSet,
+) -> HashMap<usize, codex_rollout::CodexStateIndex> {
+    let mut authorities = HashMap::new();
+    for (index, entry) in contexts.entries.iter().enumerate() {
+        if let Some(state_index) = codex_authority_for(entry) {
+            authorities.insert(index, state_index);
+        }
+    }
+    authorities
+}
+
+fn codex_authority_for(entry: &SessionContextEntry) -> Option<codex_rollout::CodexStateIndex> {
+    let ToolSessionContext::Codex { codex_home, .. } = &entry.context else {
+        return None;
+    };
+    codex_rollout::CodexStateIndex::load(codex_home.as_deref()?)
+}
+
+/// The artifact that represents the requested session's identity.
+///
+/// A Codex thread can own several rollout files and the one the client holds may
+/// be a superseded artifact — a stale detail URL, or a row rendered before a
+/// revert moved the thread on. Reading that artifact alone would show one segment
+/// of the conversation, so the same authority the list uses picks the artifact
+/// whose lineage covers the whole thread. Everything else is returned untouched.
+fn canonical_session_meta(entry: &SessionContextEntry, session: SessionMeta) -> SessionMeta {
+    if !matches!(entry.context, ToolSessionContext::Codex { .. }) {
+        return session;
+    }
+
+    let session_id = session.session_id.clone();
+    let artifacts: Vec<SessionMeta> = get_cached_sessions(&entry.context, false)
+        .into_iter()
+        .filter(|candidate| candidate.session_id == session_id)
+        .collect();
+    if artifacts.len() < 2 {
+        return session;
+    }
+
+    let candidates: Vec<(String, i64)> = artifacts
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.source_path.clone(),
+                session_activity_ts(candidate),
+            )
+        })
+        .collect();
+
+    let authority = codex_authority_for(entry);
+    let selected =
+        codex_rollout::select_canonical_index(authority.as_ref(), &session_id, &candidates);
+    match selected.and_then(|position| artifacts.into_iter().nth(position)) {
+        Some(canonical) => canonical,
+        None => session,
+    }
+}
+
+/// The one artifact that represents an identity.
+///
+/// Codex's state database decides when it names one of the artifacts we scanned;
+/// otherwise the most recently active artifact wins, with the greater
+/// `source_path` breaking ties so the pick stays deterministic.
+fn pick_session_artifact(
+    artifacts: Vec<SessionWithContext>,
+    authority: Option<&codex_rollout::CodexStateIndex>,
+    session_id: &str,
+) -> Option<SessionWithContext> {
+    let candidates: Vec<(String, i64)> = artifacts
+        .iter()
+        .map(|artifact| {
+            (
+                artifact.meta.source_path.clone(),
+                session_activity_ts(&artifact.meta),
+            )
+        })
+        .collect();
+
+    let selected =
+        codex_rollout::select_canonical_index(authority, session_id, &candidates).unwrap_or(0);
+    artifacts.into_iter().nth(selected)
+}
+
 fn find_session_with_context(
     contexts: &SessionContextSet,
     source_path: &str,
@@ -909,7 +1188,10 @@ fn find_session_with_context(
                 matches_session_source(&entry.context, &session.source_path, source_path)
             })
         {
-            return Ok((entry.clone(), annotate_session_source(session, entry)));
+            return Ok((
+                entry.clone(),
+                annotate_session_source(canonical_session_meta(entry, session), entry),
+            ));
         }
     }
 
@@ -997,10 +1279,16 @@ fn list_sessions_blocking(
     page_size: usize,
     force_refresh: bool,
     load_mode: SessionListLoadMode,
+    time_range: SessionTimeRange,
+    now_ms: i64,
 ) -> Result<SessionListPage, String> {
-    let use_quick_initial_page =
-        page == 1 && page_size <= 10 && query.is_none() && path_filter.is_none() && !force_refresh;
-    let (mut sessions, partial, cache_state, meta_complete) = match load_mode {
+    let use_quick_initial_page = page == 1
+        && page_size <= 10
+        && query.is_none()
+        && path_filter.is_none()
+        && time_range == SessionTimeRange::All
+        && !force_refresh;
+    let (sessions, partial, cache_state, meta_complete) = match load_mode {
         SessionListLoadMode::CacheFirst => {
             let (mut cached_sessions, cache_partial, cache_state) =
                 collect_any_cached_sessions_with_context(&contexts, source_mode);
@@ -1049,25 +1337,29 @@ fn list_sessions_blocking(
             SessionListLoadMode::Auto | SessionListLoadMode::Full | SessionListLoadMode::Refresh
         );
 
+    // One logical session can be several on-disk artifacts; collapse before
+    // anything sorts, filters, counts or returns rows, so the count the UI shows
+    // matches the rows it renders.
+    let mut sessions = collapse_sessions_by_identity(sessions, &codex_authorities(&contexts));
+
     sessions.sort_by(|left, right| {
-        let left_ts = left
-            .meta
-            .last_active_at
-            .or(left.meta.created_at)
-            .unwrap_or(0);
-        let right_ts = right
-            .meta
-            .last_active_at
-            .or(right.meta.created_at)
-            .unwrap_or(0);
-        right_ts.cmp(&left_ts)
+        session_activity_ts(&right.meta).cmp(&session_activity_ts(&left.meta))
     });
 
-    let available_paths = build_session_paths_from_contexts(&sessions, DEFAULT_SESSION_PATH_LIMIT);
+    // Time filter runs before `available_paths` is derived, so the path
+    // dropdown only offers directories that exist in the currently filtered
+    // view.
+    let time_bounds = time_range.bounds(now_ms);
+    let time_filtered_sessions: Vec<SessionWithContext> = sessions
+        .into_iter()
+        .filter(|session| session_activity_in_range(&session.meta, time_bounds.as_ref()))
+        .collect();
+
+    let available_paths = build_session_paths_from_contexts(&time_filtered_sessions, DEFAULT_SESSION_PATH_LIMIT);
     let path_filtered_sessions = if let Some(path_filter_text) = path_filter.as_deref() {
-        filter_sessions_by_path_with_context(sessions, path_filter_text)
+        filter_sessions_by_path_with_context(time_filtered_sessions, path_filter_text)
     } else {
-        sessions
+        time_filtered_sessions
     };
     let (filtered_sessions, exact_session_id_match) = if let Some(query_text) = query.as_deref() {
         filter_sessions_by_query_with_context(
@@ -1665,7 +1957,7 @@ fn import_session_blocking(
     }
 
     match &context {
-        ToolSessionContext::Codex { sessions_root } => {
+        ToolSessionContext::Codex { sessions_root, .. } => {
             ensure_snapshot_format(&exported_file.native_snapshot, SNAPSHOT_FORMAT_CODEX)?;
             codex::import_native_snapshot(
                 sessions_root,
@@ -1837,7 +2129,7 @@ fn build_native_snapshot(
     context: &ToolSessionContext,
 ) -> Result<NativeSnapshot, String> {
     match context {
-        ToolSessionContext::Codex { sessions_root } => Ok(NativeSnapshot {
+        ToolSessionContext::Codex { sessions_root, .. } => Ok(NativeSnapshot {
             format: SNAPSHOT_FORMAT_CODEX.to_string(),
             payload: codex::export_native_snapshot(sessions_root, Path::new(source_path))?,
         }),
@@ -1961,7 +2253,7 @@ fn ensure_snapshot_format(snapshot: &NativeSnapshot, expected: &str) -> Result<(
 
 fn scan_sessions(context: &ToolSessionContext) -> Vec<SessionMeta> {
     let mut sessions = match context {
-        ToolSessionContext::Codex { sessions_root } => codex::scan_sessions(sessions_root),
+        ToolSessionContext::Codex { sessions_root, .. } => codex::scan_sessions(sessions_root),
         ToolSessionContext::ClaudeCode { projects_root } => {
             claude_code::scan_sessions(projects_root)
         }
@@ -1993,7 +2285,7 @@ fn scan_sessions(context: &ToolSessionContext) -> Vec<SessionMeta> {
 
 fn scan_recent_sessions(context: &ToolSessionContext, limit: usize) -> Vec<SessionMeta> {
     let mut sessions = match context {
-        ToolSessionContext::Codex { sessions_root } => {
+        ToolSessionContext::Codex { sessions_root, .. } => {
             codex::scan_recent_sessions(sessions_root, limit)
         }
         ToolSessionContext::ClaudeCode { projects_root } => {
@@ -2289,7 +2581,7 @@ fn session_context_entry(context: ToolSessionContext) -> SessionContextEntry {
 
 fn context_wsl_info(context: &ToolSessionContext) -> Option<WslLocationInfo> {
     match context {
-        ToolSessionContext::Codex { sessions_root } => path_wsl_info(sessions_root),
+        ToolSessionContext::Codex { sessions_root, .. } => path_wsl_info(sessions_root),
         ToolSessionContext::ClaudeCode { projects_root } => path_wsl_info(projects_root),
         ToolSessionContext::GeminiCli { tmp_root } => path_wsl_info(tmp_root),
         ToolSessionContext::OpenClaw { agents_root } => path_wsl_info(agents_root),
@@ -2354,9 +2646,13 @@ fn build_default_wsl_session_context(
     let linux_user_root = Some(linux_home.to_string());
 
     match tool {
-        SessionTool::Codex => Some(ToolSessionContext::Codex {
-            sessions_root: wsl_home_path(distro, linux_home, ".codex/sessions"),
-        }),
+        SessionTool::Codex => {
+            let sessions_root = wsl_home_path(distro, linux_home, ".codex/sessions");
+            Some(ToolSessionContext::Codex {
+                codex_home: sessions_root.parent().map(Path::to_path_buf),
+                sessions_root,
+            })
+        }
         SessionTool::ClaudeCode => Some(ToolSessionContext::ClaudeCode {
             projects_root: wsl_home_path(distro, linux_home, ".claude/projects"),
         }),
@@ -2470,6 +2766,9 @@ async fn resolve_context(
             let runtime_location = get_codex_runtime_location_async(db).await?;
             Ok(ToolSessionContext::Codex {
                 sessions_root: runtime_location.host_path.join("sessions"),
+                // `runtime_location.host_path` is the Codex home; its state
+                // database sits next to `sessions/`.
+                codex_home: Some(runtime_location.host_path),
             })
         }
         SessionTool::ClaudeCode => {
@@ -2611,7 +2910,7 @@ fn resolve_opencode_state_root(location: &RuntimeLocationInfo) -> Result<PathBuf
         .join("opencode"))
 }
 
-fn resolve_pi_sessions_root(location: &RuntimeLocationInfo) -> Result<PathBuf, String> {
+pub(crate) fn resolve_pi_sessions_root(location: &RuntimeLocationInfo) -> Result<PathBuf, String> {
     const SESSION_DIR_ENV_KEY: &str = "PI_CODING_AGENT_SESSION_DIR";
 
     if let Ok(session_dir) = std::env::var(SESSION_DIR_ENV_KEY) {
@@ -2931,6 +3230,7 @@ mod tests {
             entries: vec![SessionContextEntry {
                 context: ToolSessionContext::Codex {
                     sessions_root: test_root.path().to_path_buf(),
+                    codex_home: None,
                 },
                 source: SessionRuntimeSource::Local,
                 distro: None,
@@ -2984,6 +3284,237 @@ mod tests {
         assert_eq!(filtered[0].meta.session_id, exact_session_id);
     }
 
+    fn time_filter_meta(last_active_at: Option<i64>) -> SessionMeta {
+        SessionMeta {
+            provider_id: "codex".to_string(),
+            session_id: "time-filter-session".to_string(),
+            title: None,
+            summary: None,
+            project_dir: None,
+            created_at: None,
+            last_active_at,
+            source_path: "time-filter-session.jsonl".to_string(),
+            resume_command: None,
+            runtime_source: None,
+            runtime_distro: None,
+        }
+    }
+
+    #[test]
+    fn session_time_range_parse_accepts_presets_and_rejects_unknown() {
+        assert_eq!(SessionTimeRange::parse(None).unwrap(), SessionTimeRange::All);
+        assert_eq!(
+            SessionTimeRange::parse(Some(String::new())).unwrap(),
+            SessionTimeRange::All
+        );
+        assert_eq!(
+            SessionTimeRange::parse(Some("today".to_string())).unwrap(),
+            SessionTimeRange::Today
+        );
+        assert_eq!(
+            SessionTimeRange::parse(Some("7d".to_string())).unwrap(),
+            SessionTimeRange::Last7Days
+        );
+        assert_eq!(
+            SessionTimeRange::parse(Some("30d".to_string())).unwrap(),
+            SessionTimeRange::Last30Days
+        );
+        assert_eq!(
+            SessionTimeRange::parse(Some("older_30d".to_string())).unwrap(),
+            SessionTimeRange::OlderThan30Days
+        );
+        assert!(SessionTimeRange::parse(Some("yesterday".to_string())).is_err());
+    }
+
+    #[test]
+    fn session_time_range_last30_and_older30_partition_on_same_cutoff() {
+        const DAY_MS: i64 = 86_400_000;
+        let now_ms = 1_800_000_000_000;
+
+        assert!(SessionTimeRange::All.bounds(now_ms).is_none());
+
+        let last7 = SessionTimeRange::Last7Days
+            .bounds(now_ms)
+            .expect("7d should have bounds");
+        assert_eq!(last7.min_ts, Some(now_ms - 7 * DAY_MS));
+        assert!(last7.max_ts.is_none());
+
+        let last30 = SessionTimeRange::Last30Days
+            .bounds(now_ms)
+            .expect("30d should have bounds");
+        let older30 = SessionTimeRange::OlderThan30Days
+            .bounds(now_ms)
+            .expect("older_30d should have bounds");
+        assert_eq!(last30.min_ts, Some(now_ms - 30 * DAY_MS));
+        assert!(last30.max_ts.is_none());
+        assert!(older30.min_ts.is_none());
+        assert_eq!(older30.max_ts, last30.min_ts, "the two views share one cutoff");
+    }
+
+    #[test]
+    fn session_activity_in_range_keeps_boundary_and_excludes_missing_timestamp() {
+        const DAY_MS: i64 = 86_400_000;
+        let now_ms = 1_800_000_000_000;
+        let cutoff = now_ms - 30 * DAY_MS;
+
+        let last30 = SessionTimeRange::Last30Days.bounds(now_ms);
+        let older30 = SessionTimeRange::OlderThan30Days.bounds(now_ms);
+
+        // Exactly on the cutoff: inside "last 30 days", outside "older than 30 days".
+        assert!(session_activity_in_range(&time_filter_meta(Some(cutoff)), last30.as_ref()));
+        assert!(!session_activity_in_range(
+            &time_filter_meta(Some(cutoff)),
+            older30.as_ref()
+        ));
+        assert!(!session_activity_in_range(
+            &time_filter_meta(Some(cutoff - 1)),
+            last30.as_ref()
+        ));
+        assert!(session_activity_in_range(
+            &time_filter_meta(Some(cutoff - 1)),
+            older30.as_ref()
+        ));
+
+        // Sessions without any parseable time are hidden from filtered views
+        // and stay visible under `all`.
+        assert!(session_activity_in_range(&time_filter_meta(None), None));
+        assert!(session_activity_in_range(&time_filter_meta(Some(0)), None));
+        assert!(!session_activity_in_range(&time_filter_meta(None), last30.as_ref()));
+        assert!(!session_activity_in_range(&time_filter_meta(Some(0)), older30.as_ref()));
+    }
+
+    #[test]
+    fn local_day_start_ms_lands_on_local_midnight_of_same_day() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let day_start = local_day_start_ms(now_ms);
+
+        assert!(day_start <= now_ms);
+        assert!(now_ms - day_start < 86_400_000);
+        assert_eq!(local_day_start_ms(day_start), day_start);
+
+        let today_bounds = SessionTimeRange::Today
+            .bounds(now_ms)
+            .expect("today should have bounds");
+        assert_eq!(today_bounds.min_ts, Some(day_start));
+    }
+
+    #[test]
+    fn list_sessions_time_filter_scopes_items_and_paths_and_disables_quick_initial_page() {
+        let test_root = TestDir::new("time-filter");
+        let sessions_root = test_root.path().join("sessions");
+        let recent_project_dir = test_root.path().join("recent-project");
+        let old_project_dir = test_root.path().join("old-project");
+
+        let now = Utc::now();
+        let recent_rollout_dir = sessions_root
+            .join(now.format("%Y").to_string())
+            .join(now.format("%m").to_string())
+            .join(now.format("%d").to_string());
+        write_text_file(
+            &recent_rollout_dir.join("rollout-2026-01-01T00-00-00-recent-session.jsonl"),
+            &json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "session_meta",
+                "payload": {
+                    "id": "recent-session",
+                    "timestamp": now.to_rfc3339(),
+                    "cwd": recent_project_dir.to_string_lossy().to_string(),
+                }
+            })
+            .to_string(),
+        );
+        write_text_file(
+            &sessions_root
+                .join("2024")
+                .join("01")
+                .join("01")
+                .join("rollout-2024-01-01T00-00-00-old-session.jsonl"),
+            &json!({
+                "timestamp": "2024-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "old-session",
+                    "timestamp": "2024-01-01T00:00:00Z",
+                    "cwd": old_project_dir.to_string_lossy().to_string(),
+                }
+            })
+            .to_string(),
+        );
+
+        let contexts = SessionContextSet {
+            entries: vec![SessionContextEntry {
+                context: ToolSessionContext::Codex {
+                    sessions_root,
+                    codex_home: None,
+                },
+                source: SessionRuntimeSource::Local,
+                distro: None,
+            }],
+            available_sources: Vec::new(),
+        };
+        let now_ms = now.timestamp_millis();
+
+        let last30 = list_sessions_blocking(
+            contexts.clone(),
+            SessionSourceMode::All,
+            None,
+            None,
+            1,
+            10,
+            false,
+            SessionListLoadMode::Full,
+            SessionTimeRange::Last30Days,
+            now_ms,
+        )
+        .expect("last-30d list should succeed");
+        assert_eq!(last30.total, 1);
+        assert_eq!(last30.items[0].session_id, "recent-session");
+        assert_eq!(
+            last30.available_paths,
+            Some(vec![recent_project_dir.to_string_lossy().to_string()]),
+            "path options must follow the time-filtered view"
+        );
+
+        let older30 = list_sessions_blocking(
+            contexts.clone(),
+            SessionSourceMode::All,
+            None,
+            None,
+            1,
+            10,
+            false,
+            SessionListLoadMode::Full,
+            SessionTimeRange::OlderThan30Days,
+            now_ms,
+        )
+        .expect("older-30d list should succeed");
+        assert_eq!(older30.total, 1);
+        assert_eq!(older30.items[0].session_id, "old-session");
+        assert_eq!(
+            older30.available_paths,
+            Some(vec![old_project_dir.to_string_lossy().to_string()])
+        );
+
+        // The quick initial-page guard must not apply when a time range is set:
+        // auto mode with a time filter behaves like a full collect.
+        let auto_with_time = list_sessions_blocking(
+            contexts,
+            SessionSourceMode::All,
+            None,
+            None,
+            1,
+            10,
+            false,
+            SessionListLoadMode::Auto,
+            SessionTimeRange::Last30Days,
+            now_ms,
+        )
+        .expect("auto list with time filter should succeed");
+        assert!(!auto_with_time.partial);
+        assert!(auto_with_time.meta_complete);
+        assert_eq!(auto_with_time.total, 1);
+    }
+
     #[test]
     fn cache_first_skips_uncached_wsl_context_for_initial_page() {
         let test_root = TestDir::new("cache-first-skips-uncached-wsl");
@@ -3032,6 +3563,7 @@ mod tests {
                 SessionContextEntry {
                     context: ToolSessionContext::Codex {
                         sessions_root: local_root,
+                        codex_home: None,
                     },
                     source: SessionRuntimeSource::Local,
                     distro: None,
@@ -3039,6 +3571,7 @@ mod tests {
                 SessionContextEntry {
                     context: ToolSessionContext::Codex {
                         sessions_root: wsl_root,
+                        codex_home: None,
                     },
                     source: SessionRuntimeSource::Wsl,
                     distro: Some("Debian".to_string()),
@@ -3057,6 +3590,8 @@ mod tests {
             10,
             false,
             SessionListLoadMode::CacheFirst,
+            SessionTimeRange::All,
+            0,
         )
         .expect("cache-first list should succeed");
 
@@ -3078,6 +3613,8 @@ mod tests {
             10,
             false,
             SessionListLoadMode::Full,
+            SessionTimeRange::All,
+            0,
         )
         .expect("full list should succeed");
 
@@ -3090,6 +3627,436 @@ mod tests {
         assert!(!full_result.partial);
         assert!(!full_result.has_more);
         assert!(full_result.meta_complete);
+    }
+
+    fn write_codex_rollout(path: &Path, session_id: &str, timestamp: &str) {
+        write_text_file(
+            path,
+            &json!({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": timestamp,
+                    "cwd": "/tmp/project",
+                }
+            })
+            .to_string(),
+        );
+    }
+
+    fn test_session_at(
+        context_index: usize,
+        session_id: &str,
+        source_path: &str,
+        ts: i64,
+    ) -> SessionWithContext {
+        SessionWithContext {
+            context_index,
+            meta: SessionMeta {
+                provider_id: "codex".to_string(),
+                session_id: session_id.to_string(),
+                title: None,
+                summary: None,
+                project_dir: None,
+                created_at: Some(ts),
+                last_active_at: Some(ts),
+                source_path: source_path.to_string(),
+                resume_command: None,
+                runtime_source: None,
+                runtime_distro: None,
+            },
+        }
+    }
+
+    /// No Codex state database, i.e. the scan-based heuristic decides.
+    fn no_authorities() -> HashMap<usize, codex_rollout::CodexStateIndex> {
+        HashMap::new()
+    }
+
+    /// Codex opens a fresh rollout file per resume while keeping the thread id in
+    /// `session_meta`, so one session owns several artifacts. The list showed one
+    /// row per artifact; it must show one row per session, from the live artifact.
+    #[test]
+    fn list_shows_one_row_per_session_when_rollouts_share_a_thread_id() {
+        let test_root = TestDir::new("collapse-shared-thread-id");
+        let sessions_root = test_root.path().join("sessions");
+        let shared_id = "01a08e7d-5f4b-7c31-9a20-6d3f11b91882";
+        let other_id = "01a08e11-2c7d-7b55-8e10-4a9c77d20453";
+        let superseded = sessions_root
+            .join("2026")
+            .join("09")
+            .join("11")
+            .join(format!("rollout-2026-09-11T10-00-00-{shared_id}.jsonl"));
+        let live = sessions_root
+            .join("2026")
+            .join("09")
+            .join("17")
+            .join(format!("rollout-2026-09-17T09-00-00-{shared_id}.jsonl"));
+        let unrelated = sessions_root
+            .join("2026")
+            .join("09")
+            .join("17")
+            .join(format!("rollout-2026-09-17T10-00-00-{other_id}.jsonl"));
+
+        write_codex_rollout(&superseded, shared_id, "2026-09-11T10:00:00Z");
+        write_codex_rollout(&live, shared_id, "2026-09-17T09:00:00Z");
+        write_codex_rollout(&unrelated, other_id, "2026-09-17T10:00:00Z");
+
+        let contexts = SessionContextSet {
+            entries: vec![SessionContextEntry {
+                context: ToolSessionContext::Codex {
+                    sessions_root: sessions_root.clone(),
+                    codex_home: None,
+                },
+                source: SessionRuntimeSource::Local,
+                distro: None,
+            }],
+            available_sources: Vec::new(),
+        };
+
+        let result = list_sessions_blocking(
+            contexts,
+            SessionSourceMode::All,
+            None,
+            None,
+            1,
+            10,
+            false,
+            SessionListLoadMode::Full,
+            SessionTimeRange::All,
+            0,
+        )
+        .expect("full list should succeed");
+
+        let session_ids: Vec<&str> = result
+            .items
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(session_ids, vec![other_id, shared_id]);
+        assert_eq!(result.total, 2);
+
+        let shared = result
+            .items
+            .iter()
+            .find(|session| session.session_id == shared_id)
+            .expect("shared session should be listed");
+        assert_eq!(shared.source_path, live.to_string_lossy().to_string());
+    }
+
+    fn write_codex_state_db(home: &Path, rows: &[(&str, &str)]) {
+        let connection = rusqlite::Connection::open(home.join("state_5.sqlite"))
+            .expect("failed to create Codex state db");
+        connection
+            .execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)")
+            .expect("failed to create threads table");
+        for (id, rollout_path) in rows {
+            connection
+                .execute(
+                    "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                    rusqlite::params![id, rollout_path],
+                )
+                .expect("failed to insert thread row");
+        }
+    }
+
+    /// After `thread/revert` a thread owns several rollouts and a scan cannot tell
+    /// which one is live — Codex's own resolver says so — so its state database
+    /// decides. Without this the list would show the newest file, which is the
+    /// reverted-away branch rather than the thread the user is actually in.
+    #[test]
+    fn list_prefers_the_rollout_codex_selected_over_the_newest_file() {
+        let test_root = TestDir::new("codex-state-db-selection");
+        let sessions_root = test_root.path().join("sessions");
+        let selected_id = "01a08e7d-5f4b-7c31-9a20-6d3f11b91882";
+        let other_id = "01a08e11-2c7d-7b55-8e10-4a9c77d20453";
+        // The thread's live rollout is the older file; the newer one belongs to a
+        // branch that was reverted away.
+        let selected = sessions_root
+            .join("2026")
+            .join("09")
+            .join("11")
+            .join(format!("rollout-2026-09-11T10-00-00-{selected_id}.jsonl"));
+        let newer = sessions_root
+            .join("2026")
+            .join("09")
+            .join("17")
+            .join(format!("rollout-2026-09-17T09-00-00-{selected_id}.jsonl"));
+        let unrelated = sessions_root
+            .join("2026")
+            .join("09")
+            .join("17")
+            .join(format!("rollout-2026-09-17T10-00-00-{other_id}.jsonl"));
+
+        write_codex_rollout(&selected, selected_id, "2026-09-11T10:00:00Z");
+        write_codex_rollout(&newer, selected_id, "2026-09-17T09:00:00Z");
+        write_codex_rollout(&unrelated, other_id, "2026-09-17T10:00:00Z");
+        write_codex_state_db(
+            test_root.path(),
+            &[(selected_id, selected.to_string_lossy().as_ref())],
+        );
+
+        let contexts = SessionContextSet {
+            entries: vec![SessionContextEntry {
+                context: ToolSessionContext::Codex {
+                    sessions_root: sessions_root.clone(),
+                    codex_home: Some(test_root.path().to_path_buf()),
+                },
+                source: SessionRuntimeSource::Local,
+                distro: None,
+            }],
+            available_sources: Vec::new(),
+        };
+
+        let result = list_sessions_blocking(
+            contexts,
+            SessionSourceMode::All,
+            None,
+            None,
+            1,
+            10,
+            false,
+            SessionListLoadMode::Full,
+            SessionTimeRange::All,
+            0,
+        )
+        .expect("full list should succeed");
+
+        assert_eq!(result.total, 2, "still one row per logical session");
+        let shared = result
+            .items
+            .iter()
+            .find(|session| session.session_id == selected_id)
+            .expect("the reverted thread should be listed");
+        assert_eq!(
+            shared.source_path,
+            selected.to_string_lossy().to_string(),
+            "the database's selected rollout wins over the newest file"
+        );
+    }
+
+    /// A state database that disagrees with the disk must not hide a session.
+    #[test]
+    fn list_falls_back_when_the_state_database_names_a_missing_rollout() {
+        let test_root = TestDir::new("codex-state-db-stale");
+        let sessions_root = test_root.path().join("sessions");
+        let shared_id = "01a08e7d-5f4b-7c31-9a20-6d3f11b91882";
+        let older = sessions_root
+            .join("2026")
+            .join("09")
+            .join("11")
+            .join(format!("rollout-2026-09-11T10-00-00-{shared_id}.jsonl"));
+        let newer = sessions_root
+            .join("2026")
+            .join("09")
+            .join("17")
+            .join(format!("rollout-2026-09-17T09-00-00-{shared_id}.jsonl"));
+
+        write_codex_rollout(&older, shared_id, "2026-09-11T10:00:00Z");
+        write_codex_rollout(&newer, shared_id, "2026-09-17T09:00:00Z");
+        write_codex_state_db(
+            test_root.path(),
+            &[(shared_id, "/codex/sessions/gone/rollout-missing.jsonl")],
+        );
+
+        let contexts = SessionContextSet {
+            entries: vec![SessionContextEntry {
+                context: ToolSessionContext::Codex {
+                    sessions_root: sessions_root.clone(),
+                    codex_home: Some(test_root.path().to_path_buf()),
+                },
+                source: SessionRuntimeSource::Local,
+                distro: None,
+            }],
+            available_sources: Vec::new(),
+        };
+
+        let result = list_sessions_blocking(
+            contexts,
+            SessionSourceMode::All,
+            None,
+            None,
+            1,
+            10,
+            false,
+            SessionListLoadMode::Full,
+            SessionTimeRange::All,
+            0,
+        )
+        .expect("full list should succeed");
+
+        assert_eq!(result.total, 1);
+        assert_eq!(
+            result.items[0].source_path,
+            newer.to_string_lossy().to_string(),
+            "Codex repairs a stale row; we must not hide the session instead"
+        );
+    }
+
+    /// The Codex cache key must move with the state database, as the OpenCode arm
+    /// already does with its sqlite path — otherwise a `CODEX_SQLITE_HOME` change
+    /// keeps serving rows picked by the old database for the whole TTL.
+    #[test]
+    fn codex_cache_key_tracks_the_state_database_path() {
+        let test_root = TestDir::new("codex-cache-key");
+        let sessions_root = test_root.path().join("sessions");
+
+        let context = ToolSessionContext::Codex {
+            sessions_root,
+            codex_home: Some(test_root.path().to_path_buf()),
+        };
+        let without_db = context.cache_key();
+
+        write_codex_state_db(test_root.path(), &[]);
+        let with_db = context.cache_key();
+
+        assert_ne!(without_db, with_db);
+    }
+
+    /// Smoke test over a real Codex home: point `CODEX_SMOKE_HOME` at a
+    /// `<home>` that holds `sessions/` and the state database, then run
+    /// `cargo test --lib -- --ignored codex_state_db_smoke`.
+    ///
+    /// The database decides the winner, so the failure worth catching is a
+    /// regression that makes rows vanish or duplicate once the authority is in
+    /// play: the list must still show exactly one row per thread id, and every
+    /// row's `source_path` must be a file the database actually selected.
+    #[test]
+    #[ignore]
+    fn codex_state_db_smoke() {
+        let Ok(home) = std::env::var("CODEX_SMOKE_HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let sessions_root = home.join("sessions");
+        let contexts = SessionContextSet {
+            entries: vec![SessionContextEntry {
+                context: ToolSessionContext::Codex {
+                    sessions_root: sessions_root.clone(),
+                    codex_home: Some(home.clone()),
+                },
+                source: SessionRuntimeSource::Local,
+                distro: None,
+            }],
+            available_sources: Vec::new(),
+        };
+
+        let result = list_sessions_blocking(
+            contexts,
+            SessionSourceMode::All,
+            None,
+            None,
+            1,
+            500,
+            false,
+            SessionListLoadMode::Full,
+            SessionTimeRange::All,
+            0,
+        )
+        .expect("full list should succeed");
+
+        println!("threads listed: {}", result.total);
+        println!(
+            "state database: {:?}",
+            codex_rollout::resolve_state_db_path(&home)
+        );
+
+        let mut ids: Vec<&str> = result
+            .items
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "one row per session id");
+        assert_eq!(
+            result.total,
+            result.items.len(),
+            "the reported total must match the rows rendered"
+        );
+
+        // A row count alone would not prove the authority is wired up: a broken
+        // path comparison silently falls back to the heuristic and still lists
+        // every thread. So count how many rows the database actually decided and
+        // require the authority to be doing work when a database exists.
+        if let Some(index) = codex_rollout::CodexStateIndex::load(&home) {
+            let database_decided = result
+                .items
+                .iter()
+                .filter(|session| {
+                    index.selected_path(&session.session_id).is_some_and(|selected| {
+                        codex_rollout::same_rollout_path(selected, &session.source_path)
+                    })
+                })
+                .count();
+            println!("rows whose path came from the database: {database_decided}");
+            assert!(
+                database_decided > 0,
+                "a readable state database must select the listed rollout, not be ignored"
+            );
+        }
+        for session in &result.items {
+            let path = Path::new(&session.source_path);
+            assert!(
+                path.exists(),
+                "a listed row must point at a real rollout: {}",
+                session.source_path
+            );
+            assert!(
+                codex_rollout::parse_rollout_path(path).is_some(),
+                "a listed row must be a rollout file: {}",
+                session.source_path
+            );
+        }
+    }
+
+    #[test]
+    fn collapse_keeps_the_same_session_id_under_two_runtime_contexts() {
+        // The local and WSL/SSH copies of an id are different sessions.
+        let collapsed = collapse_sessions_by_identity(
+            vec![
+                test_session_at(0, "shared", "/local/rollout-shared.jsonl", 100),
+                test_session_at(1, "shared", "//wsl/rollout-shared.jsonl", 900),
+            ],
+            &no_authorities(),
+        );
+
+        assert_eq!(collapsed.len(), 2);
+    }
+
+    #[test]
+    fn collapse_keeps_id_less_sessions_apart() {
+        // An absent id carries no identity; merging them would hide real sessions.
+        let collapsed = collapse_sessions_by_identity(
+            vec![
+                test_session_at(0, "", "/sessions/a.jsonl", 100),
+                test_session_at(0, "", "/sessions/b.jsonl", 900),
+            ],
+            &no_authorities(),
+        );
+
+        assert_eq!(collapsed.len(), 2);
+    }
+
+    #[test]
+    fn collapse_breaks_activity_ties_on_the_greater_source_path() {
+        // Dated rollout layouts sort chronologically by name, so the later path is
+        // the live artifact and the pick must not depend on scan order.
+        let collapsed = collapse_sessions_by_identity(
+            vec![
+                test_session_at(0, "shared", "/sessions/2026/09/16/rollout-a.jsonl", 900),
+                test_session_at(0, "shared", "/sessions/2026/09/17/rollout-b.jsonl", 900),
+            ],
+            &no_authorities(),
+        );
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(
+            collapsed[0].meta.source_path,
+            "/sessions/2026/09/17/rollout-b.jsonl"
+        );
     }
 
     #[test]
@@ -3294,6 +4261,7 @@ mod tests {
 
         let context = ToolSessionContext::Codex {
             sessions_root: sessions_root.clone(),
+            codex_home: None,
         };
         let missing_session_path = sessions_root
             .join("2026")
@@ -3319,6 +4287,84 @@ mod tests {
         assert!(result.failed_items[0].error.contains("Session not found"));
         assert!(!existing_session_path.exists());
         assert!(!another_session_path.exists());
+    }
+
+    /// A session another thread replays from must be reported as a per-item failure
+    /// rather than aborting the whole batch.
+    #[test]
+    fn delete_sessions_blocking_reports_a_referenced_session_as_a_failure() {
+        let test_root = TestDir::new("codex-bulk-delete-referenced");
+        let sessions_root = test_root.path().join("codex-home").join("sessions");
+        let thread_id = "01a08e7d-5f4b-7c31-9a20-6d3f11b91882";
+        let other_id = "01a08e11-2c7d-7b55-8e10-4a9c77d20453";
+
+        let referenced = sessions_root
+            .join("2026")
+            .join("09")
+            .join("11")
+            .join(format!("rollout-2026-09-11T10-00-00-{thread_id}.jsonl"));
+        let dependent = sessions_root
+            .join("2026")
+            .join("09")
+            .join("17")
+            .join(format!("rollout-2026-09-17T09-00-00-{other_id}.jsonl"));
+        let deletable = sessions_root
+            .join("2026")
+            .join("09")
+            .join("17")
+            .join("rollout-2026-09-17T10-00-00-01a08e99-0000-7c31-9a20-6d3f11b91882.jsonl");
+
+        write_codex_rollout(&referenced, thread_id, "2026-09-11T10:00:00Z");
+        write_codex_rollout(
+            &deletable,
+            "01a08e99-0000-7c31-9a20-6d3f11b91882",
+            "2026-09-17T10:00:00Z",
+        );
+        // The dependent thread keeps its history in the rollout above.
+        write_text_file(
+            &dependent,
+            &json!({
+                "timestamp": "2026-09-17T09:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": other_id,
+                    "cwd": "/tmp/project",
+                    "history_mode": "paginated",
+                    "history_base": {
+                        "thread_id": thread_id,
+                        "end_ordinal_exclusive": 2,
+                        "end_byte_offset": 128,
+                    },
+                }
+            })
+            .to_string(),
+        );
+
+        let result = delete_sessions_blocking(
+            single_context_set(ToolSessionContext::Codex {
+                sessions_root: sessions_root.clone(),
+                codex_home: None,
+            }),
+            vec![
+                referenced.to_string_lossy().to_string(),
+                deletable.to_string_lossy().to_string(),
+            ],
+        );
+
+        assert_eq!(result.deleted_count, 1, "the unrelated session still goes");
+        assert_eq!(result.failed_items.len(), 1);
+        assert_eq!(
+            result.failed_items[0].source_path,
+            referenced.to_string_lossy()
+        );
+        assert!(result.failed_items[0]
+            .error
+            .contains("still used as history"));
+        assert!(
+            referenced.exists(),
+            "a refused delete must not remove files"
+        );
+        assert!(!deletable.exists());
     }
 
     #[test]
@@ -3374,6 +4420,7 @@ mod tests {
         let export_dir = test_root.path().join("exports");
         let context = ToolSessionContext::Codex {
             sessions_root: sessions_root.clone(),
+            codex_home: None,
         };
 
         let result = export_sessions_blocking(
@@ -3615,6 +4662,7 @@ mod tests {
         let export_file = test_root.join("codex-session-export.json");
         let export_context = ToolSessionContext::Codex {
             sessions_root: export_sessions_root.clone(),
+            codex_home: None,
         };
         export_session_blocking(
             single_context_set(export_context),
@@ -3647,6 +4695,7 @@ mod tests {
         fs::create_dir_all(&import_sessions_root).expect("failed to create codex import root");
         let import_context = ToolSessionContext::Codex {
             sessions_root: import_sessions_root.clone(),
+            codex_home: None,
         };
         import_session_blocking(
             import_context.clone(),

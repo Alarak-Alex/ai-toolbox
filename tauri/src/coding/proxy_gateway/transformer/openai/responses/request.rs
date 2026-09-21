@@ -2,6 +2,7 @@ use crate::coding::proxy_gateway::transformer::llm::{
     ApiFormat, Message, MessageContent, Request, RequestType, TOOL_TYPE_RESPONSES_CUSTOM_TOOL,
 };
 use crate::coding::proxy_gateway::transformer::shared::{
+    downgrade_instruction_message, instruction_hoist_plan, placement_for_api_format,
     should_emit_openai_request_metadata, stop_from_value, stop_to_value, tool_choice_from_openai,
     tool_choice_to_responses,
 };
@@ -103,7 +104,14 @@ pub fn responses_request_to_llm(body: Value) -> Request {
         "truncation",
         RESPONSES_TRUNCATION_METADATA_KEY,
     );
-    append_responses_input_to_messages(body.get("input"), &mut request.messages);
+    let raw_input_items =
+        append_responses_input_to_messages(body.get("input"), &mut request.messages);
+    if !raw_input_items.is_empty() {
+        request.transformer_metadata.insert(
+            RESPONSES_RAW_INPUT_ITEMS_METADATA_KEY.to_string(),
+            Value::Array(raw_input_items),
+        );
+    }
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         request.tools = responses_tools_to_llm(tools);
     }
@@ -131,7 +139,7 @@ pub fn llm_request_to_responses(request: Request) -> Value {
         .transformer_metadata
         .get(RESPONSES_RAW_TOOL_CHOICE_METADATA_KEY)
         .cloned();
-    let raw_input_items = request
+    let mut raw_input_items = request
         .transformer_metadata
         .get(RESPONSES_RAW_INPUT_ITEMS_METADATA_KEY)
         .cloned();
@@ -157,8 +165,14 @@ pub fn llm_request_to_responses(request: Request) -> Value {
     );
     let truncation =
         responses_metadata_or_extra_body(&request, RESPONSES_TRUNCATION_METADATA_KEY, "truncation");
-    for message in request.messages {
-        if message.role == "system" || message.role == "developer" {
+    let mut message_input_offsets = Vec::with_capacity(request.messages.len() + 1);
+    let hoist_instructions = instruction_hoist_plan(
+        &request.messages,
+        placement_for_api_format(request.api_format),
+    );
+    for (message_index, message) in request.messages.into_iter().enumerate() {
+        message_input_offsets.push(input.len());
+        if hoist_instructions[message_index] {
             if let MessageContent::Text(text) = message.content {
                 if !text.is_empty() {
                     instructions.push(text);
@@ -166,7 +180,23 @@ pub fn llm_request_to_responses(request: Request) -> Value {
             }
             continue;
         }
+        // Instruction messages written in place (Anthropic/Claude Code sources) are
+        // downgraded to `user`: hoisting them would rewrite the prompt head every
+        // turn and break upstream prefix caching (see `shared/system_messages.rs`).
+        let message = downgrade_instruction_message(message);
         append_llm_message_as_responses_input(message, &mut input, &mut custom_tool_call_ids);
+    }
+    message_input_offsets.push(input.len());
+    if let Some(fragments) = raw_input_items.as_mut().and_then(Value::as_array_mut) {
+        for (raw_offset, fragment) in fragments.iter_mut().enumerate() {
+            if let Some(input_offset) = fragment
+                .get("message_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| message_input_offsets.get(index as usize))
+            {
+                fragment["index"] = json!(input_offset + raw_offset);
+            }
+        }
     }
     input = merge_raw_responses_fragments(input, raw_input_items.as_ref());
     let mut body = json!({

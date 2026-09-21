@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,11 +39,213 @@ impl GatewayCliKey {
     }
 }
 
+/// Usage collection is independent of gateway takeover support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayUsageTool {
+    Claude,
+    ClaudeDesktop,
+    Codex,
+    Grok,
+    Kimi,
+    Gemini,
+    #[serde(rename = "opencode", alias = "open_code")]
+    OpenCode,
+    Pi,
+    OhMyPi,
+    Dsh,
+    Hermes,
+    #[serde(rename = "openclaw", alias = "open_claw")]
+    OpenClaw,
+    KimiCli,
+}
+
+impl GatewayUsageTool {
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Claude,
+            Self::ClaudeDesktop,
+            Self::Codex,
+            Self::Grok,
+            Self::Kimi,
+            Self::Gemini,
+            Self::OpenCode,
+            Self::Pi,
+            Self::OhMyPi,
+            Self::Dsh,
+            Self::Hermes,
+            Self::OpenClaw,
+            Self::KimiCli,
+        ]
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::ClaudeDesktop => "claude_desktop",
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::Kimi => "kimi",
+            Self::Gemini => "gemini",
+            Self::OpenCode => "opencode",
+            Self::Pi => "pi",
+            Self::OhMyPi => "oh_my_pi",
+            Self::Dsh => "dsh",
+            Self::Hermes => "hermes",
+            Self::OpenClaw => "openclaw",
+            Self::KimiCli => "kimi_cli",
+        }
+    }
+
+    pub fn gateway_cli(self) -> Option<GatewayCliKey> {
+        Some(match self {
+            Self::Claude => GatewayCliKey::Claude,
+            Self::ClaudeDesktop => GatewayCliKey::ClaudeDesktop,
+            Self::Codex => GatewayCliKey::Codex,
+            Self::Grok => GatewayCliKey::Grok,
+            Self::Kimi => GatewayCliKey::Kimi,
+            Self::Gemini => GatewayCliKey::Gemini,
+            Self::OpenCode => GatewayCliKey::OpenCode,
+            _ => return None,
+        })
+    }
+}
+
+impl From<GatewayCliKey> for GatewayUsageTool {
+    fn from(value: GatewayCliKey) -> Self {
+        match value {
+            GatewayCliKey::Claude => Self::Claude,
+            GatewayCliKey::ClaudeDesktop => Self::ClaudeDesktop,
+            GatewayCliKey::Codex => Self::Codex,
+            GatewayCliKey::Grok => Self::Grok,
+            GatewayCliKey::Kimi => Self::Kimi,
+            GatewayCliKey::Gemini => Self::Gemini,
+            GatewayCliKey::OpenCode => Self::OpenCode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionUsageGranularity {
+    #[default]
+    Request,
+    Turn,
+    Session,
+}
+
+/// Only native facts are saved here; current provider settings are not history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct SessionUsageMetadata {
+    pub granularity: SessionUsageGranularity,
+    pub native_provider: Option<String>,
+    pub call_count: Option<u64>,
+    pub reported_total_tokens: Option<u64>,
+    pub incomplete: bool,
+    pub cost_source: Option<String>,
+    pub window_start: Option<i64>,
+    pub window_end: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayProxyMode {
     Single,
     Failover,
+    /// Aggregate mode keeps every selected provider as a candidate and routes
+    /// each request by the model name the CLI asked for. The model catalog
+    /// exposes one entry per (site, model) pair named `<site_id><sep><model>`;
+    /// the gateway strips that prefix before forwarding. Providers that declare
+    /// the same upstream model act as fallbacks for each other.
+    Aggregate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GatewayAggregateConfig {
+    pub provider_ids: Vec<String>,
+    pub separator: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
+    pub naming: crate::coding::proxy_gateway::aggregate_naming::AggregateNamingMode,
+    /// Whether one request may be retried on *another* selected site when the
+    /// site its slug or `<site><sep><model>` prefix names fails.
+    ///
+    /// `false` (the value every manifest written before this field existed
+    /// deserializes to) pins the request to the single site the model name
+    /// addresses: a failing or cooling site surfaces its own error instead of
+    /// spending another site's balance. `true` restores the historical
+    /// "sites declaring the same upstream model back each other up" behavior.
+    #[serde(default)]
+    pub cross_site_failover: bool,
+    /// Bare upstream model names published as hidden aliases.
+    ///
+    /// Absent or empty keeps the historical default of publishing every bare
+    /// model name the selected sites declare; a non-empty set narrows the hidden
+    /// alias table to exactly those names.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub subagent_exposed_models: BTreeSet<String>,
+    /// Codex `[agents]` defaults this takeover owns, if any. Absent means the
+    /// takeover wrote none, so the settings form must show the fields as
+    /// unmanaged rather than as blank values it would then write back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<GatewayAggregateSubagentDefaults>,
+}
+
+/// One bare model name the drawer may publish as a programmable hidden alias.
+///
+/// Carries its declaring site so the settings form can show where a name comes
+/// from even when it is currently *not* published (the debt this fixes: a name
+/// removed from the exposure set has to stay selectable).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GatewayAggregateBareModel {
+    pub model: String,
+    pub provider_id: String,
+    pub provider_name: String,
+}
+
+/// Read-only view of the aggregate catalog's programmable bare names.
+///
+/// `entries` are the names the generated catalog currently publishes as hidden
+/// aliases; `bare_models` is the full universe the selected sites declare, so a
+/// name that was narrowed out of the catalog can still be chosen again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GatewaySubagentCatalog {
+    pub cli_key: GatewayCliKey,
+    /// True while an aggregate manifest is enabled for this CLI.
+    pub aggregate_mode: bool,
+    #[serde(default)]
+    pub entries: Vec<GatewayAggregateBareModel>,
+    /// Absent in payloads written before this field existed; the drawer then
+    /// falls back to `entries` alone.
+    #[serde(default)]
+    pub bare_models: Vec<GatewayAggregateBareModel>,
+}
+
+/// The `[agents]` defaults shown back to the settings form.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GatewayAggregateSubagentDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl From<&crate::coding::proxy_gateway::cli_proxy::manifest::AggregateSubagentDefaults>
+    for GatewayAggregateSubagentDefaults
+{
+    fn from(
+        defaults: &crate::coding::proxy_gateway::cli_proxy::manifest::AggregateSubagentDefaults,
+    ) -> Self {
+        Self {
+            model: defaults.model.clone(),
+            reasoning_effort: defaults.reasoning_effort.clone(),
+        }
+    }
 }
 
 impl GatewayProxyMode {
@@ -51,6 +253,7 @@ impl GatewayProxyMode {
         match self {
             Self::Single => "single",
             Self::Failover => "failover",
+            Self::Aggregate => "aggregate",
         }
     }
 }
@@ -102,6 +305,16 @@ pub struct ProviderGatewayMeta {
     /// keep the pinned model) and wins over family/default mapping.
     #[serde(default, rename = "modelRewrites", alias = "model_rewrites")]
     pub model_rewrites: Option<Vec<ModelRewriteRule>>,
+    /// Upstream model ids this provider declares in its `modelCatalog`.
+    ///
+    /// Populated from `settingsConfig.modelCatalog.models` so aggregate mode can
+    /// tell whether a site actually offers the requested model. A bare model
+    /// name only resolves to sites listed here; empty means the provider never
+    /// declared a catalog, so it is excluded rather than guessed at. A site
+    /// named by an explicit `<site><sep><model>` prefix is routed regardless,
+    /// because the prefix is authoritative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_models: Vec<String>,
 }
 
 /// One user-defined exact model rewrite rule: when the CLI requests `from`
@@ -184,6 +397,7 @@ impl Default for ProviderGatewayMeta {
             pricing_model_source: "upstream".to_string(),
             custom_headers: None,
             model_rewrites: None,
+            declared_models: Vec::new(),
         }
     }
 }
@@ -198,9 +412,14 @@ pub struct ProxyGatewaySettings {
     /// WSL Direct CLI 访问本机网关时使用的宿主机可达地址，留空则继续使用 listen origin。
     pub wsl_host: String,
     pub enabled_cli_keys: Vec<GatewayCliKey>,
+    /// Allow Codex Responses WebSocket upgrades. HTTP/SSE remains the default transport.
+    pub codex_websocket_enabled: bool,
     pub request_log_enabled: bool,
     pub request_log_level: String,
     pub metrics_enabled: bool,
+    /// Whether locally-imported CLI session usage (requests that bypassed the
+    /// gateway) participates in usage statistics and the request list.
+    pub session_usage_enabled: bool,
     pub store_request_body: bool,
     pub store_headers: bool,
     pub store_response_body: bool,
@@ -238,9 +457,11 @@ impl Default for ProxyGatewaySettings {
             port_auto_select: false,
             wsl_host: String::new(),
             enabled_cli_keys: GatewayCliKey::supported_mvp(),
+            codex_websocket_enabled: false,
             request_log_enabled: true,
             request_log_level: "summary".to_string(),
             metrics_enabled: true,
+            session_usage_enabled: true,
             store_request_body: false,
             store_headers: false,
             store_response_body: false,
@@ -494,6 +715,8 @@ pub struct GatewayCliTakeoverStatus {
     pub managed_targets: Vec<GatewayManagedTarget>,
     pub mode: Option<GatewayProxyMode>,
     pub primary_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<GatewayAggregateConfig>,
     pub provider_priorities: Vec<ProviderPriorityEntry>,
     pub message: Option<String>,
 }
@@ -575,7 +798,8 @@ pub struct ProxyGatewayRequestLogListInput {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayRequestLogFilters {
-    pub cli_key: Option<GatewayCliKey>,
+    pub data_source: Option<String>,
+    pub cli_key: Option<GatewayUsageTool>,
     pub provider_name: Option<String>,
     pub model: Option<String>,
     pub status_code: Option<u16>,
@@ -603,9 +827,19 @@ pub struct GatewayPaginatedRequestLogs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayRequestLogItem {
+    #[serde(default)]
+    pub transport: GatewayRequestTransport,
+    #[serde(default)]
+    pub request_kind: GatewayRequestKind,
+    #[serde(default)]
+    pub stream_outcome: Option<GatewayStreamOutcome>,
+    #[serde(default)]
+    pub usage_metadata: Option<SessionUsageMetadata>,
+    #[serde(default)]
+    pub extra_tokens: u64,
     pub trace_id: String,
     pub data_source: String,
-    pub cli_key: GatewayCliKey,
+    pub cli_key: GatewayUsageTool,
     pub route_name: Option<String>,
     pub method: Option<String>,
     pub path: Option<String>,
@@ -645,7 +879,7 @@ pub struct GatewayUsageSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayUsageSummaryByCli {
-    pub cli_key: GatewayCliKey,
+    pub cli_key: GatewayUsageTool,
     pub summary: GatewayUsageSummary,
 }
 
@@ -665,7 +899,7 @@ pub struct GatewayUsageTrendPoint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayProviderStats {
-    pub cli_key: GatewayCliKey,
+    pub cli_key: GatewayUsageTool,
     pub provider_id: String,
     pub provider_name: Option<String>,
     pub request_count: u64,
@@ -677,26 +911,38 @@ pub struct GatewayProviderStats {
     pub cache_hit_rate: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayModelStats {
-    pub cli_key: GatewayCliKey,
+    pub cli_key: GatewayUsageTool,
     pub model: String,
     pub request_count: u64,
     pub total_tokens: u64,
     pub total_cost_usd: String,
+    /// HTTP success rate over gateway (proxy) requests only; imported session
+    /// rows carry placeholder status codes, so a model without proxy traffic
+    /// reports None instead of a placeholder-derived rate.
+    pub success_rate: Option<f32>,
     pub avg_latency_ms: Option<u64>,
+    /// Token-weighted input cache hit ratio (0..=1); None when input usage is absent.
+    pub cache_hit_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayRequestLogSummary {
+    #[serde(default)]
+    pub transport: GatewayRequestTransport,
+    #[serde(default)]
+    pub request_kind: GatewayRequestKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_metadata: Option<SessionUsageMetadata>,
     pub trace_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_source: Option<String>,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
-    pub cli_key: Option<GatewayCliKey>,
+    pub cli_key: Option<GatewayUsageTool>,
     pub route_name: String,
     pub method: String,
     pub path: String,
@@ -828,6 +1074,10 @@ pub struct GatewayProviderAttempt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayRequestLogDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<super::privacy::PrivacyDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket: Option<GatewayWebSocketMetadata>,
     #[serde(flatten)]
     pub summary: GatewayRequestLogSummary,
     pub request_headers: Option<BTreeMap<String, String>>,
@@ -848,6 +1098,73 @@ pub struct GatewayRequestLogRecord {
     pub schema_version: u32,
     #[serde(flatten)]
     pub detail: GatewayRequestLogDetail,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRequestTransport {
+    #[default]
+    Http,
+    Websocket,
+}
+
+impl GatewayRequestTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Websocket => "websocket",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "websocket" => Self::Websocket,
+            _ => Self::Http,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRequestKind {
+    #[default]
+    Request,
+    WebsocketHandshake,
+    WebsocketWarmup,
+}
+
+impl GatewayRequestKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::WebsocketHandshake => "websocket_handshake",
+            Self::WebsocketWarmup => "websocket_warmup",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "websocket_handshake" => Self::WebsocketHandshake,
+            "websocket_warmup" => Self::WebsocketWarmup,
+            _ => Self::Request,
+        }
+    }
+}
+
+/// Connection metadata belongs in JSONL detail, never in the compact usage store.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayWebSocketMetadata {
+    pub connection_id: String,
+    pub response_id: Option<String>,
+    pub stream_id: Option<String>,
+    pub previous_response_id: Option<String>,
+    pub event_type: Option<String>,
+    pub handshake_status: u16,
+    pub upstream_handshake_status: Option<u16>,
+    pub error_status: Option<u16>,
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handshake_attempts: Vec<GatewayProviderAttempt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -891,7 +1208,15 @@ pub enum GatewaySessionImportCli {
     Grok,
     Kimi,
     Gemini,
+    #[serde(rename = "opencode", alias = "open_code")]
     OpenCode,
+    Pi,
+    OhMyPi,
+    Dsh,
+    Hermes,
+    #[serde(rename = "openclaw", alias = "open_claw")]
+    OpenClaw,
+    KimiCli,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -911,7 +1236,7 @@ impl Default for GatewaySessionUsageImportInput {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct DataSourceBreakdownInput {
-    pub cli_key: Option<GatewayCliKey>,
+    pub cli_key: Option<GatewayUsageTool>,
     pub start_unix_secs: Option<i64>,
     pub end_unix_secs: Option<i64>,
 }
@@ -948,7 +1273,7 @@ impl GatewaySessionUsageImportResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct GatewayUsageRecordedEvent {
-    pub cli_key: Option<GatewayCliKey>,
+    pub cli_key: Option<GatewayUsageTool>,
     pub trace_id: Option<String>,
     pub data_source: String,
     pub inserted_records: u64,
